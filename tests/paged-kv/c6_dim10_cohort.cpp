@@ -25,6 +25,7 @@
 #include "pkv_budget_c_helpers.h"
 
 #include <cstdio>
+#include <fstream>
 #include <map>
 #include <string>
 #include <vector>
@@ -128,7 +129,7 @@ struct CohortRun {
 
 // Runs the cohort in a page pool of `pages`: every sequence is created, adopts its persona, emits 257
 // tokens (to 1,456: saved), and runs to its refusal (saved at the limit).
-CohortRun RunCohort(const Fixture& fx, uint32_t pages, bool keep_blobs) {
+CohortRun RunCohort(const Fixture& fx, uint32_t pages, bool keep_blobs, bool drive_tokens = true) {
 	CohortRun r;
 	PagePool pool(fx.model, pages);
 	PKV_CHECK_EQ(pool.status, SSLM_OK);
@@ -149,6 +150,7 @@ CohortRun RunCohort(const Fixture& fx, uint32_t pages, bool keep_blobs) {
 		}
 		seqs.push_back(s);
 		PKV_CHECK_MSG(sslm_seq_adopt_prefix(s, w.personas[static_cast<size_t>(PersonaOf(i))]) == SSLM_OK, "adopt of sequence %d", i);
+		if (!drive_tokens) continue;  // 10.4 grades admission; 10.1 grades the full decode and its end state.
 		sslm_status a = SSLM_OK, b = SSLM_OK;
 		std::vector<int32_t> t = DecodeN(fx.model, s, kMidAt - kOrigin + 1, &a);
 		if (keep_blobs) r.mid.push_back(Save(s));
@@ -164,12 +166,91 @@ CohortRun RunCohort(const Fixture& fx, uint32_t pages, bool keep_blobs) {
 	return r;
 }
 
-// The cohort in exactly CohortPages (1,842), once per artifact: 10.1, 10.4 and 10.6 read the same run.
+// A successful 10.1 run may save its 50 source blobs for 10.6 and 10.8. This is a process
+// checkpoint, never an independent reference: 10.6 still compares the continued tokens with both
+// the unsaved run and v1.11.0, and 10.4 runs fresh admission states. The caller supplies a scratch
+// directory and the exact source HEAD, while the file itself binds the loaded artifact's SHA-256.
+bool CacheVector(std::fstream& f, std::vector<uint8_t>* bytes, bool reading) {
+	uint32_t n = reading ? 0 : static_cast<uint32_t>(bytes->size());
+	if (reading) f.read(reinterpret_cast<char*>(&n), sizeof(n));
+	else f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+	if (!f || n > 100u * 1024u * 1024u) return false;
+	if (reading) bytes->resize(n);
+	if (n) {
+		if (reading) f.read(reinterpret_cast<char*>(bytes->data()), n);
+		else f.write(reinterpret_cast<const char*>(bytes->data()), n);
+	}
+	return static_cast<bool>(f);
+}
+bool CacheTokens(std::fstream& f, std::vector<int32_t>* tokens, bool reading) {
+	uint32_t n = reading ? 0 : static_cast<uint32_t>(tokens->size());
+	if (reading) f.read(reinterpret_cast<char*>(&n), sizeof(n));
+	else f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+	if (!f || n > 1u + static_cast<uint32_t>(kBudget)) return false;
+	if (reading) tokens->resize(n);
+	if (n) {
+		if (reading) f.read(reinterpret_cast<char*>(tokens->data()), n * sizeof(int32_t));
+		else f.write(reinterpret_cast<const char*>(tokens->data()), n * sizeof(int32_t));
+	}
+	return static_cast<bool>(f);
+}
+bool CohortCache(const Fixture& fx, const std::string& path, const std::string& head, CohortRun* r, bool reading) {
+	std::fstream f(path, std::ios::binary | (reading ? std::ios::in : std::ios::out | std::ios::trunc));
+	if (!f) return false;
+	if (reading) {
+		std::string magic, sha, saved_head;
+		if (!GetTextLine(f, magic) || !GetTextLine(f, sha) || !GetTextLine(f, saved_head) ||
+		    magic != "PKVC6-CACHE-1" || sha != fx.sha || saved_head != head) return false;
+		r->built = true;
+		r->tokens.resize(kSeqs);
+		r->mid.resize(kSeqs);
+		r->lim.resize(kSeqs);
+	} else {
+		f << "PKVC6-CACHE-1\n" << fx.sha << "\n" << head << "\n";
+	}
+	for (int i = 0; i < kSeqs; ++i) {
+		if (!CacheTokens(f, &r->tokens[i], reading) || !CacheVector(f, &r->mid[i], reading) ||
+		    !CacheVector(f, &r->lim[i], reading)) return false;
+		if (reading && (r->tokens[i].size() != 1u + kBudget || r->mid[i].empty() || r->lim[i].empty())) return false;
+	}
+	if (reading) return f.peek() == std::char_traits<char>::eof();
+	f.flush();
+	return static_cast<bool>(f);
+}
+
+// The cohort in exactly CohortPages (1,842), once per process. The optional on-disk checkpoint
+// lets each release cell finish within a bounded process and is written only after all 50 complete.
 const CohortRun& Cohort(const Fixture& fx) {
 	static std::map<std::string, CohortRun> runs;
 	auto it = runs.find(fx.stem);
 	if (it != runs.end()) return it->second;
-	return runs[fx.stem] = RunCohort(fx, static_cast<uint32_t>(CohortPages(fx)), true);
+	const char* dir = std::getenv("SUPERSLM_PAGED_KV_COHORT_CACHE_DIR");
+	const char* head = std::getenv("SUPERSLM_PAGED_KV_COHORT_HEAD");
+	const bool cache = dir && *dir;
+	if (cache) PKV_CHECK_MSG(head && *head, "C6 cohort cache requires the source HEAD");
+	const std::string path = cache && head && *head ? std::string(dir) + "/cohort-" + fx.stem + "-" + fx.sha + "-" + head + ".bin" : "";
+	if (!path.empty()) {
+		std::ifstream check(path, std::ios::binary);
+		if (check) {
+			CohortRun saved;
+			const bool valid = CohortCache(fx, path, head, &saved, true);
+			PKV_CHECK_MSG(valid, "C6 cohort cache invalid: %s", path.c_str());
+			if (valid) {
+				std::printf("C6 cohort checkpoint loaded: %s\n", path.c_str());
+				return runs[fx.stem] = std::move(saved);
+			}
+			return runs[fx.stem] = CohortRun{};
+		}
+	}
+	CohortRun fresh = RunCohort(fx, static_cast<uint32_t>(CohortPages(fx)), true);
+	if (!path.empty() && fresh.built && fresh.first_refused < 0 && fresh.tokens.size() == kSeqs &&
+	    fresh.mid.size() == kSeqs && fresh.lim.size() == kSeqs && fresh.end.size() == kSeqs) {
+		const std::string partial = path + ".partial";
+		const bool written = CohortCache(fx, partial, head, &fresh, false) && std::rename(partial.c_str(), path.c_str()) == 0;
+		PKV_CHECK_MSG(written, "C6 cohort checkpoint write failed: %s", path.c_str());
+		if (written) std::printf("C6 cohort checkpoint written: %s\n", path.c_str());
+	}
+	return runs[fx.stem] = std::move(fresh);
 }
 
 // ================================================================================================
@@ -312,14 +393,13 @@ void Cell104On(const Fixture& fx) {
 	const int64_t N = CohortPages(fx);
 	PKV_CHECK_EQ(N, 1842);  // §5's figure, from §3.4 written here
 	{
-		const CohortRun& r = Cohort(fx);
+		const CohortRun r = RunCohort(fx, static_cast<uint32_t>(N), false, false);
 		// kills: any draw beyond §3.4's (an adopt that draws, a begin_from that copies the world)
 		PKV_CHECK_MSG(r.built && r.first_refused < 0 && r.creates_refused == 0, "10.4 %s: a pool of %lld refused create %d (status %d)",
 		              fx.stem.c_str(), static_cast<long long>(N), r.first_refused, static_cast<int>(r.refusal));
-		for (size_t i = 0; i < r.end.size(); ++i) PKV_CHECK_EQ(r.end[i], PKV_KV_BUDGET_EXCEEDED);
 	}
 	{
-		const CohortRun r = RunCohort(fx, static_cast<uint32_t>(N - 1), false);
+		const CohortRun r = RunCohort(fx, static_cast<uint32_t>(N - 1), false, false);
 		// kills: a reservation one page short anywhere in the cohort (admitted at 1,841)
 		PKV_CHECK_MSG(r.built && r.first_refused == kSeqs - 1 && r.creates_refused == 1 && r.refusal == SSLM_KV_POOL_EXHAUSTED,
 		              "10.4 %s: a pool of %lld refused %d creates, the first at index %d (status %d)", fx.stem.c_str(),
