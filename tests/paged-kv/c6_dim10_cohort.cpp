@@ -24,10 +24,12 @@
 
 #include "pkv_budget_c_helpers.h"
 
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -166,6 +168,50 @@ CohortRun RunCohort(const Fixture& fx, uint32_t pages, bool keep_blobs, bool dri
 	return r;
 }
 
+// One bounded 10.1 process still proves admission of the complete 50-sequence cohort. It drives
+// ten selected sequences while all 50 reservations and persona adoptions remain live. Five such
+// processes cover every output; the other cells reassemble only green, source-bound shards.
+CohortRun RunCohortShard(const Fixture& fx, int shard) {
+	CohortRun r;
+	PagePool pool(fx.model, static_cast<uint32_t>(CohortPages(fx)));
+	PKV_CHECK_EQ(pool.status, SSLM_OK);
+	if (pool.status != SSLM_OK) return r;
+	World w = BuildWorld(fx, &pool.pool, kPersonas);
+	r.built = w.ok;
+	std::vector<sslm_seq> seqs(kSeqs, nullptr);
+	for (int i = 0; i < kSeqs && w.ok; ++i) {
+		sslm_seq s = nullptr;
+		const sslm_status st = sslm_seq_create_budgeted(fx.model, &pool.pool, kBudget, &s);
+		if (st != SSLM_OK) {
+			if (r.first_refused < 0) { r.first_refused = i; r.refusal = st; }
+			++r.creates_refused;
+			continue;
+		}
+		seqs[i] = s;
+		PKV_CHECK_MSG(sslm_seq_adopt_prefix(s, w.personas[static_cast<size_t>(PersonaOf(i))]) == SSLM_OK,
+		              "10.1 shard %d: adopt of sequence %d", shard, i);
+	}
+	r.tokens.resize(kSeqs);
+	r.mid.resize(kSeqs);
+	r.lim.resize(kSeqs);
+	r.end.resize(kSeqs, SSLM_OK);
+	for (int i = shard * 10; i < (shard + 1) * 10 && w.ok; ++i) {
+		if (!seqs[i]) continue;
+		sslm_status a = SSLM_OK, b = SSLM_OK;
+		std::vector<int32_t> t = DecodeN(fx.model, seqs[i], kMidAt - kOrigin + 1, &a);
+		r.mid[i] = Save(seqs[i]);
+		const std::vector<int32_t> rest = RunToRefusal(fx.model, seqs[i], &b);
+		t.insert(t.end(), rest.begin(), rest.end());
+		r.lim[i] = Save(seqs[i]);
+		r.tokens[i] = std::move(t);
+		r.end[i] = b;
+		PKV_CHECK_MSG(a == SSLM_OK, "10.1 shard %d: sequence %d status %d before 1,456", shard, i, static_cast<int>(a));
+	}
+	for (auto it = seqs.rbegin(); it != seqs.rend(); ++it) if (*it) sslm_seq_release(*it);
+	w.Release();
+	return r;
+}
+
 // A successful 10.1 run may save its 50 source blobs for 10.6 and 10.8. This is a process
 // checkpoint, never an independent reference: 10.6 still compares the continued tokens with both
 // the unsaved run and v1.11.0, and 10.4 runs fresh admission states. The caller supplies a scratch
@@ -218,6 +264,39 @@ bool CohortCache(const Fixture& fx, const std::string& path, const std::string& 
 	return static_cast<bool>(f);
 }
 
+std::string ShardPath(const std::string& dir, const Fixture& fx, const std::string& head, int shard) {
+	return dir + "/cohort-" + fx.stem + "-" + fx.sha + "-" + head + "-shard" + std::to_string(shard) + ".bin";
+}
+bool CohortShardCache(const Fixture& fx, const std::string& path, const std::string& head, int shard,
+                     CohortRun* r, bool reading) {
+	std::fstream f(path, std::ios::binary | (reading ? std::ios::in : std::ios::out | std::ios::trunc));
+	if (!f) return false;
+	if (reading) {
+		std::string magic, sha, saved_head, saved_shard;
+		if (!GetTextLine(f, magic) || !GetTextLine(f, sha) || !GetTextLine(f, saved_head) ||
+		    !GetTextLine(f, saved_shard) || magic != "PKVC6-SHARD-1" || sha != fx.sha ||
+		    saved_head != head || saved_shard != std::to_string(shard)) return false;
+		r->built = true;
+		r->tokens.resize(kSeqs);
+		r->mid.resize(kSeqs);
+		r->lim.resize(kSeqs);
+	} else {
+		f << "PKVC6-SHARD-1\n" << fx.sha << "\n" << head << "\n" << shard << "\n";
+	}
+	for (int i = 0; i < kSeqs; ++i) {
+		if (!CacheTokens(f, &r->tokens[i], reading) || !CacheVector(f, &r->mid[i], reading) ||
+		    !CacheVector(f, &r->lim[i], reading)) return false;
+		if (reading) {
+			const bool selected = i >= shard * 10 && i < (shard + 1) * 10;
+			if (selected != (r->tokens[i].size() == 1u + kBudget && !r->mid[i].empty() && !r->lim[i].empty())) return false;
+			if (!selected && (!r->tokens[i].empty() || !r->mid[i].empty() || !r->lim[i].empty())) return false;
+		}
+	}
+	if (reading) return f.peek() == std::char_traits<char>::eof();
+	f.flush();
+	return static_cast<bool>(f);
+}
+
 // The cohort in exactly CohortPages (1,842), once per process. The optional on-disk checkpoint
 // lets each release cell finish within a bounded process and is written only after all 50 complete.
 const CohortRun& Cohort(const Fixture& fx) {
@@ -241,6 +320,34 @@ const CohortRun& Cohort(const Fixture& fx) {
 			}
 			return runs[fx.stem] = CohortRun{};
 		}
+		// The five 10.1 shards are the other checkpoint form. Each covers disjoint sequence indices;
+		// they bind the same source HEAD and model hash and are checked for exact coverage here.
+		const std::string first = ShardPath(dir, fx, head, 0);
+		if (std::ifstream(first, std::ios::binary)) {
+			CohortRun joined;
+			joined.built = true;
+			joined.tokens.resize(kSeqs);
+			joined.mid.resize(kSeqs);
+			joined.lim.resize(kSeqs);
+			for (int shard = 0; shard < 5; ++shard) {
+				const std::string part = ShardPath(dir, fx, head, shard);
+				CohortRun one;
+				const bool valid = CohortShardCache(fx, part, head, shard, &one, true);
+				PKV_CHECK_MSG(valid, "C6 cohort shard invalid: %s", part.c_str());
+				if (!valid) return runs[fx.stem] = CohortRun{};
+				for (int i = shard * 10; i < (shard + 1) * 10; ++i) {
+					joined.tokens[i] = std::move(one.tokens[i]);
+					joined.mid[i] = std::move(one.mid[i]);
+					joined.lim[i] = std::move(one.lim[i]);
+				}
+				std::printf("C6 cohort shard loaded: %s\n", part.c_str());
+			}
+			return runs[fx.stem] = std::move(joined);
+		}
+	}
+	if (cache && std::getenv("SUPERSLM_PAGED_KV_COHORT_REQUIRE_CACHE")) {
+		PKV_CHECK_MSG(false, "C6 cohort checkpoint absent for %s at source HEAD %s", fx.stem.c_str(), head ? head : "(unset)");
+		return runs[fx.stem] = CohortRun{};
 	}
 	CohortRun fresh = RunCohort(fx, static_cast<uint32_t>(CohortPages(fx)), true);
 	if (!path.empty() && fresh.built && fresh.first_refused < 0 && fresh.tokens.size() == kSeqs &&
@@ -259,6 +366,35 @@ const CohortRun& Cohort(const Fixture& fx) {
 // ================================================================================================
 void Cell101On(const Fixture& fx) {
 	if (!fx.ok) return;
+	if (const char* selector = std::getenv("SUPERSLM_PAGED_KV_COHORT_SHARD")) {
+		const int shard = std::atoi(selector);
+		PKV_CHECK_MSG(std::string(selector) == std::to_string(shard) && shard >= 0 && shard < 5,
+		              "10.1 invalid shard selector %s", selector);
+		if (std::string(selector) != std::to_string(shard) || shard < 0 || shard >= 5) return;
+		const char* dir = std::getenv("SUPERSLM_PAGED_KV_COHORT_CACHE_DIR");
+		const char* head = std::getenv("SUPERSLM_PAGED_KV_COHORT_HEAD");
+		PKV_CHECK_MSG(dir && *dir && head && *head, "10.1 shard requires cache directory and source HEAD");
+		if (!dir || !*dir || !head || !*head) return;
+		CohortRun r = RunCohortShard(fx, shard);
+		bool valid = r.built && r.first_refused < 0 && r.creates_refused == 0;
+		PKV_CHECK_MSG(valid, "10.1 shard %d: full cohort admission failed", shard);
+		for (int i = shard * 10; i < (shard + 1) * 10; ++i) {
+			const std::vector<int32_t> ref = RefTokens(fx, PersonaOf(i));
+			const bool good = r.tokens[i].size() == 1u + kBudget && r.end[i] == PKV_KV_BUDGET_EXCEEDED &&
+			                  r.tokens[i] == ref && !r.mid[i].empty() && !r.lim[i].empty();
+			PKV_CHECK_MSG(good, "10.1 shard %d: sequence %d differs from v1.11.0 or did not reach its limit", shard, i);
+			valid = valid && good;
+		}
+		if (valid) {
+			const std::string path = ShardPath(dir, fx, head, shard);
+			const std::string partial = path + ".partial";
+			const bool written = CohortShardCache(fx, partial, head, shard, &r, false) &&
+			                     std::rename(partial.c_str(), path.c_str()) == 0;
+			PKV_CHECK_MSG(written, "10.1 shard %d: checkpoint write failed: %s", shard, path.c_str());
+			if (written) std::printf("C6 cohort shard written: %s\n", path.c_str());
+		}
+		return;
+	}
 	const CohortRun& r = Cohort(fx);
 	PKV_CHECK_MSG(r.built && r.first_refused < 0 && r.tokens.size() == kSeqs, "10.1 %s: the cohort did not build (%zu sequences)",
 	              fx.stem.c_str(), r.tokens.size());
