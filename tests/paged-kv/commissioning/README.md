@@ -326,8 +326,9 @@ timing. Pass an id only once `-Status` reads COMMISSIONED for its entries:
 | `admission` | PKV-LEGACY-COUNT-C4, PKV-FILL-PROBE-C5, PKV-FILL-PROBE-ONESTATE-C5 | nothing; 10.4, 10.6, 10.8 can stand |
 | `timing74` | PKV-TIMING-74-C6 | `SUPERSLM_PAGED_KV_74_MAX_RATIO` = `-Max74Ratio`, for 7.4 only. Without `-Max74Ratio`, 7.4 stays quarantined |
 | `timing79` | PKV-TIMING-79-C6 | `SUPERSLM_PAGED_KV_TIMING_COMMISSIONED=1`, for the 7.9 legs only |
+| `lifecycle` | PKV-LIFECYCLE-C6 | `SUPERSLM_PAGED_KV_LIFE_COMMISSIONED=1`, for both lifecycle legs; measured changes may stand, but the plan gives no lifecycle pass/fail bar |
 
-Any other id is an error, `lifecycle` included: the lifecycle legs always read quarantined. Each
+Any other id is an error. Each
 leg's done-marker records the HEAD, the test binary's sha256, the sha256 of the artifacts,
 references and baseline it read, the ids in force that the leg rests on, the assertion variables
 set and, for 7.4 only, `-Max74Ratio`. A resume reruns any leg whose record differs from the current

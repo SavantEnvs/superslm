@@ -109,20 +109,24 @@ try {
     Check ((Get-PkvRecordEnv $r79only74).Count -eq 0) 'timing74 alone sets nothing for 7.9'
     Check ((Get-PkvLegStanding -Rests @('timing79') -Record $r79only74) -eq 'quarantined (timing79)') 'timing74 alone leaves 7.9 quarantined'
 
-    # ---- S1: lifecycle is never commissioned -------------------------------------------------------
+    # ---- lifecycle can stand only with its separate commissioned receipt ---------------------------
     $all = Get-PkvCommissionedIds @('oracle,admission', 'timing74', 'timing79')
     Check (($all -join ',') -eq 'admission,oracle,timing74,timing79') 'comma-joined ids split and sort'
     foreach ($leg in 'lifecycle-v1.11.0', 'lifecycle/C6') {
         $rl = New-PkvLegRecord -Leg $leg -Rests @('lifecycle') -Commissioned $all -Max74Ratio '2.0' @common
-        Check ((Get-PkvRecordEnv $rl).Count -eq 0) "$leg gets no assertion variable with everything commissioned"
-        Check ((Get-PkvLegStanding -Rests @('lifecycle') -Record $rl) -like 'quarantined*') "$leg stays quarantined with everything commissioned"
+        Check ((Get-PkvRecordEnv $rl).Count -eq 0) "$leg gets no lifecycle variable when only other ids are commissioned"
+        Check ((Get-PkvLegStanding -Rests @('lifecycle') -Record $rl) -eq 'quarantined (lifecycle)') "$leg stays quarantined without its own receipt"
+        $standing = New-PkvLegRecord -Leg $leg -Rests @('lifecycle') -Commissioned @('lifecycle') @common
+        Check ((Get-PkvRecordEnv $standing)['SUPERSLM_PAGED_KV_LIFE_COMMISSIONED'] -eq '1') "$leg sets its own commissioning variable"
+        Check ((Get-PkvLegStanding -Rests @('lifecycle') -Record $standing) -eq 'standing') "$leg stands after commissioning"
+        Check (-not (Test-PkvLegRecordCurrent $rl $standing)) "$leg reruns when newly commissioned"
     }
-    # A hand-edited record naming lifecycle still does not stand.
+    # A hand-edited record naming lifecycle but lacking its assertion variable still does not stand.
     $forged = New-PkvLegRecord -Leg 'lifecycle/C6' -Rests @('lifecycle') -Commissioned @() @common
     $forged.Commissioned = 'lifecycle'
-    Check ((Get-PkvLegStanding -Rests @('lifecycle') -Record $forged) -like 'quarantined*') 'a record naming lifecycle does not stand'
-    Throws { Get-PkvCommissionedIds @('lifecycle') } 'no registry entry' '-Commissioned lifecycle is rejected'
-    Throws { Get-PkvCommissionedIds @('oracle,lifecycle') } 'no registry entry' '-Commissioned oracle,lifecycle is rejected'
+    Check ((Get-PkvLegStanding -Rests @('lifecycle') -Record $forged) -eq 'quarantined (lifecycle (SUPERSLM_PAGED_KV_LIFE_COMMISSIONED unset))') 'a record naming lifecycle without its variable does not stand'
+    $withLife = Get-PkvCommissionedIds @('oracle,lifecycle')
+    Check (($withLife -join ',') -eq 'lifecycle,oracle') '-Commissioned accepts the registered lifecycle id'
     Throws { Get-PkvCommissionedIds @('timing') } "not 'timing'" '-Commissioned timing (the old shared id) is rejected'
     Throws { Get-PkvCommissionedIds @('bogus') } "not 'bogus'" 'an unknown id is rejected'
     Check ((Get-PkvCommissionedIds @()).Count -eq 0) 'no ids: empty set'

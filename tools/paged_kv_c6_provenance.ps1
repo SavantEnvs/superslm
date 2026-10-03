@@ -13,14 +13,15 @@
 
 # The instruments -Commissioned may name, by the registry entry each stands for, and the environment
 # variable through which the cell asserts that instrument's verdict (empty: no variable; the oracle
-# and the admission instruments assert unconditionally). The lifecycle timings
-# (c6_lifecycle_timing.cpp) are not here: they have no registry entry and no commissioning, record
-# figures only, and are always quarantined.
+# and the admission instruments assert unconditionally). Lifecycle has no performance bar;
+# commissioning makes its measured change report eligible to stand, while its NO RESULT/RESOLVED
+# verdicts continue to assert nothing.
 $PkvC6Instruments = [ordered]@{
     oracle    = @{ Registry = 'PKV-ORACLE-R0'; Env = '' }
     admission = @{ Registry = 'PKV-LEGACY-COUNT-C4, PKV-FILL-PROBE-C5, PKV-FILL-PROBE-ONESTATE-C5'; Env = '' }
     timing74  = @{ Registry = 'PKV-TIMING-74-C6'; Env = 'SUPERSLM_PAGED_KV_74_MAX_RATIO' }
     timing79  = @{ Registry = 'PKV-TIMING-79-C6'; Env = 'SUPERSLM_PAGED_KV_TIMING_COMMISSIONED' }
+    lifecycle = @{ Registry = 'PKV-LIFECYCLE-C6'; Env = 'SUPERSLM_PAGED_KV_LIFE_COMMISSIONED' }
 }
 $PkvC6RecordSchema = 'pkv-c6-leg/1'
 # The fields a stored record must match for a leg to be skipped. Outcome and the binary's path are
@@ -32,9 +33,6 @@ function Get-PkvCommissionedIds {
     param([string[]]$Ids)
     $out = @($Ids | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     foreach ($c in $out) {
-        if ($c -eq 'lifecycle') {
-            throw "-Commissioned lifecycle: the lifecycle timings have no registry entry and no commissioning; they record figures only and are always quarantined"
-        }
         if (-not $PkvC6Instruments.Contains($c)) {
             throw "-Commissioned takes $(@($PkvC6Instruments.Keys) -join ', '); not '$c'"
         }
@@ -52,6 +50,7 @@ function Get-PkvLegAssertionEnv {
         switch ($r) {
             'timing79' { $envs['SUPERSLM_PAGED_KV_TIMING_COMMISSIONED'] = '1' }
             'timing74' { if ($Max74Ratio) { $envs['SUPERSLM_PAGED_KV_74_MAX_RATIO'] = $Max74Ratio } }
+            'lifecycle' { $envs['SUPERSLM_PAGED_KV_LIFE_COMMISSIONED'] = '1' }
         }
     }
     return $envs

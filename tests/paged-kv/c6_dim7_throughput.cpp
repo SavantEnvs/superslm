@@ -180,7 +180,12 @@ void Cell79Box() {
 	}
 	std::ofstream out;
 	if (const char* path = std::getenv("SUPERSLM_PAGED_KV_79_OUT")) out.open(path);
+	// A box run may checkpoint one target at a time. The default still runs both.
+	const char* selected = std::getenv("SUPERSLM_PAGED_KV_79_TARGET");
+	bool found_selected = false;
 	for (const Target& t : targets) {
+		if (selected && *selected && std::string(selected) != t.name) continue;
+		found_selected = true;
 		const Rate r = Measure(GetArtifact(t.file, t.geo), t.width, t.n);
 		if (!r.ok) continue;
 		if (out) out << t.name << " " << r.median << " " << r.spread << "\n";
@@ -188,6 +193,7 @@ void Cell79Box() {
 		if (it != baseline.end()) Grade(t.name, r, it->second);
 		else std::printf("7.9 %s: %.1f tok/s, spread %.2f%% (no baseline given)\n", t.name, r.median, r.spread * 100);
 	}
+	PKV_CHECK_MSG(!selected || !*selected || found_selected, "7.9: unknown target %s", selected ? selected : "");
 	// The paged build's verdict needs the v1.11.0 run's figures.
 	PKV_CHECK_MSG(std::getenv("SUPERSLM_PAGED_KV_79_OUT") || !baseline.empty(),
 	              "7.9: neither SUPERSLM_PAGED_KV_79_OUT (the v1.11.0 run) nor SUPERSLM_PAGED_KV_79_BASELINE (the paged run) is set");

@@ -35,9 +35,9 @@
 #   timing74   PKV-TIMING-74-C6 (7.4): sets SUPERSLM_PAGED_KV_74_MAX_RATIO=-Max74Ratio for 7.4 only;
 #              without -Max74Ratio the cell asserts nothing and 7.4 stays quarantined
 #   timing79   PKV-TIMING-79-C6 (7.9): sets SUPERSLM_PAGED_KV_TIMING_COMMISSIONED=1 for the 7.9 legs only
-# Any other id is an error. The lifecycle timings (lifecycle-v1.11.0, lifecycle/C6) have no registry
-# entry and no commissioning: they record figures only, get no assertion variable, and always read
-# quarantined; -Commissioned lifecycle is an error. Pass an id only after the debunker has
+#   lifecycle  PKV-LIFECYCLE-C6: sets SUPERSLM_PAGED_KV_LIFE_COMMISSIONED=1 for the two lifecycle
+#              legs. Its measured changes can stand; the plan supplies no lifecycle pass/fail bar.
+# Any other id is an error. Pass an id only after the debunker has
 # commissioned that entry through the records tree's instrument-commission.ps1 (-Status reads
 # COMMISSIONED). The summary marks each leg quarantined or standing from its stored record alone.
 #
@@ -48,7 +48,7 @@
 # Usage:
 #   tools\run_paged_kv_c6_box.ps1 -BuildDir D:\_scratch\pkv-c6\build [-ArtifactDir DIR]
 #       [-ScratchDir D:\_scratch\pkv-c6] [-CorrectnessOnly | -TimingOnly] [-Only lifecycle-v1.11.0,lifecycle/C6]
-#       [-Commissioned oracle,admission,timing74,timing79] [-Max74Ratio 1.5] [-Also79PlainLibrary] [-Fresh] [-NoBuild]
+#       [-Commissioned oracle,admission,timing74,timing79,lifecycle] [-Max74Ratio 1.5] [-Also79PlainLibrary] [-Fresh] [-NoBuild]
 # -BuildDir is a CMake build directory of THIS checkout (configured here with Ninja, Release, when it
 # has no CMakeCache.txt); superslm_pkv_c6 is (re)built in it unless -NoBuild. Exit 0 only when every
 # selected leg is GREEN.
@@ -250,7 +250,8 @@ function Get-IdleReport {
 if (($Commissioned -contains 'timing74') -and -not $Max74Ratio) { Write-Output 'NOTE: timing74 commissioned but no -Max74Ratio: 7.4 stays quarantined (the cell asserts only with a ratio)' }
 $envNames = @('SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR', 'SUPERSLM_PAGED_KV_79_OUT', 'SUPERSLM_PAGED_KV_79_BASELINE',
     'SUPERSLM_PAGED_KV_LIFE_OUT', 'SUPERSLM_PAGED_KV_LIFE_BASELINE',
-    'SUPERSLM_PAGED_KV_TIMING_COMMISSIONED', 'SUPERSLM_PAGED_KV_74_MAX_RATIO', 'SUPERSLM_PAGED_KV_FIXTURE_DIR')
+    'SUPERSLM_PAGED_KV_TIMING_COMMISSIONED', 'SUPERSLM_PAGED_KV_74_MAX_RATIO',
+    'SUPERSLM_PAGED_KV_LIFE_COMMISSIONED', 'SUPERSLM_PAGED_KV_FIXTURE_DIR')
 $results = @{}
 $stopTiming = $false
 foreach ($leg in $legs) {
