@@ -46,6 +46,27 @@ foreach(step c2 c3 c4 c5 c6)
 	endif()
 endforeach()
 
+# C6's measured 7.9/7.9b arms and piece-wise SSB5 prefill use the production
+# library. This target has no test-injection compile definitions or link input.
+add_executable(superslm_pkv_pair EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_pair.cpp)
+target_link_libraries(superslm_pkv_pair PRIVATE superslm)
+target_include_directories(superslm_pkv_pair PRIVATE ${PKV_DIR} include src tests)
+target_compile_definitions(superslm_pkv_pair PRIVATE PKV_REFERENCE_DIR="${PKV_DIR}/reference")
+if(MSVC)
+	target_compile_options(superslm_pkv_pair PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(superslm_pkv_pair PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+# Lifecycle cost has a frozen v1.11.0 baseline and a paged leg linked to the
+# production library. Its result cannot carry a seam or injection definition.
+superslm_pkv_target(superslm_pkv_lifecycle_prod LIBRARY superslm SOURCES ${PKV_DIR}/c6_lifecycle_timing.cpp)
+target_compile_definitions(superslm_pkv_lifecycle_prod PRIVATE PKV_LIFECYCLE_PRODUCTION_LEG=1)
+get_target_property(PKV_PROD_DEFS superslm COMPILE_DEFINITIONS)
+if("${PKV_PROD_DEFS}" MATCHES "SUPERSLM_.*(SEAM|INJECTION|INSTRUMENT)")
+	message(FATAL_ERROR "production superslm library carries a seam/injection definition; lifecycle grading refused")
+endif()
+
 # Cells 4.7/C5 and 6.3/C5: the DotRow tiers. superslm_pkv_c5's sources linked against each forced-tier
 # library of CMakeLists.txt in place of superslm_test_injection (x86-64 only, like those libraries;
 # EXCLUDE_FROM_ALL both). Each forced library carries the bad-alloc and matvec seams, so the whole C5

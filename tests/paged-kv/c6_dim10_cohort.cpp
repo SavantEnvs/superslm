@@ -24,6 +24,8 @@
 
 #include "pkv_budget_c_helpers.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
@@ -127,7 +129,43 @@ struct CohortRun {
 	std::vector<std::vector<int32_t>> tokens;   // per admitted sequence: everything it emitted
 	std::vector<sslm_status> end;               // the status that ended it
 	std::vector<std::vector<uint8_t>> mid, lim;  // 10.6's saves at 1,456 and at the limit
+	std::vector<std::string> mid_rows, lim_rows;  // direct page-peek digests at the reference record points
 };
+
+// Read the live page table and page bytes through the test seam, independently of
+// token output and of the save path. The reference digests use position-major rows.
+std::string CohortRows(const Fixture& fx, sslm_kv_pool pool, sslm_seq seq, int64_t length) {
+	std::vector<uint8_t> rows;
+	std::vector<uint8_t> page(fx.PageBytes());
+	int64_t loaded = -1;
+	for (int64_t pos = 0; pos < length; ++pos) {
+		if (pos / fx.B() != loaded) {
+			uint32_t index = 0, mapped = 0;
+			if (sslm_pkv_test_only_seq_table_entry(seq, static_cast<uint32_t>(pos / fx.B()), &index, &mapped) != SSLM_OK ||
+			    !mapped || sslm_pkv_test_only_peek_page_bytes(pool, index, page.data(), page.size()) != SSLM_OK)
+				return "(unreadable)";
+			loaded = pos / fx.B();
+		}
+		for (uint32_t layer = 0; layer < fx.geo.layers; ++layer)
+			for (uint32_t half = 0; half < 2; ++half)
+				for (uint32_t head = 0; head < fx.geo.kv_heads; ++head) {
+					const size_t offset = ((static_cast<size_t>(layer) * 2 + half) * fx.geo.kv_heads + head) *
+					                      static_cast<size_t>(fx.B()) * fx.geo.head_dim +
+					                      static_cast<size_t>(pos % fx.B()) * fx.geo.head_dim;
+					rows.insert(rows.end(), page.begin() + offset, page.begin() + offset + fx.geo.head_dim);
+				}
+	}
+	if (std::getenv("SUPERSLM_PAGED_KV_ROW_DIGEST_FLIP") && !rows.empty()) rows[rows.size() / 2] ^= 1;
+	return Sha(rows.data(), rows.size());
+}
+
+bool CheckCohortRows(const Fixture& fx, int persona, const std::string& mid, const std::string& lim) {
+	const RefFile& ref = Reference("v1.11.0", fx);
+	const std::string tag = "persona" + std::to_string(persona);
+	const RefRecord* a = RefLookup(ref, "cohort", tag + "_1456");
+	const RefRecord* b = RefLookup(ref, "cohort", tag + "_1712");
+	return a && b && mid == a->rows_sha && lim == b->rows_sha;
+}
 
 // Runs the cohort in a page pool of `pages`: every sequence is created, adopts its persona, emits 257
 // tokens (to 1,456: saved), and runs to its refusal (saved at the limit).
@@ -155,10 +193,12 @@ CohortRun RunCohort(const Fixture& fx, uint32_t pages, bool keep_blobs, bool dri
 		if (!drive_tokens) continue;  // 10.4 grades admission; 10.1 grades the full decode and its end state.
 		sslm_status a = SSLM_OK, b = SSLM_OK;
 		std::vector<int32_t> t = DecodeN(fx.model, s, kMidAt - kOrigin + 1, &a);
+		if (drive_tokens) r.mid_rows.push_back(CohortRows(fx, pool.pool, s, kMidAt));
 		if (keep_blobs) r.mid.push_back(Save(s));
 		const std::vector<int32_t> rest = RunToRefusal(fx.model, s, &b);
 		t.insert(t.end(), rest.begin(), rest.end());
 		if (keep_blobs) r.lim.push_back(Save(s));
+		if (drive_tokens) r.lim_rows.push_back(CohortRows(fx, pool.pool, s, kOrigin + kBudget));
 		PKV_CHECK_MSG(a == SSLM_OK, "sequence %d: status %d before 1,456", i, static_cast<int>(a));
 		r.tokens.push_back(t);
 		r.end.push_back(b);
@@ -194,15 +234,19 @@ CohortRun RunCohortShard(const Fixture& fx, int shard) {
 	r.tokens.resize(kSeqs);
 	r.mid.resize(kSeqs);
 	r.lim.resize(kSeqs);
+	r.mid_rows.resize(kSeqs);
+	r.lim_rows.resize(kSeqs);
 	r.end.resize(kSeqs, SSLM_OK);
 	for (int i = shard * 10; i < (shard + 1) * 10 && w.ok; ++i) {
 		if (!seqs[i]) continue;
 		sslm_status a = SSLM_OK, b = SSLM_OK;
 		std::vector<int32_t> t = DecodeN(fx.model, seqs[i], kMidAt - kOrigin + 1, &a);
 		r.mid[i] = Save(seqs[i]);
+		r.mid_rows[i] = CohortRows(fx, pool.pool, seqs[i], kMidAt);
 		const std::vector<int32_t> rest = RunToRefusal(fx.model, seqs[i], &b);
 		t.insert(t.end(), rest.begin(), rest.end());
 		r.lim[i] = Save(seqs[i]);
+		r.lim_rows[i] = CohortRows(fx, pool.pool, seqs[i], kOrigin + kBudget);
 		r.tokens[i] = std::move(t);
 		r.end[i] = b;
 		PKV_CHECK_MSG(a == SSLM_OK, "10.1 shard %d: sequence %d status %d before 1,456", shard, i, static_cast<int>(a));
@@ -240,24 +284,53 @@ bool CacheTokens(std::fstream& f, std::vector<int32_t>* tokens, bool reading) {
 	}
 	return static_cast<bool>(f);
 }
+bool CacheDigest(std::fstream& f, std::string* digest, bool reading) {
+	char bytes[64]{};
+	if (reading) {
+		f.read(bytes, sizeof bytes);
+		if (!f) return false;
+		*digest = std::string(bytes, sizeof bytes);
+		if (digest->find_first_not_of('\0') == std::string::npos) {
+			digest->clear();
+			return true;
+		}
+		return std::all_of(digest->begin(), digest->end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); });
+	}
+	if (!digest->empty() && digest->size() != sizeof bytes) return false;
+	f.write(digest->empty() ? bytes : digest->data(), sizeof bytes);
+	return static_cast<bool>(f);
+}
+bool CacheStatus(std::fstream& f, sslm_status* status, bool reading) {
+	int32_t value = reading ? 0 : static_cast<int32_t>(*status);
+	if (reading) f.read(reinterpret_cast<char*>(&value), sizeof value);
+	else f.write(reinterpret_cast<const char*>(&value), sizeof value);
+	if (!f || (value != SSLM_OK && value != PKV_KV_BUDGET_EXCEEDED)) return false;
+	if (reading) *status = static_cast<sslm_status>(value);
+	return true;
+}
 bool CohortCache(const Fixture& fx, const std::string& path, const std::string& head, CohortRun* r, bool reading) {
 	std::fstream f(path, std::ios::binary | (reading ? std::ios::in : std::ios::out | std::ios::trunc));
 	if (!f) return false;
 	if (reading) {
 		std::string magic, sha, saved_head;
 		if (!GetTextLine(f, magic) || !GetTextLine(f, sha) || !GetTextLine(f, saved_head) ||
-		    magic != "PKVC6-CACHE-1" || sha != fx.sha || saved_head != head) return false;
+		    magic != "PKVC6-CACHE-3" || sha != fx.sha || saved_head != head) return false;
 		r->built = true;
 		r->tokens.resize(kSeqs);
 		r->mid.resize(kSeqs);
 		r->lim.resize(kSeqs);
+		r->mid_rows.resize(kSeqs);
+		r->lim_rows.resize(kSeqs);
+		r->end.resize(kSeqs);
 	} else {
-		f << "PKVC6-CACHE-1\n" << fx.sha << "\n" << head << "\n";
+		f << "PKVC6-CACHE-3\n" << fx.sha << "\n" << head << "\n";
 	}
 	for (int i = 0; i < kSeqs; ++i) {
 		if (!CacheTokens(f, &r->tokens[i], reading) || !CacheVector(f, &r->mid[i], reading) ||
-		    !CacheVector(f, &r->lim[i], reading)) return false;
-		if (reading && (r->tokens[i].size() != 1u + kBudget || r->mid[i].empty() || r->lim[i].empty())) return false;
+		    !CacheVector(f, &r->lim[i], reading) || !CacheDigest(f, &r->mid_rows[i], reading) ||
+		    !CacheDigest(f, &r->lim_rows[i], reading) || !CacheStatus(f, &r->end[i], reading)) return false;
+		if (reading && (r->tokens[i].size() != 1u + kBudget || r->mid[i].empty() || r->lim[i].empty() ||
+		                r->end[i] != PKV_KV_BUDGET_EXCEEDED)) return false;
 	}
 	if (reading) return f.peek() == std::char_traits<char>::eof();
 	f.flush();
@@ -274,22 +347,28 @@ bool CohortShardCache(const Fixture& fx, const std::string& path, const std::str
 	if (reading) {
 		std::string magic, sha, saved_head, saved_shard;
 		if (!GetTextLine(f, magic) || !GetTextLine(f, sha) || !GetTextLine(f, saved_head) ||
-		    !GetTextLine(f, saved_shard) || magic != "PKVC6-SHARD-1" || sha != fx.sha ||
+		    !GetTextLine(f, saved_shard) || magic != "PKVC6-SHARD-3" || sha != fx.sha ||
 		    saved_head != head || saved_shard != std::to_string(shard)) return false;
 		r->built = true;
 		r->tokens.resize(kSeqs);
 		r->mid.resize(kSeqs);
 		r->lim.resize(kSeqs);
+		r->mid_rows.resize(kSeqs);
+		r->lim_rows.resize(kSeqs);
+		r->end.resize(kSeqs);
 	} else {
-		f << "PKVC6-SHARD-1\n" << fx.sha << "\n" << head << "\n" << shard << "\n";
+		f << "PKVC6-SHARD-3\n" << fx.sha << "\n" << head << "\n" << shard << "\n";
 	}
 	for (int i = 0; i < kSeqs; ++i) {
 		if (!CacheTokens(f, &r->tokens[i], reading) || !CacheVector(f, &r->mid[i], reading) ||
-		    !CacheVector(f, &r->lim[i], reading)) return false;
+		    !CacheVector(f, &r->lim[i], reading) || !CacheDigest(f, &r->mid_rows[i], reading) ||
+		    !CacheDigest(f, &r->lim_rows[i], reading) || !CacheStatus(f, &r->end[i], reading)) return false;
 		if (reading) {
 			const bool selected = i >= shard * 10 && i < (shard + 1) * 10;
-			if (selected != (r->tokens[i].size() == 1u + kBudget && !r->mid[i].empty() && !r->lim[i].empty())) return false;
-			if (!selected && (!r->tokens[i].empty() || !r->mid[i].empty() || !r->lim[i].empty())) return false;
+			if (selected != (r->tokens[i].size() == 1u + kBudget && !r->mid[i].empty() && !r->lim[i].empty() &&
+			                 !r->mid_rows[i].empty() && !r->lim_rows[i].empty() && r->end[i] == PKV_KV_BUDGET_EXCEEDED)) return false;
+			if (!selected && (!r->tokens[i].empty() || !r->mid[i].empty() || !r->lim[i].empty() ||
+			                  !r->mid_rows[i].empty() || !r->lim_rows[i].empty() || r->end[i] != SSLM_OK)) return false;
 		}
 	}
 	if (reading) return f.peek() == std::char_traits<char>::eof();
@@ -329,6 +408,9 @@ const CohortRun& Cohort(const Fixture& fx) {
 			joined.tokens.resize(kSeqs);
 			joined.mid.resize(kSeqs);
 			joined.lim.resize(kSeqs);
+			joined.mid_rows.resize(kSeqs);
+			joined.lim_rows.resize(kSeqs);
+			joined.end.resize(kSeqs, SSLM_OK);
 			for (int shard = 0; shard < 5; ++shard) {
 				const std::string part = ShardPath(dir, fx, head, shard);
 				CohortRun one;
@@ -338,7 +420,10 @@ const CohortRun& Cohort(const Fixture& fx) {
 				for (int i = shard * 10; i < (shard + 1) * 10; ++i) {
 					joined.tokens[i] = std::move(one.tokens[i]);
 					joined.mid[i] = std::move(one.mid[i]);
-					joined.lim[i] = std::move(one.lim[i]);
+			joined.lim[i] = std::move(one.lim[i]);
+			joined.mid_rows[i] = std::move(one.mid_rows[i]);
+			joined.lim_rows[i] = std::move(one.lim_rows[i]);
+			joined.end[i] = one.end[i];
 				}
 				std::printf("C6 cohort shard loaded: %s\n", part.c_str());
 			}
@@ -380,10 +465,12 @@ void Cell101On(const Fixture& fx) {
 		PKV_CHECK_MSG(valid, "10.1 shard %d: full cohort admission failed", shard);
 		for (int i = shard * 10; i < (shard + 1) * 10; ++i) {
 			const std::vector<int32_t> ref = RefTokens(fx, PersonaOf(i));
-			const bool good = r.tokens[i].size() == 1u + kBudget && r.end[i] == PKV_KV_BUDGET_EXCEEDED &&
-			                  r.tokens[i] == ref && !r.mid[i].empty() && !r.lim[i].empty();
-			PKV_CHECK_MSG(good, "10.1 shard %d: sequence %d differs from v1.11.0 or did not reach its limit", shard, i);
-			valid = valid && good;
+			const bool tokens = r.tokens[i].size() == 1u + kBudget && r.end[i] == PKV_KV_BUDGET_EXCEEDED &&
+			                    r.tokens[i] == ref && !r.mid[i].empty() && !r.lim[i].empty();
+			const bool rows = CheckCohortRows(fx, PersonaOf(i), r.mid_rows[i], r.lim_rows[i]);
+			PKV_CHECK_MSG(tokens, "10.1 shard %d: sequence %d differs in tokens or did not reach its limit", shard, i);
+			PKV_CHECK_MSG(rows, "10.1 shard %d: sequence %d K/V row digest differs from v1.11.0", shard, i);
+			valid = valid && tokens && rows;
 		}
 		if (valid) {
 			const std::string path = ShardPath(dir, fx, head, shard);
@@ -396,8 +483,10 @@ void Cell101On(const Fixture& fx) {
 		return;
 	}
 	const CohortRun& r = Cohort(fx);
-	PKV_CHECK_MSG(r.built && r.first_refused < 0 && r.tokens.size() == kSeqs, "10.1 %s: the cohort did not build (%zu sequences)",
+	PKV_CHECK_MSG(r.built && r.first_refused < 0 && r.tokens.size() == kSeqs && r.mid_rows.size() == kSeqs &&
+	              r.lim_rows.size() == kSeqs, "10.1 %s: the cohort did not build (%zu sequences)",
 	              fx.stem.c_str(), r.tokens.size());
+	if (r.tokens.size() != kSeqs || r.mid_rows.size() != kSeqs || r.lim_rows.size() != kSeqs) return;
 	std::vector<std::vector<int32_t>> ref;
 	for (int p = 0; p < kPersonas; ++p) ref.push_back(RefTokens(fx, p));
 	for (size_t i = 0; i < r.tokens.size(); ++i) {
@@ -407,6 +496,8 @@ void Cell101On(const Fixture& fx) {
 		// tail copied short, a begin_from child missing its parent's state)
 		PKV_CHECK_MSG(r.tokens[i] == ref[static_cast<size_t>(PersonaOf(static_cast<int>(i)))],
 		              "10.1 %s: sequence %zu's tokens differ from the no-sharing run on v1.11.0", fx.stem.c_str(), i);
+		PKV_CHECK_MSG(CheckCohortRows(fx, PersonaOf(static_cast<int>(i)), r.mid_rows[i], r.lim_rows[i]),
+		              "10.1 %s: sequence %zu K/V rows differ from both reference record points", fx.stem.c_str(), i);
 	}
 }
 
@@ -432,6 +523,7 @@ void Cell102On(const Fixture& fx) {
 	}
 	// decoded as one batch, as a host serves a cohort
 	std::vector<std::vector<int32_t>> got(seqs.size());
+	std::vector<std::string> mid_rows(seqs.size());
 	sslm_decode_params p{};
 	p.layer_budget = 1;
 	std::vector<int32_t> out(seqs.size());
@@ -440,12 +532,19 @@ void Cell102On(const Fixture& fx) {
 		st = sslm_decode_step(fx.model, seqs.data(), static_cast<int32_t>(seqs.size()), &p, nullptr, out.data());
 		if (st != SSLM_OK) break;
 		for (size_t i = 0; i < seqs.size(); ++i)
-			if (out[i] >= 0) got[i].push_back(out[i]);
+			if (out[i] >= 0) {
+				got[i].push_back(out[i]);
+				if (got[i].size() == static_cast<size_t>(kMidAt - kOrigin + 1))
+					mid_rows[i] = CohortRows(fx, pool.pool, seqs[i], kMidAt);
+			}
 	}
 	PKV_CHECK_EQ(st, PKV_KV_BUDGET_EXCEEDED);
 	for (size_t i = 0; i < got.size(); ++i) {
 		PKV_CHECK_EQ(got[i].size(), 1 + kBudget);
 		PKV_CHECK_MSG(got[i] == ref, "10.2 %s: sequence %zu's tokens differ from v1.11.0's", fx.stem.c_str(), i);
+		const std::string lim_rows = CohortRows(fx, pool.pool, seqs[i], kOrigin + kBudget);
+		PKV_CHECK_MSG(CheckCohortRows(fx, 0, mid_rows[i], lim_rows),
+		              "10.2 %s: sequence %zu K/V rows differ from both reference record points", fx.stem.c_str(), i);
 	}
 	for (auto it = seqs.rbegin(); it != seqs.rend(); ++it) sslm_seq_release(*it);
 	w.Release();

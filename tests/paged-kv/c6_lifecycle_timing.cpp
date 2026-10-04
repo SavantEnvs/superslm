@@ -45,6 +45,11 @@
 // interleaved across all readings so a drift reaches every reading alike. The resolving power of a
 // change is the larger of the two sides' spreads.
 
+#if defined(PKV_LIFECYCLE_PRODUCTION_LEG) && \
+    (defined(SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS) || defined(SUPERSLM_ENABLE_BAD_ALLOC_INJECTION) || \
+     defined(SUPERSLM_ENABLE_MATVEC_TEST_SEAMS) || defined(SUPERSLM_ENABLE_MATMUL_DISPATCH_INSTRUMENT))
+#error A paged lifecycle production leg with a seam or injection definition cannot publish a result.
+#endif
 #include "pkv_budget_c_helpers.h"
 
 #include <algorithm>
@@ -297,6 +302,20 @@ std::string Us(double ns) {
 	return b;
 }
 
+bool ChangeResolved(const Reading& paged, const Reading& base) {
+	return base.median > 0 && paged.median > 0 &&
+	       std::fabs(paged.median / base.median - 1.0) >= std::max(paged.spread, base.spread);
+}
+
+void CellLifecycleConstructions() {
+	const Reading baseline{true, 1.0, 2.804};
+	const Reading aa{true, 1.0, 2.804};
+	const Reading reset_mutant{true, 64.0 / 2.804, 2.804};
+	PKV_CHECK(!ChangeResolved(aa, baseline));
+	PKV_CHECK(ChangeResolved(reset_mutant, baseline));
+	PKV_CHECK(64.0 / 2.804 > 22.0);
+}
+
 // Prints one reading against its baseline, then its verdict in the timing cells' shared vocabulary
 // (pkv_common.h): NO RESULT when |change| is below the resolving power, RESOLVED otherwise. No bar exists
 // for a lifecycle verb, so there is no PASS or FAIL and nothing is asserted.
@@ -311,7 +330,7 @@ void Report(const std::string& key, const Reading& paged, const Reading* base) {
 	}
 	const double change = paged.median / base->median - 1.0;  // positive: the paged build is slower
 	const double resolving = std::max(paged.spread, base->spread);
-	const bool resolved = std::fabs(change) >= resolving;
+	const bool resolved = ChangeResolved(paged, *base);
 	std::printf("lifecycle %s: baseline %s, paged %s, change %+.2f%%, resolving power %.2f%%\n", key.c_str(), Us(base->median).c_str(),
 	            Us(paged.median).c_str(), change * 100, resolving * 100);
 	PrintTimingVerdict("lifecycle", key, resolved ? TimingVerdict::kResolved : TimingVerdict::kNoResult,
@@ -383,5 +402,6 @@ void CellLifecycleFixtures() {
 
 PKV_CELL("lifecycle/C6", "C6", CellLifecycleBox);
 PKV_CELL("lifecycle/C6:fixtures", "C6", CellLifecycleFixtures);
+PKV_CELL("lifecycle/C6:constructions", "C6", CellLifecycleConstructions);
 
 }  // namespace

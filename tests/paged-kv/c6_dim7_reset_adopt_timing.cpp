@@ -1,177 +1,143 @@
-// Paged-KV plan (rev 16.1) step C1: cell 7.4, owned by C6 (§7, §8's timing harness).
-//
-// 7.4 "Reset and adopt do not scale with the cap": the same live length timed at caps 4096 and 32768.
-// Dimension 7 checks that the measurement exists; the value is calibration's (§8): the timing harness is
-// commissioned at C6 on the box, and until then its readings are quarantined (recorded, never acted
-// on). So the cell measures and prints, and asserts the ratio only when the box supplies the commissioned
-// bound in SUPERSLM_PAGED_KV_74_MAX_RATIO (the largest cap-32768 / cap-4096 median ratio calibration
-// accepts as "does not scale"; a cap-proportional verb shows about 8).
-//
-// The construction: a 1,000-token prefix (mid-page, so share adopt copies a tail page), and a holder
-// that alternates adopt and reset, so each reset unmaps a live length of 1,000 and each adopt maps one.
-// Both holder modes: budget (share adopt, §3.5) and whole_reserve (copy adopt of ceil(1000/B) pages; its
-// reset is O(mapped) once the memset is gone, §3.3).
-//
-// Each reading is the median of kBatches batch medians of kCalls timed calls (205 calls), the batches of
-// the cap-4096 and cap-32768 holders interleaved so a drift reaches both alike. Its relative spread is
-// (max - min) / median over the batch medians, and the resolving power of a ratio is the larger of the
-// two sides' spreads (7.9's and c6_lifecycle_timing.cpp's convention). Each ratio is printed with it and
-// graded three ways (pkv_common.h's timing verdicts) against the bound, by its relative distance
-// d = ratio / bound - 1: NO RESULT when |d| is within the resolving power, PASS when d <= -resolving,
-// FAIL when d > resolving. A NO RESULT asserts nothing.
-//
-// Registered twice: "7.4/C6" on the box's real artifacts (0.5B at cap 4096 and 1.5B at cap 32768 from
-// SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR; per-token bytes differ, so the printed figures are also given
-// per byte of the live rows), and "7.4/C6:fixtures" on pkv_def and pkv_32k, which differ only in cap.
-
+// C6 7.4: paired calls at two caps on one model; fixed timer vitality precedes grading.
 #include "pkv_budget_c_helpers.h"
-
 #include <algorithm>
-#include <chrono>
 #include <cmath>
-#include <memory>
-#include <string>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <random>
 #include <vector>
 
-namespace {
+#if defined(_M_X64) || defined(__x86_64__)
+#define PKV_74_X86 1
+#include <immintrin.h>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#include <pthread.h>
+#include <sched.h>
+#endif
+#else
+#define PKV_74_X86 0
+#endif
 
+namespace {
 using namespace pkv;
 using namespace pkv::bc;
+constexpr int kPairs = 205;
+enum class Verdict { Pass, Fail, NoResult };
 
-constexpr int kBatches = 5;
-constexpr int kCalls = 41;
-constexpr int32_t kLive = 1000;
-
-double Median(std::vector<double> v) {
-	if (v.empty()) return 0;
-	std::sort(v.begin(), v.end());
-	return v[v.size() / 2];
+double Median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v.empty() ? 0 : v[v.size()/2]; }
+bool Vitality(double low, double large, double empty) {
+	return low > empty && large > empty && (large-empty)/(low-empty) >= 9.0 && (large-empty)/(low-empty) <= 11.0;
 }
+Verdict Grade(std::vector<double> v, double* lo=nullptr, double* hi=nullptr) {
+	if (v.size()!=kPairs || std::any_of(v.begin(), v.end(), [](double x){return !std::isfinite(x)||x<=0;})) return Verdict::NoResult;
+	std::sort(v.begin(), v.end()); if(lo)*lo=v[85]; if(hi)*hi=v[119];
+	if(v[119]<=2.0)return Verdict::Pass; if(v[85]>2.0)return Verdict::Fail; return Verdict::NoResult;
+}
+void Constructions() {
+	std::vector<double> v(kPairs,1.0); PKV_CHECK(Grade(v)==Verdict::Pass);
+	std::fill(v.begin(),v.end(),8.0); PKV_CHECK(Grade(v)==Verdict::Fail);
+	std::fill(v.begin(),v.end(),4.0); PKV_CHECK(Grade(v)==Verdict::Fail);
+	PKV_CHECK(Vitality(120,1020,20));
+	for(double cost:{20.0,40.0,80.0,200.0}) {
+		PKV_CHECK(!Vitality(100+cost,1000+cost,0));
+		PKV_CHECK(Vitality(100+cost,1000+cost,cost));
+	}
+}
+[[noreturn]] void Refuse(int code,const char* why) { std::fprintf(stderr,"7.4 INFRASTRUCTURE %d: %s\n",code,why); std::exit(code); }
 
-struct Reading {
-	double median = 0;  // ns per call: the median of the batch medians
-	double spread = 0;  // (max - min) / median over the batch medians
+#if PKV_74_X86
+struct Pin {
+	bool ok=false;
+#if defined(_WIN32)
+	DWORD_PTR old=0;
+	Pin(){DWORD_PTR p=0,s=0;if(GetProcessAffinityMask(GetCurrentProcess(),&p,&s)&&p){old=SetThreadAffinityMask(GetCurrentThread(),p&(~p+1));ok=old!=0;}}
+	~Pin(){if(old)SetThreadAffinityMask(GetCurrentThread(),old);}
+#else
+	cpu_set_t old{};
+	Pin(){if(pthread_getaffinity_np(pthread_self(),sizeof old,&old))return;for(int c=0;c<CPU_SETSIZE;++c)if(CPU_ISSET(c,&old)){cpu_set_t one;CPU_ZERO(&one);CPU_SET(c,&one);ok=pthread_setaffinity_np(pthread_self(),sizeof one,&one)==0;return;}}
+	~Pin(){if(ok)pthread_setaffinity_np(pthread_self(),sizeof old,&old);}
+#endif
 };
-
-Reading Of(std::vector<double> batch_medians) {
-	Reading r;
-	r.median = Median(batch_medians);
-	std::sort(batch_medians.begin(), batch_medians.end());
-	r.spread = r.median > 0 && !batch_medians.empty() ? (batch_medians.back() - batch_medians.front()) / r.median : 0;
-	return r;
+bool TscInvariant(){
+#if defined(_WIN32)
+	int r[4]{};__cpuid(r,0x80000000);if(static_cast<unsigned>(r[0])<0x80000007u)return false;__cpuid(r,0x80000007);return (r[3]&(1<<8))!=0;
+#else
+	unsigned a,b,c,d;if(__get_cpuid_max(0x80000000,nullptr)<0x80000007u)return false;__get_cpuid(0x80000007,&a,&b,&c,&d);return (d&(1u<<8))!=0;
+#endif
 }
-
-// One side: a rig with the prefix and the alternating holder, timed one batch at a time.
-class Side {
-public:
-	Side(const Fixture& fx, bool budget_holder) : fx_(fx) {
-		if (!fx.ok) return;
-		const int64_t own = budget_holder ? fx.R(512) : fx.CapPages();
-		rig_ = std::make_unique<Rig>(fx, static_cast<uint32_t>(fx.R(kLive) + own + 4));
-		px_ = rig_->Prefix(BudgetPrefix(fx, rig_->Pool(), PrefixTokens(kLive)));
-		sslm_seq s = nullptr;
-		const sslm_status st =
-		    budget_holder ? sslm_seq_create_budgeted(fx.model, rig_->Pool(), 512, &s) : sslm_seq_create(fx.model, rig_->Pool(), &s);
-		PKV_CHECK_EQ(st, SSLM_OK);
-		s_ = rig_->Seq(s);
-		ok_ = px_ && s_;
-	}
-	bool ok() const { return ok_; }
-	void Batch() {
-		if (!ok_) return;
-		std::vector<double> reset, adopt;
-		using clock = std::chrono::steady_clock;
-		for (int i = 0; i < kCalls; ++i) {
-			const auto t0 = clock::now();
-			const sslm_status a = sslm_seq_adopt_prefix(s_, px_);
-			const auto t1 = clock::now();
-			const sslm_status r = sslm_seq_reset(s_);
-			const auto t2 = clock::now();
-			PKV_CHECK_MSG(a == SSLM_OK && r == SSLM_OK, "7.4 %s: adopt %d, reset %d", fx_.stem.c_str(), static_cast<int>(a), static_cast<int>(r));
-			if (a != SSLM_OK || r != SSLM_OK) {
-				ok_ = false;
-				return;
-			}
-			adopt.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count());
-			reset.push_back(std::chrono::duration<double, std::nano>(t2 - t1).count());
-		}
-		adopt_.push_back(Median(adopt));
-		reset_.push_back(Median(reset));
-	}
-	Reading Reset() const { return Of(reset_); }
-	Reading Adopt() const { return Of(adopt_); }
-
-private:
-	const Fixture& fx_;
-	std::unique_ptr<Rig> rig_;
-	sslm_prefix px_ = nullptr;
-	sslm_seq s_ = nullptr;
-	bool ok_ = false;
-	std::vector<double> reset_, adopt_;  // batch medians
+bool use_rdtscp=false;
+bool RdtscpAvailable(){
+#if defined(_WIN32)
+	int r[4]{};__cpuid(r,0x80000000);if(static_cast<unsigned>(r[0])<0x80000001u)return false;__cpuid(r,0x80000001);return (r[3]&(1<<27))!=0;
+#else
+	unsigned a,b,c,d;if(__get_cpuid_max(0x80000000,nullptr)<0x80000001u)return false;__get_cpuid(0x80000001,&a,&b,&c,&d);return (d&(1u<<27))!=0;
+#endif
+}
+uint64_t Tick(){_mm_lfence();unsigned aux=0;auto t=use_rdtscp?__rdtscp(&aux):__rdtsc();_mm_lfence();return t;}
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+uint64_t Adds(int n){volatile uint64_t x=0;for(int i=0;i<n;++i)x=x+static_cast<uint64_t>(i+1);return x;}
+struct Clock {
+	double empty=0, resolution=0;bool okay=false;
+	Clock(){std::vector<double> e,a,b;for(int i=0;i<21;++i){auto x=Tick(),y=Tick();e.push_back(double(y-x));
+		x=Tick();(void)Adds(i%2?1000:100);y=Tick();(i%2?b:a).push_back(double(y-x));
+		x=Tick();(void)Adds(i%2?100:1000);y=Tick();(i%2?a:b).push_back(double(y-x));}
+		empty=Median(e);resolution=*std::min_element(e.begin(),e.end());okay=Vitality(Median(a),Median(b),empty);
+		std::printf("7.4t: resolution %.0f ticks empty %.0f 100 %.0f 1000 %.0f ratio %.3f %s\n",resolution,empty,Median(a),Median(b),(Median(a)>empty)?(Median(b)-empty)/(Median(a)-empty):0,okay?"PASS":"INFRASTRUCTURE");}
 };
-
-// Prints one verb's ratio with its resolving power and, given a bound, its verdict; asserts a PASS or
-// FAIL only (a bound is given only once the harness is commissioned, above).
-void GradeRatio(const char* mode, const char* verb, const Reading& a, const Reading& b, const char* bound) {
-	const double ratio = b.median / a.median;
-	const double resolving = std::max(a.spread, b.spread);
-	std::printf("7.4 %s %s: ratio %.3f (cap 32768 / cap 4096), resolving power %.2f%%\n", mode, verb, ratio, resolving * 100);
-	if (!bound) return;
-	const double max_ratio = std::atof(bound);
-	// Relative units: the ratio over the bound, against 1, so the (relative) resolving power applies as is.
-	// No "effect below the resolving power" rule here: 7.4's claim is the ratio's place against the bound,
-	// and a ratio near 1 is that claim's pass, not an absent effect.
-	const double d = ratio / max_ratio - 1.0;
-	const TimingVerdict v = GradeAgainstBound(ratio / max_ratio, 1.0, resolving);
-	const std::string why =
-	    Fmt("ratio %.3f is %.2f%% %s the bound %.3f, %s the resolving power %.2f%%", ratio, std::fabs(d) * 100, d > 0 ? "above" : "below",
-	        max_ratio, v == TimingVerdict::kNoResult ? "within" : "beyond", resolving * 100);
-	PrintTimingVerdict("7.4", std::string(mode) + " " + verb, v, why, true);
-	if (v == TimingVerdict::kNoResult) return;
-	// kills: a reset or adopt whose cost follows the cap (the memset, a cap-sized table fill, a whole-block
-	// copy): about 8x from 4096 to 32768
-	PKV_CHECK_MSG(v == TimingVerdict::kPass, "7.4 %s %s: ratio %.3f above the commissioned %.3f by more than the resolving power %.2f%%",
-	              mode, verb, ratio, max_ratio, resolving * 100);
-}
-
-void Run74(const Fixture& small, const Fixture& large) {
-	if (!small.ok || !large.ok) return;
-	PKV_CHECK_EQ(small.geo.context_cap, 4096);
-	PKV_CHECK_EQ(large.geo.context_cap, 32768);
-	const char* bound = std::getenv("SUPERSLM_PAGED_KV_74_MAX_RATIO");
-	for (int budget_holder = 1; budget_holder >= 0; --budget_holder) {
-		Side sa(small, budget_holder), sb(large, budget_holder);
-		if (!sa.ok() || !sb.ok()) continue;
-		for (int batch = 0; batch < kBatches; ++batch) {
-			sa.Batch();
-			sb.Batch();
-		}
-		if (!sa.ok() || !sb.ok()) continue;
-		const Reading ar = sa.Reset(), br = sb.Reset(), aa = sa.Adopt(), ba = sb.Adopt();
-		const double live_a = static_cast<double>(kLive) * small.BytesPerToken(), live_b = static_cast<double>(kLive) * large.BytesPerToken();
-		const char* mode = budget_holder ? "budget" : "whole_reserve";
-		std::printf("7.4 %s holder, live length %d: reset %.0f ns (cap 4096, %s, spread %.2f%%) / %.0f ns (cap 32768, %s, spread %.2f%%); "
-		            "adopt %.0f (spread %.2f%%) / %.0f ns (spread %.2f%%); per live byte: reset %.4f / %.4f, adopt %.4f / %.4f ns\n",
-		            mode, kLive, ar.median, small.stem.c_str(), ar.spread * 100, br.median, large.stem.c_str(), br.spread * 100, aa.median,
-		            aa.spread * 100, ba.median, ba.spread * 100, ar.median / live_a, br.median / live_b, aa.median / live_a,
-		            ba.median / live_b);
-		// The FAIL message's "<mode> reset: ratio" is what run_commissioning.py's timing74 reject reads.
-		GradeRatio(mode, "reset", ar, br, bound);
-		GradeRatio(mode, "adopt", aa, ba, bound);
-		if (!bound)
-			std::printf("7.4: quarantined reading (SUPERSLM_PAGED_KV_74_MAX_RATIO unset: the timing harness is not commissioned)\n");
+void Delay(uint64_t ticks){auto start=Tick();while(Tick()-start<ticks)_mm_pause();}
+struct Side {
+	const Fixture& fx;std::unique_ptr<Rig> rig;sslm_prefix prefix=nullptr;sslm_seq seq=nullptr;bool ok=false;
+	Side(const Fixture& f,bool budget):fx(f){if(!f.ok)return;auto own=budget?f.R(512):f.CapPages();rig=std::make_unique<Rig>(f,static_cast<uint32_t>(f.R(1000)+own+4));
+		prefix=rig->Prefix(BudgetPrefix(f,rig->Pool(),PrefixTokens(1000)));sslm_seq s=nullptr;
+		auto st=budget?sslm_seq_create_budgeted(f.model,rig->Pool(),512,&s):sslm_seq_create(f.model,rig->Pool(),&s);seq=rig->Seq(s);ok=st==SSLM_OK&&prefix&&seq;}
+	bool Call(double empty,double extra_adopt,double extra_reset,double* adopt,double* reset){if(!ok)return false;auto a=Tick();auto sa=sslm_seq_adopt_prefix(seq,prefix);if(extra_adopt>0)Delay(static_cast<uint64_t>(extra_adopt));auto b=Tick();
+		auto sr=sslm_seq_reset(seq);if(extra_reset>0)Delay(static_cast<uint64_t>(extra_reset));auto c=Tick();ok=sa==SSLM_OK&&sr==SSLM_OK;*adopt=double(b-a)-empty;*reset=double(c-b)-empty;return ok;}
+};
+void Run74(const Fixture& low,const Fixture& large){
+	if(!low.ok||!large.ok)Refuse(71,"artifact missing or unable to load");
+	if(low.geo.context_cap!=4096||large.geo.context_cap!=32768)Refuse(72,"wrong cap");
+	if(low.geo.layers!=large.geo.layers||low.geo.kv_heads!=large.geo.kv_heads||low.geo.head_dim!=large.geo.head_dim||low.B()!=large.B()||
+	   sslm_kv_page_size(low.model)!=sslm_kv_page_size(large.model))Refuse(71,"geometry mismatch");
+	if(!TscInvariant())Refuse(73,"invariant TSC absent");Pin pin;if(!pin.ok)Refuse(73,"cannot pin timing thread");Clock clock;
+	if(!clock.okay&&RdtscpAvailable()){use_rdtscp=true;clock=Clock();}
+	if(!clock.okay)Refuse(76,"fixed-L timer vitality failed with every supported fence");
+	std::printf("7.4 artifact hashes: cap4096=%s cap32768=%s\n",low.sha.c_str(),large.sha.c_str());bool unresolved=false;
+	for(bool budget:{true,false}){Side a(low,budget),b(large,budget);if(!a.ok||!b.ok)Refuse(71,"holder creation failed");
+		for(int i=0;i<10;++i){double x=0,y=0;if(!a.Call(clock.empty,0,0,&x,&y)||!b.Call(clock.empty,0,0,&x,&y))Refuse(71,"warmup failed");}
+		double ad0=0,re0=0;if(!a.Call(clock.empty,0,0,&ad0,&re0))Refuse(71,"control probe failed");
+		double extra_ad=std::getenv("SUPERSLM_PAGED_KV_74_ADOPT_MUTANT")?std::max(0.0,3*ad0):0;
+		double extra_re=std::getenv("SUPERSLM_PAGED_KV_74_RESET_MUTANT")?std::max(0.0,7*re0):0;
+		std::vector<double> ra,rb,aa,ab,adopt_ratios,reset_ratios;std::mt19937 rng(7404+static_cast<unsigned>(budget));
+		for(int i=0;i<kPairs;++i){double xad=0,xre=0,yad=0,yre=0;
+			auto first=[&]{return a.Call(clock.empty,0,0,&xad,&xre);};auto second=[&]{return b.Call(clock.empty,extra_ad,extra_re,&yad,&yre);};
+			if(!((rng()&1)?(first()&&second()):(second()&&first())))Refuse(71,"timed verb failed");
+			aa.push_back(xad);ab.push_back(yad);ra.push_back(xre);rb.push_back(yre);adopt_ratios.push_back(yad/xad);reset_ratios.push_back(yre/xre);}
+		if(Median(aa)<100||Median(ab)<100||Median(ra)<100||Median(rb)<100)Refuse(74,"corrected median under 100 ticks");
+		for(auto& entry:{std::pair{"adopt",adopt_ratios},std::pair{"reset",reset_ratios}}){double lo=0,hi=0;auto verdict=Grade(entry.second,&lo,&hi);
+			std::printf("7.4 %s %s r(86)=%.3f r(120)=%.3f bound=2.0 %s\n",budget?"budget":"whole_reserve",entry.first,lo,hi,verdict==Verdict::Pass?"PASS":verdict==Verdict::Fail?"FAIL":"NO RESULT");
+			PKV_CHECK_MSG(verdict!=Verdict::Fail,"7.4 %s %s: ratio above 2.0",budget?"budget":"whole_reserve",entry.first);unresolved|=verdict==Verdict::NoResult;}
 	}
+	if(unresolved)Refuse(75,"sign interval did not resolve the bound");
 }
-
-void Cell74Box() {
-	Run74(GetArtifact("qwen2.5-0.5b-instruct-cap4096-aex.sslm", Geometry{24, 2, 64, 4096}),
-	      GetArtifact("qwen2.5-1.5b-instruct.sslm", Geometry{28, 2, 128, 32768}));
+#else
+void Run74(const Fixture&,const Fixture&){Refuse(73,"x86 invariant TSC required");}
+#endif
+void Box(){const char* large=std::getenv("SUPERSLM_PAGED_KV_74_CAP32768_FILE");Run74(GetArtifact("qwen2.5-0.5b-instruct-cap4096-aex.sslm",Geometry{24,2,64,4096}),
+  GetArtifact(large?large:"qwen2.5-0.5b-instruct-cap32768-aex.sslm",Geometry{24,2,64,32768}));}
+void Fixtures(){Run74(GetFixture("pkv_def"),GetFixture("pkv_32k"));}
+PKV_CELL("7.4/C6","C6",Box);
+PKV_CELL("7.4/C6:fixtures","C6",Fixtures);
+PKV_CELL("7.4t/C6:constructions","C6",Constructions);
 }
-void Cell74Fixtures() { Run74(GetFixture("pkv_def"), GetFixture("pkv_32k")); }
-
-PKV_CELL("7.4/C6", "C6", Cell74Box);
-PKV_CELL("7.4/C6:fixtures", "C6", Cell74Fixtures);
-
-}  // namespace

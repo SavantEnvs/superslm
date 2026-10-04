@@ -1,0 +1,327 @@
+"""Production-library C6 prompt checkpoints and in-process 7.9/7.9b pairs.
+
+`prepare` checkpoints at most 4096 prompt tokens per production-library process.
+`run` grades exactly 508 pairs; a shorter invocation is an ungraded mechanism run.
+All results remain quarantined until independent instrument commissioning.
+"""
+
+from __future__ import annotations
+import argparse
+import csv
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import statistics
+import struct
+import subprocess
+import sys
+import time
+
+
+class Refusal(RuntimeError):
+    pass
+
+
+def sha(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    temp = path.with_name(path.name + f".{os.getpid()}.partial")
+    try:
+        temp.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def load_record(path: Path) -> dict | None:
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    required = {"kind", "complete", "model_hashes", "token_sha256", "pairs_sha256", "pair_count"}
+    return record if record.get("complete") is True and required <= record.keys() else None
+
+
+def pid_live(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        result = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True)
+        return result.returncode == 0 and re.search(rf',"{pid}"(?:,|$)', result.stdout) is not None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+class PidLock:
+    def __init__(self, path: Path):
+        self.path = path
+    def __enter__(self):
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(fd, "w") as out:
+                    out.write(str(os.getpid()))
+                return self
+            except FileExistsError:
+                try:
+                    owner = int(self.path.read_text())
+                except (OSError, ValueError):
+                    raise Refusal(f"torn pid lock: {self.path}") from None
+                if pid_live(owner):
+                    raise Refusal(f"second runner refused: pid {owner}")
+                self.path.unlink(missing_ok=True)
+    def __exit__(self, *_):
+        self.path.unlink(missing_ok=True)
+
+
+def production_library(exe: Path) -> tuple[str, str]:
+    if exe.name.lower() != "superslm_pkv_pair.exe":
+        raise Refusal("expected the production superslm_pkv_pair.exe target")
+    lib = exe.with_name("superslm.lib")
+    if not exe.is_file() or not lib.is_file():
+        raise Refusal("production pair executable or superslm.lib missing")
+    return sha(exe), sha(lib)
+
+
+def run_logged(command: list[str], log: Path, cap: int, env: dict[str, str]) -> int | None:
+    start = time.monotonic()
+    with log.open("wb") as output:
+        process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, env=env)
+        while True:
+            try:
+                return process.wait(timeout=max(0.1, min(30, cap - (time.monotonic() - start))))
+            except subprocess.TimeoutExpired:
+                elapsed = time.monotonic() - start
+                print(f"heartbeat pid={process.pid} elapsed={elapsed:.0f}s log={log}", flush=True)
+                if elapsed >= cap:
+                    process.kill()
+                    process.wait()
+                    return None
+
+
+def validate_manifest(manifest: dict, model_sha: str, width: int, directory: Path,
+                      geometry: list[int] | None = None) -> int:
+    if (manifest.get("model_sha256") != model_sha or
+        manifest.get("stream") != {"seed": 79, "width": width, "prompt_tokens": width - 512} or
+        (geometry is not None and manifest.get("geometry") != geometry)):
+        return 0
+    at, previous = 0, "-"
+    for piece in manifest.get("pieces", []):
+        path = directory / piece.get("file", "")
+        if (piece.get("start") != at or piece.get("input_sha256") != previous or not path.is_file() or sha(path) != piece.get("sha256")):
+            return at
+        at += piece.get("count", 0)
+        previous = piece["sha256"]
+    return at
+
+
+def prepare(args) -> dict:
+    exe, model, directory = args.exe.resolve(), args.model.resolve(), args.directory.resolve()
+    production_library(exe)
+    if not model.is_file() or args.width <= 512 or not 1 <= args.piece_limit <= 4096:
+        raise Refusal("model, width or piece limit invalid")
+    directory.mkdir(parents=True, exist_ok=True)
+    model_sha = sha(model)
+    manifest_path = directory / "manifest.json"
+    with PidLock(directory / "prepare.lock"):
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            manifest = {}
+        at = validate_manifest(manifest, model_sha, args.width, directory,
+                               [args.cap, args.layers, args.heads, args.dim])
+        if at == 0:
+            manifest = {"model_sha256": model_sha, "stream": {"seed": 79, "width": args.width, "prompt_tokens": args.width - 512},
+                        "geometry": [args.cap, args.layers, args.heads, args.dim], "pieces": [], "next_piece_limit": args.piece_limit}
+        else:
+            manifest["pieces"] = [p for p in manifest["pieces"] if p["start"] < at]
+        limit = min(manifest.get("next_piece_limit", args.piece_limit), 4096)
+        env = os.environ.copy()
+        env["SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR"] = str(model.parent)
+        while at < args.width - 512:
+            count = min(limit, args.width - 512 - at)
+            prior = directory / manifest["pieces"][-1]["file"] if manifest["pieces"] else None
+            output = directory / f"piece_{at:05d}_{count:04d}.blob"
+            partial = output.with_suffix(".partial")
+            partial.unlink(missing_ok=True)
+            command = [str(exe), "prefill", model.name, str(args.cap), str(args.layers), str(args.heads), str(args.dim),
+                       str(args.width), str(at), str(count), str(prior) if prior else "-", str(partial)]
+            result = run_logged(command, directory / f"piece_{at:05d}.log", args.cap_seconds, env)
+            if result is None:
+                partial.unlink(missing_ok=True)
+                if count == 1:
+                    raise Refusal(f"one-token piece at {at} exceeded {args.cap_seconds}s")
+                limit = max(1, count // 2)
+                manifest["next_piece_limit"] = limit
+                atomic_json(manifest_path, manifest)
+                continue
+            if result or not partial.is_file():
+                raise Refusal(f"prefill piece {at}+{count} failed; see piece_{at:05d}.log")
+            os.replace(partial, output)
+            digest = sha(output)
+            manifest["pieces"].append({"start": at, "count": count, "file": output.name,
+                                        "input_sha256": sha(prior) if prior else "-", "sha256": digest})
+            at += count
+            manifest["next_piece_limit"] = limit
+            atomic_json(manifest_path, manifest)
+            print(f"checkpoint prompt {at}/{args.width - 512} sha256={digest}", flush=True)
+        manifest["complete"] = True
+        manifest["final_blob"] = manifest["pieces"][-1]["file"]
+        manifest["final_sha256"] = manifest["pieces"][-1]["sha256"]
+        atomic_json(manifest_path, manifest)
+        return manifest
+
+
+def checked_blob(manifest_path: Path, model: Path, width: int,
+                 geometry: list[int] | None = None) -> tuple[Path, str]:
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, ValueError):
+        raise Refusal(f"missing or torn blob manifest: {manifest_path}") from None
+    if (not manifest.get("complete") or
+        validate_manifest(manifest, sha(model), width, manifest_path.parent, geometry) != width - 512):
+        raise Refusal(f"blob/manifest mismatch: {manifest_path}")
+    blob = manifest_path.parent / manifest.get("final_blob", "")
+    if not blob.is_file() or sha(blob) != manifest.get("final_sha256"):
+        raise Refusal(f"final blob mismatch: {blob}")
+    return blob, sha(manifest_path)
+
+
+def parse_pairs(path: Path, count: int) -> tuple[list[float], str]:
+    slowdown, tokens = [], hashlib.sha256()
+    with path.open(newline="") as source:
+        rows = list(csv.reader(source))
+    if len(rows) != count:
+        raise Refusal(f"incomplete pair set: {len(rows)} of {count}")
+    for index, row in enumerate(rows):
+        try:
+            if len(row) != 6 or int(row[0]) != index or row[1] not in ("A", "B"):
+                raise Refusal(f"invalid pair row {index}")
+            paged, one = float(row[2]), float(row[3])
+            a, b = int(row[4]), int(row[5])
+        except (ValueError, IndexError) as exc:
+            raise Refusal(f"invalid pair row {index}") from exc
+        if not math.isfinite(paged) or not math.isfinite(one) or paged <= 0 or one <= 0:
+            raise Refusal(f"invalid duration at pair {index}")
+        if a != b:
+            raise Refusal(f"token-stream mismatch at pair {index}")
+        tokens.update(struct.pack("<i", a))
+        slowdown.append(1.0 - one / paged)
+    return slowdown, tokens.hexdigest()
+
+
+def grade(values: list[float]) -> dict:
+    if len(values) != 508:
+        return {"status": "MECHANISM_ONLY", "pair_count": len(values)}
+    sorted_values = sorted(values)
+    lo, hi = sorted_values[228], sorted_values[279]
+    return {"status": "QUARANTINED", "pair_count": 508, "median_slowdown": statistics.median(values),
+            "half_width": (hi - lo) / 2, "sign_interval": [lo, hi],
+            "effect": "RESOLVED" if lo > 0 or hi < 0 else "NO RESULT",
+            "bar": "PASS" if hi <= .05 else "FAIL" if lo > .05 else "NO RESULT"}
+
+
+def run(args) -> dict:
+    exe = args.exe.resolve()
+    exe_sha, lib_sha = production_library(exe)
+    model_a = args.model_a.resolve()
+    model_b = (args.model_b or args.model_a).resolve()
+    if not model_a.is_file() or not model_b.is_file() or model_a.parent != model_b.parent:
+        raise Refusal("both models must exist in one artifact directory")
+    if args.kind == "79b" and args.model_b:
+        raise Refusal("7.9b uses one model")
+    manifest_hashes, blobs = [], []
+    if args.kind == "79":
+        if not args.manifest_a or not args.manifest_b:
+            raise Refusal("7.9 requires a manifest for each arm")
+        if args.cap_b is None:
+            raise Refusal("7.9 requires the one-page arm's cap")
+        for manifest, model, cap in ((args.manifest_a, model_a, args.cap_a),
+                                     (args.manifest_b, model_b, args.cap_b)):
+            blob, digest = checked_blob(manifest.resolve(), model, args.width,
+                                        [cap, args.layers, args.heads, args.dim])
+            blobs.append(blob)
+            manifest_hashes.append(digest)
+    result = args.result.resolve()
+    result.parent.mkdir(parents=True, exist_ok=True)
+    with PidLock(result.with_suffix(".lock")):
+        pairs_file = result.with_suffix(".pairs.partial")
+        pairs_file.unlink(missing_ok=True)
+        env = os.environ.copy()
+        env["SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR"] = str(model_a.parent)
+        if args.kind == "79":
+            command = [str(exe), "pair79", model_a.name, model_b.name, str(args.cap_a), str(args.cap_b),
+                       str(args.layers), str(args.heads), str(args.dim), str(blobs[0]), str(blobs[1]),
+                       str(args.pairs), str(args.seed), str(pairs_file)]
+        else:
+            command = [str(exe), "pair79b", model_a.name, str(args.cap_a), str(args.layers), str(args.heads),
+                       str(args.dim), str(args.pairs), str(args.seed), str(pairs_file)]
+        exit_code = run_logged(command, result.with_suffix(".log"), args.cap_seconds, env)
+        if exit_code is None or exit_code != 0 or not pairs_file.is_file():
+            raise Refusal("production pair runner failed or capped; see log")
+        values, token_sha = parse_pairs(pairs_file, args.pairs)
+        stats = grade(values)
+        record = {"kind": args.kind, "complete": True, "exe_sha256": exe_sha, "library_sha256": lib_sha,
+                  "model_hashes": [sha(model_a), sha(model_b)], "manifest_hashes": manifest_hashes,
+                  "token_sha256": token_sha, "pairs_sha256": sha(pairs_file), "seed": args.seed, **stats}
+        os.replace(pairs_file, result.with_suffix(".pairs.csv"))
+        atomic_json(result, record)
+        return record
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="mode", required=True)
+    prep = sub.add_parser("prepare")
+    prep.add_argument("--exe", required=True, type=Path)
+    prep.add_argument("--model", required=True, type=Path)
+    prep.add_argument("--directory", required=True, type=Path)
+    prep.add_argument("--width", required=True, type=int)
+    for p in (prep,):
+        p.add_argument("--cap", required=True, type=int)
+        p.add_argument("--layers", required=True, type=int)
+        p.add_argument("--heads", required=True, type=int)
+        p.add_argument("--dim", required=True, type=int)
+    prep.add_argument("--piece-limit", type=int, default=4096)
+    prep.add_argument("--cap-seconds", type=int, default=1500)
+    pair = sub.add_parser("run")
+    pair.add_argument("--exe", required=True, type=Path)
+    pair.add_argument("--kind", required=True, choices=("79", "79b"))
+    pair.add_argument("--model-a", required=True, type=Path)
+    pair.add_argument("--model-b", type=Path)
+    pair.add_argument("--manifest-a", type=Path)
+    pair.add_argument("--manifest-b", type=Path)
+    pair.add_argument("--result", required=True, type=Path)
+    pair.add_argument("--cap-a", required=True, type=int)
+    pair.add_argument("--cap-b", type=int)
+    pair.add_argument("--layers", required=True, type=int)
+    pair.add_argument("--heads", required=True, type=int)
+    pair.add_argument("--dim", required=True, type=int)
+    pair.add_argument("--width", required=True, type=int)
+    pair.add_argument("--pairs", type=int, default=508)
+    pair.add_argument("--seed", type=int, default=7904)
+    pair.add_argument("--cap-seconds", type=int, default=3600)
+    args = parser.parse_args(argv)
+    try:
+        record = prepare(args) if args.mode == "prepare" else run(args)
+        print(json.dumps(record, sort_keys=True))
+        return 0
+    except Refusal as exc:
+        print(f"INFRASTRUCTURE: {exc}", file=sys.stderr)
+        return 40
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

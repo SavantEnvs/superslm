@@ -1,4 +1,4 @@
-# Paged-KV plan (rev 16.2) step C6: the box run's per-leg provenance records and the standing derived
+# Paged-KV plan (rev 16.6) step C6: the box run's per-leg provenance records and the standing derived
 # from them (tools/run_paged_kv_c6_box.ps1). Pure functions only (no file system beyond the marker
 # read and write, no processes), so tools/test_paged_kv_c6_provenance.ps1 can run them anywhere pwsh
 # runs. Dot-source it.
@@ -6,7 +6,7 @@
 # A leg's done-marker is its provenance record: the git HEAD, the sha256 of the test binary, the
 # sha256 of every file the leg read (artifacts, references, baselines), the commissioned instrument
 # ids in force that the leg rests on, the assertion environment variables actually set, and
-# -Max74Ratio for the 7.4 leg (the one that rests on timing74), plus the outcome. Recording only what
+# the outcome. Recording only what
 # bears on the leg means commissioning one instrument reruns only the legs that rest on it.
 # A leg is skipped on resume only when its stored record equals the record this invocation would
 # produce; its standing is derived from its stored record alone, never from the current arguments.
@@ -19,14 +19,13 @@
 $PkvC6Instruments = [ordered]@{
     oracle    = @{ Registry = 'PKV-ORACLE-R0'; Env = '' }
     admission = @{ Registry = 'PKV-LEGACY-COUNT-C4, PKV-FILL-PROBE-C5, PKV-FILL-PROBE-ONESTATE-C5'; Env = '' }
-    timing74  = @{ Registry = 'PKV-TIMING-74-C6'; Env = 'SUPERSLM_PAGED_KV_74_MAX_RATIO' }
-    timing79  = @{ Registry = 'PKV-TIMING-79-C6'; Env = 'SUPERSLM_PAGED_KV_TIMING_COMMISSIONED' }
+    timing74  = @{ Registry = 'PKV-TIMING-74-C6'; Env = '' }
     lifecycle = @{ Registry = 'PKV-LIFECYCLE-C6'; Env = 'SUPERSLM_PAGED_KV_LIFE_COMMISSIONED' }
 }
-$PkvC6RecordSchema = 'pkv-c6-leg/1'
+$PkvC6RecordSchema = 'pkv-c6-leg/2'
 # The fields a stored record must match for a leg to be skipped. Outcome and the binary's path are
 # kept for the reader, not compared.
-$PkvC6RecordKeys = @('Schema', 'Leg', 'Head', 'BinarySha256', 'Inputs', 'Commissioned', 'AssertEnv', 'Max74Ratio')
+$PkvC6RecordKeys = @('Schema', 'Leg', 'Head', 'BinarySha256', 'Inputs', 'Commissioned', 'AssertEnv')
 
 # Splits comma-joined lists and rejects any id that is not a commissionable instrument.
 function Get-PkvCommissionedIds {
@@ -41,15 +40,13 @@ function Get-PkvCommissionedIds {
 }
 
 # The assertion variables a leg resting on $Rests gets: only for an instrument that is both rested on
-# and commissioned. 7.4 asserts only with a ratio, so timing74 without -Max74Ratio sets nothing.
+# and commissioned.
 function Get-PkvLegAssertionEnv {
-    param([string[]]$Rests, [string[]]$Commissioned, [string]$Max74Ratio = '')
+    param([string[]]$Rests, [string[]]$Commissioned)
     $envs = [ordered]@{}
     foreach ($r in @($Rests | Sort-Object -Unique)) {
         if ($Commissioned -notcontains $r -or -not $PkvC6Instruments.Contains($r)) { continue }
         switch ($r) {
-            'timing79' { $envs['SUPERSLM_PAGED_KV_TIMING_COMMISSIONED'] = '1' }
-            'timing74' { if ($Max74Ratio) { $envs['SUPERSLM_PAGED_KV_74_MAX_RATIO'] = $Max74Ratio } }
             'lifecycle' { $envs['SUPERSLM_PAGED_KV_LIFE_COMMISSIONED'] = '1' }
         }
     }
@@ -63,8 +60,7 @@ function ConvertTo-PkvPairs {
 }
 
 # The record this invocation would write for a leg. $Inputs maps a label (role:file name) to the
-# file's sha256. Commissioned keeps only the ids the leg rests on, and Max74Ratio is kept only for a
-# leg resting on timing74. Every value is a plain string, so the record survives a JSON round trip
+# file's sha256. Commissioned keeps only the ids the leg rests on. Every value is a plain string, so the record survives a JSON round trip
 # unchanged.
 function New-PkvLegRecord {
     param(
@@ -74,12 +70,10 @@ function New-PkvLegRecord {
         [string]$Binary = '',
         [string]$BinarySha256 = '',
         [System.Collections.IDictionary]$Inputs = @{},
-        [string[]]$Commissioned = @(),
-        [string]$Max74Ratio = ''
+        [string[]]$Commissioned = @()
     )
-    $envs = Get-PkvLegAssertionEnv -Rests $Rests -Commissioned $Commissioned -Max74Ratio $Max74Ratio
+    $envs = Get-PkvLegAssertionEnv -Rests $Rests -Commissioned $Commissioned
     $relevant = @($Commissioned | Where-Object { $Rests -contains $_ } | Sort-Object -Unique)
-    $ratio = if ($Rests -contains 'timing74') { $Max74Ratio } else { '' }
     return [ordered]@{
         Schema       = $PkvC6RecordSchema
         Leg          = $Leg
@@ -89,7 +83,6 @@ function New-PkvLegRecord {
         Inputs       = (ConvertTo-PkvPairs $Inputs)
         Commissioned = ($relevant -join ',')
         AssertEnv    = (ConvertTo-PkvPairs $envs)
-        Max74Ratio   = $ratio
         Outcome      = ''
     }
 }
@@ -144,7 +137,7 @@ function Get-PkvLegStanding {
         if ($commissioned -notcontains $r) { $missing += $r; continue }
         $var = $PkvC6Instruments[$r].Env
         if ($var -and -not $envs.Contains($var)) {
-            if ($r -eq 'timing74') { $missing += 'ratio' } else { $missing += "$r ($var unset)" }
+            $missing += "$r ($var unset)"
         }
     }
     if ($missing.Count -eq 0) { return 'standing' }
