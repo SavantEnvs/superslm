@@ -1,7 +1,6 @@
-# Paged-KV plan (rev 16.6) step C6: the box run's per-leg provenance records and the standing derived
-# from them (tools/run_paged_kv_c6_box.ps1). Pure functions only (no file system beyond the marker
-# read and write, no processes), so tools/test_paged_kv_c6_provenance.ps1 can run them anywhere pwsh
-# runs. Dot-source it.
+# Paged-KV plan (rev 16.7) step C6: the box run's per-leg provenance records and the standing derived
+# from them (tools/run_paged_kv_c6_box.ps1). The functions can be tested without a timing run.
+# Dot-source this file.
 #
 # A leg's done-marker is its provenance record: the git HEAD, the sha256 of the test binary, the
 # sha256 of every file the leg read (artifacts, references, baselines), the commissioned instrument
@@ -11,7 +10,7 @@
 # A leg is skipped on resume only when its stored record equals the record this invocation would
 # produce; its standing is derived from its stored record alone, never from the current arguments.
 
-# The instruments -Commissioned may name, by the registry entry each stands for, and the environment
+# The instruments the verified receipt may name, by the registry entry each stands for, and the environment
 # variable through which the cell asserts that instrument's verdict (empty: no variable; the oracle
 # and the admission instruments assert unconditionally). Lifecycle has no performance bar;
 # commissioning makes its measured change report eligible to stand, while its NO RESULT/RESOLVED
@@ -22,10 +21,41 @@ $PkvC6Instruments = [ordered]@{
     timing74  = @{ Registry = 'PKV-TIMING-74-C6'; Env = '' }
     lifecycle = @{ Registry = 'PKV-LIFECYCLE-C6'; Env = 'SUPERSLM_PAGED_KV_LIFE_COMMISSIONED' }
 }
-$PkvC6RecordSchema = 'pkv-c6-leg/2'
+$PkvC6RecordSchema = 'pkv-c6-leg/3'
 # The fields a stored record must match for a leg to be skipped. Outcome and the binary's path are
 # kept for the reader, not compared.
-$PkvC6RecordKeys = @('Schema', 'Leg', 'Head', 'BinarySha256', 'Inputs', 'Commissioned', 'AssertEnv')
+$PkvC6RecordKeys = @('Schema', 'Leg', 'Head', 'BinarySha256', 'Inputs', 'Commissioned', 'AssertEnv', 'HookState')
+$PkvC6TimingLock = 'D:\_scratch\SuperSLM\pkv-c6-timing.lock'
+
+function Enter-PkvTimingLock {
+    param([string]$Path = $PkvC6TimingLock)
+    $parent = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    for ($attempt = 0; $attempt -lt 3; ++$attempt) {
+        try {
+            $file = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try {
+                $bytes = [Text.Encoding]::ASCII.GetBytes("$PID")
+                $file.Write($bytes, 0, $bytes.Length)
+            } finally { $file.Dispose() }
+            return $Path
+        } catch [IO.IOException] {
+            if (-not (Test-Path -LiteralPath $Path)) { continue }
+            $owner = 0
+            if (-not [int]::TryParse((Get-Content -LiteralPath $Path -Raw).Trim(), [ref]$owner)) { throw "torn C6 timing lock: $Path" }
+            if (Get-Process -Id $owner -ErrorAction SilentlyContinue) { throw "second C6 timing runner refused: pid $owner" }
+            Remove-Item -LiteralPath $Path -Force
+        }
+    }
+    throw "cannot acquire C6 timing lock: $Path"
+}
+
+function Exit-PkvTimingLock {
+    param([string]$Path)
+    if ((Test-Path -LiteralPath $Path) -and (Get-Content -LiteralPath $Path -Raw).Trim() -eq "$PID") {
+        Remove-Item -LiteralPath $Path -Force
+    }
+}
 
 # Splits comma-joined lists and rejects any id that is not a commissionable instrument.
 function Get-PkvCommissionedIds {
@@ -37,6 +67,26 @@ function Get-PkvCommissionedIds {
         }
     }
     return , @($out | Sort-Object -Unique)
+}
+
+# Only the receipt-verifying tool's computed status can confer standing.
+# -Status prints stored fields; -Verify rechecks the receipt and live hash.
+function Get-PkvVerifiedIds {
+    param([string[]]$Lines)
+    $found = @()
+    foreach ($key in $PkvC6Instruments.Keys) {
+        $registryIds = @($PkvC6Instruments[$key].Registry -split ',' | ForEach-Object { $_.Trim() })
+        $verified = @($registryIds | Where-Object { $id = $_; @($Lines | Where-Object { $_ -ceq "COMMISSIONED  $id" }).Count })
+        if ($verified.Count -eq $registryIds.Count) { $found += $key }
+    }
+    return ,$found
+}
+
+function Get-PkvRunnerCommissionedIds {
+    param([string[]]$Requested = @(), [string[]]$VerifyLines = @())
+    # Requested is accepted for command-line compatibility only. A verified
+    # receipt line is the sole path to standing.
+    return (Get-PkvVerifiedIds $VerifyLines)
 }
 
 # The assertion variables a leg resting on $Rests gets: only for an instrument that is both rested on
@@ -70,7 +120,8 @@ function New-PkvLegRecord {
         [string]$Binary = '',
         [string]$BinarySha256 = '',
         [System.Collections.IDictionary]$Inputs = @{},
-        [string[]]$Commissioned = @()
+        [string[]]$Commissioned = @(),
+        [string]$HookState = ''
     )
     $envs = Get-PkvLegAssertionEnv -Rests $Rests -Commissioned $Commissioned
     $relevant = @($Commissioned | Where-Object { $Rests -contains $_ } | Sort-Object -Unique)
@@ -83,6 +134,7 @@ function New-PkvLegRecord {
         Inputs       = (ConvertTo-PkvPairs $Inputs)
         Commissioned = ($relevant -join ',')
         AssertEnv    = (ConvertTo-PkvPairs $envs)
+        HookState    = $HookState
         Outcome      = ''
     }
 }
@@ -129,6 +181,7 @@ function Get-PkvLegRecordDiff {
 function Get-PkvLegStanding {
     param([string[]]$Rests, $Record)
     if (-not $Record -or (Get-PkvRecordField $Record 'Schema') -ne $PkvC6RecordSchema) { return 'quarantined (no provenance record)' }
+    if (Get-PkvRecordField $Record 'HookState') { return 'quarantined (mutant construction hook)' }
     $commissioned = @((Get-PkvRecordField $Record 'Commissioned') -split ',' | Where-Object { $_ })
     $envs = Get-PkvRecordEnv $Record
     $missing = @()

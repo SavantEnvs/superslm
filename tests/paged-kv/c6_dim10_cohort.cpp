@@ -29,10 +29,19 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <utility>
 #include <vector>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -49,6 +58,24 @@ const char* k05B = "qwen2.5-0.5b-instruct-cap4096-aex.sslm";
 const char* k15B = "qwen2.5-1.5b-instruct.sslm";
 const Geometry kGeo05B{24, 2, 64, 4096};
 const Geometry kGeo15B{28, 2, 128, 32768};
+
+std::string ExecutableSha() {
+	static const std::string digest = [] {
+		char path[4096]{};
+#if defined(_WIN32)
+		const DWORD count = GetModuleFileNameA(nullptr, path, sizeof path);
+		if (!count || count >= sizeof path) return std::string{};
+#else
+		const ssize_t count = readlink("/proc/self/exe", path, sizeof path - 1);
+		if (count <= 0 || count >= static_cast<ssize_t>(sizeof path)) return std::string{};
+		path[count] = 0;
+#endif
+		std::vector<uint8_t> bytes;
+		if (!ReadAll(path, &bytes) || bytes.empty()) return std::string{};
+		return Sha(bytes.data(), bytes.size());
+	}();
+	return digest;
+}
 
 int PersonaOf(int seq) { return seq / (kSeqs / kPersonas); }
 
@@ -155,7 +182,11 @@ std::string CohortRows(const Fixture& fx, sslm_kv_pool pool, sslm_seq seq, int64
 					rows.insert(rows.end(), page.begin() + offset, page.begin() + offset + fx.geo.head_dim);
 				}
 	}
-	if (std::getenv("SUPERSLM_PAGED_KV_ROW_DIGEST_FLIP") && !rows.empty()) rows[rows.size() / 2] ^= 1;
+	const char* flip = std::getenv("SUPERSLM_PAGED_KV_ROW_DIGEST_FLIP");
+	if (flip && !rows.empty() &&
+	    (std::string(flip) == "both" ||
+	     (std::string(flip) == "mid" && length == kMidAt) ||
+	     (std::string(flip) == "limit" && length == kOrigin + kBudget))) rows[rows.size() / 2] ^= 1;
 	return Sha(rows.data(), rows.size());
 }
 
@@ -312,9 +343,9 @@ bool CohortCache(const Fixture& fx, const std::string& path, const std::string& 
 	std::fstream f(path, std::ios::binary | (reading ? std::ios::in : std::ios::out | std::ios::trunc));
 	if (!f) return false;
 	if (reading) {
-		std::string magic, sha, saved_head;
-		if (!GetTextLine(f, magic) || !GetTextLine(f, sha) || !GetTextLine(f, saved_head) ||
-		    magic != "PKVC6-CACHE-3" || sha != fx.sha || saved_head != head) return false;
+		std::string magic, sha, saved_head, executable;
+		if (!GetTextLine(f, magic) || !GetTextLine(f, sha) || !GetTextLine(f, saved_head) || !GetTextLine(f, executable) ||
+		    magic != "PKVC6-CACHE-4" || sha != fx.sha || saved_head != head || executable != ExecutableSha()) return false;
 		r->built = true;
 		r->tokens.resize(kSeqs);
 		r->mid.resize(kSeqs);
@@ -323,7 +354,7 @@ bool CohortCache(const Fixture& fx, const std::string& path, const std::string& 
 		r->lim_rows.resize(kSeqs);
 		r->end.resize(kSeqs);
 	} else {
-		f << "PKVC6-CACHE-3\n" << fx.sha << "\n" << head << "\n";
+		f << "PKVC6-CACHE-4\n" << fx.sha << "\n" << head << "\n" << ExecutableSha() << "\n";
 	}
 	for (int i = 0; i < kSeqs; ++i) {
 		if (!CacheTokens(f, &r->tokens[i], reading) || !CacheVector(f, &r->mid[i], reading) ||
@@ -338,17 +369,20 @@ bool CohortCache(const Fixture& fx, const std::string& path, const std::string& 
 }
 
 std::string ShardPath(const std::string& dir, const Fixture& fx, const std::string& head, int shard) {
-	return dir + "/cohort-" + fx.stem + "-" + fx.sha + "-" + head + "-shard" + std::to_string(shard) + ".bin";
+	return dir + "/cohort-" + fx.stem + "-" + fx.sha + "-" + head + "-" + ExecutableSha() + "-shard" + std::to_string(shard) + ".bin";
+}
+std::string CohortPath(const std::string& dir, const Fixture& fx, const std::string& head) {
+	return dir + "/cohort-" + fx.stem + "-" + fx.sha + "-" + head + "-" + ExecutableSha() + ".bin";
 }
 bool CohortShardCache(const Fixture& fx, const std::string& path, const std::string& head, int shard,
                      CohortRun* r, bool reading) {
 	std::fstream f(path, std::ios::binary | (reading ? std::ios::in : std::ios::out | std::ios::trunc));
 	if (!f) return false;
 	if (reading) {
-		std::string magic, sha, saved_head, saved_shard;
+		std::string magic, sha, saved_head, executable, saved_shard;
 		if (!GetTextLine(f, magic) || !GetTextLine(f, sha) || !GetTextLine(f, saved_head) ||
-		    !GetTextLine(f, saved_shard) || magic != "PKVC6-SHARD-3" || sha != fx.sha ||
-		    saved_head != head || saved_shard != std::to_string(shard)) return false;
+		    !GetTextLine(f, executable) || !GetTextLine(f, saved_shard) || magic != "PKVC6-SHARD-4" || sha != fx.sha ||
+		    saved_head != head || executable != ExecutableSha() || saved_shard != std::to_string(shard)) return false;
 		r->built = true;
 		r->tokens.resize(kSeqs);
 		r->mid.resize(kSeqs);
@@ -357,7 +391,7 @@ bool CohortShardCache(const Fixture& fx, const std::string& path, const std::str
 		r->lim_rows.resize(kSeqs);
 		r->end.resize(kSeqs);
 	} else {
-		f << "PKVC6-SHARD-3\n" << fx.sha << "\n" << head << "\n" << shard << "\n";
+		f << "PKVC6-SHARD-4\n" << fx.sha << "\n" << head << "\n" << ExecutableSha() << "\n" << shard << "\n";
 	}
 	for (int i = 0; i < kSeqs; ++i) {
 		if (!CacheTokens(f, &r->tokens[i], reading) || !CacheVector(f, &r->mid[i], reading) ||
@@ -376,6 +410,46 @@ bool CohortShardCache(const Fixture& fx, const std::string& path, const std::str
 	return static_cast<bool>(f);
 }
 
+void CellCacheVersion() {
+	const Fixture& fx = GetFixture("pkv_def");
+	if (!fx.ok) return;
+	const std::string exe = ExecutableSha();
+	PKV_CHECK_MSG(exe.size() == 64, "cohort executable hash missing");
+#if defined(_WIN32)
+	const auto pid = GetCurrentProcessId();
+#else
+	const auto pid = getpid();
+#endif
+	const auto dir = std::filesystem::temp_directory_path() / ("pkv-cache-v4-" + std::to_string(pid));
+	std::filesystem::create_directories(dir);
+	const std::string path = CohortPath(dir.string(), fx, "test-head");
+	const std::string shard = ShardPath(dir.string(), fx, "test-head", 0);
+	PKV_CHECK(path.find(exe) != std::string::npos && shard.find(exe) != std::string::npos);
+	CohortRun r;
+	r.tokens.resize(kSeqs);r.mid.resize(kSeqs);r.lim.resize(kSeqs);
+	r.mid_rows.resize(kSeqs);r.lim_rows.resize(kSeqs);r.end.resize(kSeqs,PKV_KV_BUDGET_EXCEEDED);
+	for(int i=0;i<kSeqs;++i){r.tokens[i].assign(1+kBudget,0);r.mid[i]={1};r.lim[i]={1};
+		r.mid_rows[i]=std::string(64,'a');r.lim_rows[i]=std::string(64,'b');}
+	PKV_CHECK(CohortCache(fx,path,"test-head",&r,false));
+	CohortRun loaded;
+	PKV_CHECK(CohortCache(fx,path,"test-head",&loaded,true));
+	{
+		std::fstream f(path,std::ios::binary|std::ios::in|std::ios::out);
+		f.seekp(std::string("PKVC6-CACHE-").size());f.put('1');
+	}
+	PKV_CHECK(!CohortCache(fx,path,"test-head",&loaded,true));
+	for(int i=10;i<kSeqs;++i){r.tokens[i].clear();r.mid[i].clear();r.lim[i].clear();
+		r.mid_rows[i].clear();r.lim_rows[i].clear();r.end[i]=SSLM_OK;}
+	PKV_CHECK(CohortShardCache(fx,shard,"test-head",0,&r,false));
+	PKV_CHECK(CohortShardCache(fx,shard,"test-head",0,&loaded,true));
+	{
+		std::fstream f(shard,std::ios::binary|std::ios::in|std::ios::out);
+		f.seekp(std::string("PKVC6-SHARD-").size());f.put('1');
+	}
+	PKV_CHECK(!CohortShardCache(fx,shard,"test-head",0,&loaded,true));
+	std::filesystem::remove(path);std::filesystem::remove(shard);std::filesystem::remove(dir);
+}
+
 // The cohort in exactly CohortPages (1,842), once per process. The optional on-disk checkpoint
 // lets each release cell finish within a bounded process and is written only after all 50 complete.
 const CohortRun& Cohort(const Fixture& fx) {
@@ -386,7 +460,7 @@ const CohortRun& Cohort(const Fixture& fx) {
 	const char* head = std::getenv("SUPERSLM_PAGED_KV_COHORT_HEAD");
 	const bool cache = dir && *dir;
 	if (cache) PKV_CHECK_MSG(head && *head, "C6 cohort cache requires the source HEAD");
-	const std::string path = cache && head && *head ? std::string(dir) + "/cohort-" + fx.stem + "-" + fx.sha + "-" + head + ".bin" : "";
+	const std::string path = cache && head && *head ? CohortPath(dir, fx, head) : "";
 	if (!path.empty()) {
 		std::ifstream check(path, std::ios::binary);
 		if (check) {
@@ -830,5 +904,6 @@ PKV_CELL("10.6/C6", "C6", Cell106Box);
 PKV_CELL("10.6/C6:pkv_def", "C6", Cell106Fixture);
 PKV_CELL("10.8/C6", "C6", Cell108Box);
 PKV_CELL("10.8/C6:pkv_def", "C6", Cell108Fixture);
+PKV_CELL("cohort/C6:cache-version", "C6", CellCacheVersion);
 
 }  // namespace

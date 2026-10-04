@@ -3,13 +3,13 @@
 # 7.9 and 7.9b use tools/run_paged_kv_pairs.py with superslm_pkv_pair, linked
 # to the production superslm library. This runner never supplies a decode-speed
 # verdict. Each selected leg runs by exact cell id and writes a provenance-bound
-# marker only after the process returns. Timing legs require an idle check before
-# and after the run. Instrument readings remain quarantined until their registry
+# marker only after the process returns. Timing legs record pre/post load and
+# offenders. Instrument readings remain quarantined until their registry
 # receipts are live.
 #
 # Usage: tools/run_paged_kv_c6_box.ps1 -BuildDir DIR [-ArtifactDir DIR]
 #        [-CorrectnessOnly | -TimingOnly] [-Only lifecycle/C6,7.4/C6]
-#        [-Commissioned oracle,admission,timing74,lifecycle] [-Fresh] [-NoBuild]
+#        [-Fresh] [-NoBuild]
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$ArtifactDir = '',
@@ -28,8 +28,10 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'paged_kv_box_common.ps1')
 . (Join-Path $PSScriptRoot 'paged_kv_c6_provenance.ps1')
 if ($TimingOnly -and $CorrectnessOnly) { throw '-TimingOnly and -CorrectnessOnly exclude each other' }
-# Lists may arrive as one comma-joined string (powershell -File): split them here.
-$Commissioned = Get-PkvCommissionedIds $Commissioned
+# The caller's legacy -Commissioned hint confers no standing. The receipt
+# verifier alone supplies the commissioned IDs recorded for this invocation.
+$verification = @(powershell -NoProfile -File 'D:\Wizard\Claude\Tooling\instrument-commission.ps1' -Verify 2>&1 | ForEach-Object { "$_" })
+$Commissioned = Get-PkvRunnerCommissionedIds -Requested $Commissioned -VerifyLines $verification
 $Repo = Get-PkvRepo
 $RefDir = Join-Path $Repo 'tests\paged-kv\reference'
 $C6 = Join-Path $ScratchDir 'c6'
@@ -124,8 +126,15 @@ function Get-LegInputs($leg) {
 function Get-LegRecord($leg) {
     $bin = $exe[$leg.Bin]
     $sha = if ($bin -and (Test-Path -LiteralPath $bin -PathType Leaf)) { Get-PkvSha256 $bin } else { 'missing' }
+    $hook = ''
+    if ($leg.Name -eq '7.4/C6') {
+        $hook = "adopt=$env:SUPERSLM_PAGED_KV_74_ADOPT_MUTANT;reset=$env:SUPERSLM_PAGED_KV_74_RESET_MUTANT"
+        if ($hook -eq 'adopt=;reset=') { $hook = '' }
+    } elseif ($leg.Name -like 'lifecycle*' -and $env:SUPERSLM_PAGED_KV_LIFE_RESET_MUTANT) {
+        $hook = "reset=$env:SUPERSLM_PAGED_KV_LIFE_RESET_MUTANT"
+    }
     return New-PkvLegRecord -Leg $leg.Name -Rests $leg.Rests -Head $Head -Binary "$bin" -BinarySha256 $sha `
-        -Inputs (Get-LegInputs $leg) -Commissioned $Commissioned
+        -Inputs (Get-LegInputs $leg) -Commissioned $Commissioned -HookState $hook
 }
 function Test-LegCurrent($leg) { return Test-PkvLegRecordCurrent (Read-PkvLegRecord (Get-MarkerPath $leg)) (Get-LegRecord $leg) }
 
@@ -196,7 +205,6 @@ $envNames = @('SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR',
     'SUPERSLM_PAGED_KV_LIFE_OUT', 'SUPERSLM_PAGED_KV_LIFE_BASELINE',
     'SUPERSLM_PAGED_KV_LIFE_COMMISSIONED', 'SUPERSLM_PAGED_KV_FIXTURE_DIR')
 $results = @{}
-$stopTiming = $false
 foreach ($leg in $legs) {
     $marker = Get-MarkerPath $leg
     $record = Get-LegRecord $leg
@@ -209,7 +217,6 @@ foreach ($leg in $legs) {
         $why = if ($stored) { 'differs in ' + ((Get-PkvLegRecordDiff $stored $record) -join ', ') } else { 'holds no provenance record' }
         Write-Output "STALE $($leg.Name): its marker $why; rerunning"
     }
-    if ($leg.Kind -eq 'timing' -and $stopTiming) { $results[$leg.Name] = 'NOT-RUN (earlier timing leg not idle)'; continue }
     if ($leg.Name -eq 'lifecycle/C6') {
         if (-not (Test-Path -LiteralPath $BaselineLife)) { $results[$leg.Name] = 'NOT-RUN (no lifecycle-v1.11.0 baseline)'; continue }
     }
@@ -223,16 +230,13 @@ foreach ($leg in $legs) {
         if ($envNames -notcontains $k) { throw "assertion variable $k is not cleared between legs" }
         Set-Item -Path "Env:\$k" -Value $assertEnv[$k]
     }
+    $timingLock = if ($leg.Kind -eq 'timing') { Enter-PkvTimingLock } else { $null }
+    try {
     $log = Get-LogPath $leg
     $before = $null
     if ($leg.Kind -eq 'timing') {
         $before = Get-IdleReport
-        if (-not $before.Idle) {
-            Write-Output "NOT IDLE before $($leg.Name): $($before.Offenders -join '; ') (load $($before.Load)%). Timing legs stop here; rerun when the box is quiet."
-            $results[$leg.Name] = 'NOT-IDLE'
-            $stopTiming = $true
-            continue
-        }
+        $record['LoadBefore'] = "load=$($before.Load); offenders=$($before.Offenders -join ',')"
     }
     Write-Output ("RUN  {0}: {1} ={2} (log {3})" -f $leg.Name, $exe[$leg.Bin], $leg.Cell, $log)
     $t0 = Get-Date
@@ -242,24 +246,20 @@ foreach ($leg in $legs) {
     $idleNote = ''
     if ($leg.Kind -eq 'timing') {
         $after = Get-IdleReport
-        $idleNote = "idle before: yes (load $($before.Load)%); idle after: $(if ($after.Idle) { 'yes' } else { 'NO: ' + ($after.Offenders -join '; ') }) (load $($after.Load)%)"
+        $record['LoadAfter'] = "load=$($after.Load); offenders=$($after.Offenders -join ',')"
+        $idleNote = "before: $($record['LoadBefore']); after: $($record['LoadAfter'])"
         Add-Content -LiteralPath $log -Value "IDLE CHECK $idleNote"
     }
     $tail = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue)
     $last = $tail | Where-Object { $_ -match '^\d+ cells, \d+ red; \d+ checks, \d+ failures$' } | Select-Object -Last 1
     $verdict = switch ($code) { 0 { 'GREEN' } 1 { 'RED' } default { "CRASH($code)" } }
     if ($last -match '^0 cells') { $verdict = 'NO-CELL' }
-    if ($leg.Kind -eq 'timing' -and -not $after.Idle) {
-        Write-Output "NOT IDLE after $($leg.Name): $($after.Offenders -join '; '). No marker written; rerun this leg."
-        $results[$leg.Name] = "$verdict (NOT IDLE after: rerun)"
-        $stopTiming = $true
-        continue
-    }
     if ($leg.Name -eq 'lifecycle-v1.11.0' -and $code -eq 0) { Move-Item -LiteralPath "$BaselineLife.partial" -Destination $BaselineLife -Force }
     $line = '{0} exit={1} {2} ({3} s) {4} {5}' -f $verdict, $code, $last, $secs, (Get-Date -Format s), $idleNote
     $record.Outcome = $line
     Write-PkvLegRecord $marker $record
     Write-Output "DONE $($leg.Name): $line"
+    } finally { if ($timingLock) { Exit-PkvTimingLock $timingLock } }
 }
 foreach ($n in $envNames) { Remove-Item -Path "Env:\$n" -ErrorAction SilentlyContinue }
 

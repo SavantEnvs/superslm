@@ -46,6 +46,13 @@ foreach(step c2 c3 c4 c5 c6)
 	endif()
 endforeach()
 
+# Red-first timer and CPUID decision-path constructions. Neither target is a
+# production timing leg or eligible to publish a C6 reading.
+superslm_pkv_target(superslm_pkv_74_no_tsc SOURCES ${PKV_DIR}/c6_dim7_reset_adopt_timing.cpp)
+target_compile_definitions(superslm_pkv_74_no_tsc PRIVATE PKV_74_FORCE_NO_TSC=1)
+superslm_pkv_target(superslm_pkv_74_no_subtraction SOURCES ${PKV_DIR}/c6_dim7_reset_adopt_timing.cpp)
+target_compile_definitions(superslm_pkv_74_no_subtraction PRIVATE PKV_74_NO_SUBTRACTION_MUTANT=1)
+
 # C6's measured 7.9/7.9b arms and piece-wise SSB5 prefill use the production
 # library. This target has no test-injection compile definitions or link input.
 add_executable(superslm_pkv_pair EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_pair.cpp)
@@ -63,7 +70,7 @@ endif()
 superslm_pkv_target(superslm_pkv_lifecycle_prod LIBRARY superslm SOURCES ${PKV_DIR}/c6_lifecycle_timing.cpp)
 target_compile_definitions(superslm_pkv_lifecycle_prod PRIVATE PKV_LIFECYCLE_PRODUCTION_LEG=1)
 get_target_property(PKV_PROD_DEFS superslm COMPILE_DEFINITIONS)
-if("${PKV_PROD_DEFS}" MATCHES "SUPERSLM_.*(SEAM|INJECTION|INSTRUMENT)")
+if("${PKV_PROD_DEFS}" MATCHES "SUPERSLM_.*(SEAM|INJECTION|INSTRUMENT|BENCH)")
 	message(FATAL_ERROR "production superslm library carries a seam/injection definition; lifecycle grading refused")
 endif()
 

@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import statistics
 import struct
 import subprocess
@@ -23,6 +24,9 @@ import time
 
 class Refusal(RuntimeError):
     pass
+
+
+BOX_LOCK = Path("D:/_scratch/SuperSLM/pkv-c6-timing.lock")
 
 
 def sha(path: Path) -> str:
@@ -47,7 +51,8 @@ def load_record(path: Path) -> dict | None:
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    required = {"kind", "complete", "model_hashes", "token_sha256", "pairs_sha256", "pair_count"}
+    required = {"kind", "complete", "model_hashes", "token_sha256", "pairs_sha256", "pair_count",
+                "exe_sha256", "library_sha256", "seed", "status", "hook"}
     return record if record.get("complete") is True and required <= record.keys() else None
 
 
@@ -92,7 +97,31 @@ def production_library(exe: Path) -> tuple[str, str]:
     lib = exe.with_name("superslm.lib")
     if not exe.is_file() or not lib.is_file():
         raise Refusal("production pair executable or superslm.lib missing")
+    identity = subprocess.run([str(exe), "identity"], capture_output=True, text=True, timeout=30)
+    if identity.returncode or identity.stdout.strip() != "PKV_PAIR_PRODUCTION_V2 defs=none":
+        raise Refusal("production pair identity or build definitions invalid")
     return sha(exe), sha(lib)
+
+
+def box_observation() -> dict:
+    if os.name != "nt":
+        try:
+            return {"load_1m": os.getloadavg()[0], "offenders": []}
+        except OSError:
+            return {"load_1m": None, "offenders": []}
+    command = ("$p=Get-Process -Name UnrealEditor,UnrealEditor-Cmd,cl,link,dotnet,UnrealBuildTool "
+               "-ErrorAction SilentlyContinue | ForEach-Object { \"$($_.ProcessName):$($_.Id)\" };"
+               "$cpu=(Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average;"
+               "@{cpu_percent=$cpu;offenders=@($p);build_lock=(Test-Path 'D:\\_ssu_build_lock')} "
+               "| ConvertTo-Json -Compress")
+    try:
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", command], capture_output=True,
+                                text=True, timeout=15)
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return {"cpu_percent": None, "offenders": [], "observation_error": True}
 
 
 def run_logged(command: list[str], log: Path, cap: int, env: dict[str, str]) -> int | None:
@@ -233,7 +262,28 @@ def grade(values: list[float]) -> dict:
             "bar": "PASS" if hi <= .05 else "FAIL" if lo > .05 else "NO RESULT"}
 
 
+def read_result(path: Path, expected: dict) -> dict | None:
+    record = load_record(path)
+    if record is None or any(record.get(key) != value for key, value in expected.items()):
+        return None
+    pairs_file = path.with_suffix(".pairs.csv")
+    if not pairs_file.is_file() or sha(pairs_file) != record["pairs_sha256"]:
+        return None
+    try:
+        values, token_sha = parse_pairs(pairs_file, record["pair_count"])
+    except (OSError, Refusal):
+        return None
+    if token_sha != record["token_sha256"]:
+        return None
+    computed = grade(values)
+    if any(record.get(key) != value for key, value in computed.items() if key != "status"):
+        return None
+    return record
+
+
 def run(args) -> dict:
+    if args.pairs != 508 and not getattr(args, "mechanism", False):
+        raise Refusal("incomplete graded pair set: exactly 508 required")
     exe = args.exe.resolve()
     exe_sha, lib_sha = production_library(exe)
     model_a = args.model_a.resolve()
@@ -256,7 +306,23 @@ def run(args) -> dict:
             manifest_hashes.append(digest)
     result = args.result.resolve()
     result.parent.mkdir(parents=True, exist_ok=True)
-    with PidLock(result.with_suffix(".lock")):
+    BOX_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    seed = args.seed if args.seed is not None else secrets.randbits(32)
+    hook = os.environ.get("SUPERSLM_PAGED_KV_79_SLOW_ARM", "")
+    load_record = getattr(args, "load_record", None)
+    if load_record and not load_record.is_file():
+        raise Refusal(f"load generator record missing: {load_record}")
+    load_sha = sha(load_record) if load_record else None
+    expected = {"kind": args.kind, "exe_sha256": exe_sha, "library_sha256": lib_sha,
+                "model_hashes": [sha(model_a), sha(model_b)], "manifest_hashes": manifest_hashes,
+                "pair_count": args.pairs, "seed": seed, "hook": hook, "load_sha256": load_sha,
+                "status": "MUTANT_CONSTRUCTION" if hook else
+                          "MECHANISM_ONLY" if getattr(args, "mechanism", False) else "QUARANTINED"}
+    with PidLock(BOX_LOCK):
+        prior = read_result(result, expected)
+        if prior is not None:
+            return prior
+        before = box_observation()
         pairs_file = result.with_suffix(".pairs.partial")
         pairs_file.unlink(missing_ok=True)
         env = os.environ.copy()
@@ -264,18 +330,24 @@ def run(args) -> dict:
         if args.kind == "79":
             command = [str(exe), "pair79", model_a.name, model_b.name, str(args.cap_a), str(args.cap_b),
                        str(args.layers), str(args.heads), str(args.dim), str(blobs[0]), str(blobs[1]),
-                       str(args.pairs), str(args.seed), str(pairs_file)]
+                       str(args.pairs), str(seed), str(pairs_file)]
         else:
             command = [str(exe), "pair79b", model_a.name, str(args.cap_a), str(args.layers), str(args.heads),
-                       str(args.dim), str(args.pairs), str(args.seed), str(pairs_file)]
+                       str(args.dim), str(args.pairs), str(seed), str(pairs_file)]
         exit_code = run_logged(command, result.with_suffix(".log"), args.cap_seconds, env)
+        after = box_observation()
         if exit_code is None or exit_code != 0 or not pairs_file.is_file():
             raise Refusal("production pair runner failed or capped; see log")
         values, token_sha = parse_pairs(pairs_file, args.pairs)
         stats = grade(values)
+        if hook:
+            stats["status"] = "MUTANT_CONSTRUCTION"
+        elif getattr(args, "mechanism", False):
+            stats["status"] = "MECHANISM_ONLY"
         record = {"kind": args.kind, "complete": True, "exe_sha256": exe_sha, "library_sha256": lib_sha,
                   "model_hashes": [sha(model_a), sha(model_b)], "manifest_hashes": manifest_hashes,
-                  "token_sha256": token_sha, "pairs_sha256": sha(pairs_file), "seed": args.seed, **stats}
+                  "token_sha256": token_sha, "pairs_sha256": sha(pairs_file), "seed": seed,
+                  "hook": hook, "load_sha256": load_sha, "load_before": before, "load_after": after, **stats}
         os.replace(pairs_file, result.with_suffix(".pairs.csv"))
         atomic_json(result, record)
         return record
@@ -311,8 +383,10 @@ def main(argv=None) -> int:
     pair.add_argument("--dim", required=True, type=int)
     pair.add_argument("--width", required=True, type=int)
     pair.add_argument("--pairs", type=int, default=508)
-    pair.add_argument("--seed", type=int, default=7904)
+    pair.add_argument("--seed", type=int)
+    pair.add_argument("--mechanism", action="store_true", help="explicitly allow an ungraded short construction")
     pair.add_argument("--cap-seconds", type=int, default=3600)
+    pair.add_argument("--load-record", type=Path, help="the on/off generator record bound into this result")
     args = parser.parse_args(argv)
     try:
         record = prepare(args) if args.mode == "prepare" else run(args)
