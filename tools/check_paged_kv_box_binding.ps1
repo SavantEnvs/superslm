@@ -1,5 +1,6 @@
 # Exercise only Get-LegRecord, without entering a timing cell or build shell.
-param([string]$Runner = (Join-Path $PSScriptRoot 'run_paged_kv_c6_box.ps1'))
+param([string]$Runner = (Join-Path $PSScriptRoot 'run_paged_kv_c6_box.ps1'),
+      [string]$BuildDir = 'D:\_scratch\T-3114\build-c6-opt')
 $ErrorActionPreference = 'Stop'
 $source = Get-Content -LiteralPath $Runner -Raw
 $start = $source.IndexOf('function Get-LegRecord($leg) {', [StringComparison]::Ordinal)
@@ -15,7 +16,7 @@ function New-PkvLegRecord {
           $Inputs, $Commissioned, $HookState)
     return @{ Commissioned = @($Commissioned); SourceManifestSha256 = "$SourceManifestSha256" }
 }
-$exe = @{ pkv_c6 = 'D:\_scratch\T-3114\build-c6\superslm_pkv_c6.exe' }
+$exe = @{ pkv_c6 = (Join-Path $BuildDir 'superslm_pkv_c6.exe') }
 if (-not (Test-Path -LiteralPath "$($exe.pkv_c6).source-set.json")) { throw 'C6 source manifest missing' }
 $Commissioned = @('timing74')
 $PkvC6Instruments = @{ timing74 = @{ Registry = 'PKV-TIMING-74-C6-R168' } }
