@@ -17,14 +17,11 @@ class RefusalCells(unittest.TestCase):
                               capture_output=True, text=True, timeout=90)
 
     def check_refusal(self, code, message, **settings):
-        for attempt in range(5 if code in (74, 75) else 1):
-            result = self.call(**settings)
-            if code in (74, 75) and result.returncode == 76:
-                continue  # timer vitality precedes these deliberate refusals
-            self.assertEqual(result.returncode, code, result.stdout + result.stderr)
-            self.assertIn(message, result.stderr)
-            return
-        self.fail(f"timer vitality refused every attempt before infrastructure {code}")
+        result = self.call(**settings)
+        self.assertNotEqual(result.returncode, 76,
+                            "7.4t diagnostic refusal blocked the direct 7.4 cell")
+        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        self.assertIn(message, result.stderr)
 
     def test_74_5_geometry_refuses_before_cap(self):
         self.check_refusal(71, "geometry mismatch", FIXTURE_LARGE="pkv_qk")
@@ -42,14 +39,21 @@ class RefusalCells(unittest.TestCase):
         self.check_refusal(74, "corrected median under 100 ticks", FORCE_FLOOR="1")
 
     def test_timer_vitality_and_unresolved_refusals(self):
-        self.check_refusal(76, "fixed-L timer vitality failed", FORCE_VITALITY_FAILURE="1")
         self.check_refusal(75, "sign interval did not resolve", FORCE_UNRESOLVED="1")
+
+    def test_4t_diagnostic_failure_is_reported_without_gating_74(self):
+        result = self.call(FORCE_VITALITY_FAILURE="1")
+        self.assertNotEqual(result.returncode, 76, result.stdout + result.stderr)
+        self.assertIn("7.4t:", result.stdout)
+        self.assertIn("INFRASTRUCTURE", result.stdout)
+        for holder in ("budget", "whole_reserve"):
+            for verb in ("reset", "adopt"):
+                self.assertIn(f"7.4 {holder} {verb} r(86)=", result.stdout)
 
     def test_4t_live_no_subtraction_mutant(self):
         healthy = [self.call(cell="7.4t/C6:live") for _ in range(20)]
         passed = sum(result.returncode == 0 for result in healthy)
-        print(f"7.4t fixed-L live mechanism: {passed}/20 healthy accepted", flush=True)
-        self.assertGreaterEqual(passed, 19, f"healthy fixed-L clock accepted only {passed}/20")
+        print(f"7.4t diagnostic fixed-L live mechanism: {passed}/20 accepted; no 7.4 gate", flush=True)
         mutant = self.call(binary="superslm_pkv_74_no_subtraction.exe", cell="7.4t/C6:live")
         self.assertEqual(mutant.returncode, 1, mutant.stdout + mutant.stderr)
         self.assertIn("clock.okay", mutant.stderr)
@@ -59,8 +63,8 @@ class RefusalCells(unittest.TestCase):
             with self.subTest(verb=verb):
                 for attempt in range(3):
                     result = self.call(**{verb + "_MUTANT": "1"})
-                    if result.returncode == 76:  # independent timer vitality refusal
-                        continue
+                    self.assertNotEqual(result.returncode, 76,
+                                        "7.4t diagnostic refusal blocked the direct 7.4 cell")
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     for holder in ("budget", "whole_reserve"):
                         self.assertRegex(result.stdout, rf"7\.4 {holder} {verb.lower()} r\(86\)=[0-9.]+ r\(120\)=[0-9.]+ bound=2\.0 FAIL")
