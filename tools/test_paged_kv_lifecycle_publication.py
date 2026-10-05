@@ -55,6 +55,19 @@ class LifecyclePublication(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("malformed baseline row", result.stderr)
 
+    def test_lc4_duplicate_baseline_key_refuses(self):
+        with tempfile.TemporaryDirectory() as temp:
+            baseline = Path(temp) / "baseline.txt"
+            captured = self.call(OUT=baseline)
+            self.assertEqual(captured.returncode, 0, captured.stdout + captured.stderr)
+            rows = baseline.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(rows)
+            baseline.write_text("\n".join([*rows, rows[0]]) + "\n", encoding="utf-8")
+            duplicate = self.call(BASELINE=baseline)
+            self.assertNotEqual(duplicate.returncode, 0, duplicate.stdout + duplicate.stderr)
+            self.assertIn("malformed baseline row", duplicate.stderr)
+            self.assertNotIn("published change", duplicate.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
