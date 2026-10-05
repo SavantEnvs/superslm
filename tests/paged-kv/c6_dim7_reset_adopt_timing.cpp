@@ -1,5 +1,6 @@
 // C6 7.4: paired calls at two caps on one model; fixed timer vitality precedes grading.
 #include "pkv_budget_c_helpers.h"
+#include "superslm/model.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -11,6 +12,10 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #if defined(_M_X64) || defined(__x86_64__)
 #define PKV_74_X86 1
@@ -35,6 +40,23 @@ using namespace pkv;
 using namespace pkv::bc;
 constexpr int kPairs = 205;
 enum class Verdict { Pass, Fail, NoResult };
+[[noreturn]] void Refuse(int code,const char* why);
+void Lock74() {
+#if defined(_WIN32)
+	CreateDirectoryA("D:\\_scratch\\SuperSLM",nullptr);
+	const char* path="D:\\_scratch\\SuperSLM\\pkv-c6-timing.lock";
+	HANDLE handle=CreateFileA(path,GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+	if(handle==INVALID_HANDLE_VALUE)Refuse(71,"C6 timing lock already held");
+	const auto pid=std::to_string(GetCurrentProcessId());DWORD written=0;
+	WriteFile(handle,pid.data(),static_cast<DWORD>(pid.size()),&written,nullptr);CloseHandle(handle);
+	std::atexit([]{DeleteFileA("D:\\_scratch\\SuperSLM\\pkv-c6-timing.lock");});
+#else
+	const char* path="/tmp/superslm-pkv-c6-timing.lock";
+	const int fd=open(path,O_CREAT|O_EXCL|O_WRONLY,0600);
+	if(fd<0)Refuse(71,"C6 timing lock already held");close(fd);
+	std::atexit([]{unlink("/tmp/superslm-pkv-c6-timing.lock");});
+#endif
+}
 
 double Median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v.empty() ? 0 : v[v.size()/2]; }
 double Corrected(double raw,double empty) {
@@ -90,7 +112,16 @@ void Constructions() {
 		PKV_CHECK(Vitality(100+cost,1000+cost,cost));
 	}
 }
-[[noreturn]] void Refuse(int code,const char* why) { std::fprintf(stderr,"7.4 INFRASTRUCTURE %d: %s\n",code,why); std::exit(code); }
+[[noreturn]] void Refuse(int code,const char* why) {
+	std::fprintf(stderr,"7.4 INFRASTRUCTURE %d: %s\n",code,why);
+	if(State().failures){
+		std::printf("[C6] 7.4/C6 RED (%d checks, %d failed)\n",State().checks,State().failures);
+		std::printf("1 cells, 1 red; %d checks, %d failures\n",State().checks,State().failures);
+		std::fflush(stdout);
+		std::exit(1);
+	}
+	std::exit(code);
+}
 
 #if PKV_74_X86
 struct Pin {
@@ -152,8 +183,23 @@ struct Side {
 		return ok;}
 };
 void Run74(const Fixture& low,const Fixture& large){
+	Lock74();
 	if(!low.ok||!large.ok)Refuse(71,"artifact missing or unable to load");
-	if(low.geo.layers!=large.geo.layers||low.geo.kv_heads!=large.geo.kv_heads||low.geo.head_dim!=large.geo.head_dim)Refuse(71,"geometry mismatch");
+	superslm::SslmModelView low_view,large_view;std::string error;
+	if(superslm::SslmModel::Load(low.bytes.p,low.size,low_view,&error)!=superslm::SslmModelStatus::Ok||
+	   superslm::SslmModel::Load(large.bytes.p,large.size,large_view,&error)!=superslm::SslmModelStatus::Ok)
+		Refuse(71,"artifact config cannot be parsed");
+	const auto& small_config=low_view.config;const auto& large_config=large_view.config;
+	if(small_config.num_hidden_layers!=large_config.num_hidden_layers||
+	   small_config.num_key_value_heads!=large_config.num_key_value_heads||
+	   small_config.head_dim!=large_config.head_dim||small_config.hidden_size!=large_config.hidden_size||
+	   small_config.kv_block_size!=large_config.kv_block_size||
+	   small_config.num_hidden_layers!=low.geo.layers||large_config.num_hidden_layers!=large.geo.layers||
+	   small_config.num_key_value_heads!=low.geo.kv_heads||large_config.num_key_value_heads!=large.geo.kv_heads||
+	   small_config.head_dim!=low.geo.head_dim||large_config.head_dim!=large.geo.head_dim)
+		Refuse(71,"geometry mismatch");
+	if(sslm_kv_block_size(low.model)!=size_t{small_config.context_cap}*low.BytesPerToken()||
+	   sslm_kv_block_size(large.model)!=size_t{large_config.context_cap}*large.BytesPerToken())Refuse(71,"block size mismatch");
 	if(low.geo.context_cap!=4096||large.geo.context_cap!=32768)Refuse(72,"wrong cap");
 	if(!TscInvariant())Refuse(73,"invariant TSC absent");Pin pin;if(!pin.ok||std::getenv("SUPERSLM_PAGED_KV_74_FORCE_PIN_FAILURE"))Refuse(73,"cannot pin timing thread");Clock clock;
 	if(!clock.okay&&RdtscpAvailable()){use_rdtscp=true;clock=Clock();}

@@ -50,7 +50,6 @@ $legs = @(
     [pscustomobject]@{ Name = '10.6/C6'; Kind = 'correctness'; Bin = 'pkv_c6'; Cell = '10.6/C6'; Rests = @('admission', 'oracle') },
     [pscustomobject]@{ Name = '10.8/C6'; Kind = 'correctness'; Bin = 'pkv_c6'; Cell = '10.8/C6'; Rests = @('admission') },
     [pscustomobject]@{ Name = '7.4/C6'; Kind = 'timing'; Bin = 'pkv_c6'; Cell = '7.4/C6'; Rests = @('timing74') },
-    [pscustomobject]@{ Name = 'lifecycle-v1.11.0'; Kind = 'timing'; Bin = 'hlife_v1110'; Cell = 'lifecycle/C6'; Rests = @('lifecycle') },
     [pscustomobject]@{ Name = 'lifecycle/C6'; Kind = 'timing'; Bin = 'pkv_life_prod'; Cell = 'lifecycle/C6'; Rests = @('lifecycle') }
 )
 if ($TimingOnly) { $legs = @($legs | Where-Object { $_.Kind -eq 'timing' }) }
@@ -64,7 +63,6 @@ function Get-MarkerPath($leg) { return Join-Path $Done (($leg.Name -replace '[/\
 function Get-LogPath($leg) { return Join-Path $Logs (($leg.Name -replace '[/\\:]', '_') + '.log') }
 if ($Fresh) {
     foreach ($leg in $legs) { Remove-Item -LiteralPath (Get-MarkerPath $leg) -ErrorAction SilentlyContinue }
-    if ($legs | Where-Object { $_.Name -eq 'lifecycle-v1.11.0' }) { Remove-Item -LiteralPath $BaselineLife -ErrorAction SilentlyContinue }
 }
 
 # ---- artifacts: one directory holding both, under the names the cells read ----------------------
@@ -139,11 +137,13 @@ function Get-LegRecord($leg) {
         }
     }
     $hook = ''
-    if ($leg.Name -eq '7.4/C6') {
-        $hook = "adopt=$env:SUPERSLM_PAGED_KV_74_ADOPT_MUTANT;reset=$env:SUPERSLM_PAGED_KV_74_RESET_MUTANT"
-        if ($hook -eq 'adopt=;reset=') { $hook = '' }
-    } elseif ($leg.Name -like 'lifecycle*' -and $env:SUPERSLM_PAGED_KV_LIFE_RESET_MUTANT) {
-        $hook = "reset=$env:SUPERSLM_PAGED_KV_LIFE_RESET_MUTANT"
+    $prefix = if ($leg.Name -eq '7.4/C6') { 'SUPERSLM_PAGED_KV_74_' }
+              elseif ($leg.Name -like 'lifecycle*') { 'SUPERSLM_PAGED_KV_LIFE_' } else { '' }
+    if ($prefix) {
+        $hook = (@(Get-ChildItem Env: | Where-Object { $_.Name.StartsWith($prefix) -and
+            $_.Name -ne 'SUPERSLM_PAGED_KV_LIFE_COMMISSIONED' } | Sort-Object Name |
+            ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ';')
+        if ($hook) { $bound = @($bound | Where-Object { $_ -notin @('timing74', 'lifecycle') }) }
     }
     return New-PkvLegRecord -Leg $leg.Name -Rests $leg.Rests -Head $Head -Binary "$bin" -BinarySha256 $sha `
         -SourceManifestSha256 $manifestSha -Inputs (Get-LegInputs $leg) -Commissioned $bound -HookState $hook
@@ -180,29 +180,12 @@ if ($needs['pkv_c6'] -or $needs['pkv_life_prod']) {
         Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     if ($needs['pkv_life_prod'] -and -not $exe['pkv_life_prod']) { throw "superslm_pkv_lifecycle_prod.exe not found under $BuildDir" }
 }
-if ($needs['hlife_v1110']) {
-    # The frozen baseline compiles the lifecycle harness against the frozen library.
-    if ($needs['hlife_v1110']) { $exe['hlife_v1110'] = Join-Path $C6 'pkvlife_v1.11.0.exe' }
-    $rebuild = @{}
-    foreach ($b in @('hlife_v1110')) {
-        if ($needs[$b] -and @($legs | Where-Object { $_.Bin -eq $b -and -not (Test-LegCurrent $_) }).Count -gt 0) { $rebuild[$b] = $true }
-    }
-    $refHeader = Join-Path $C6 'pkv_refdir.h'
-    Set-Content -LiteralPath $refHeader -Encoding ascii -Value ('#define PKV_REFERENCE_DIR "' + ($RefDir -replace '\\', '/') + '"')
-    if ($rebuild['hlife_v1110']) {
-        $lib = Initialize-PkvFrozenLibrary -Tag 'v1.11.0' -WorkDir (Join-Path $ScratchDir 'ref')
-    }
-    if ($rebuild['hlife_v1110']) {
-        Build-PkvExe -Out $exe['hlife_v1110'] -Sources @((Join-Path $Repo 'tests\paged-kv\pkv_main.cpp'), (Join-Path $Repo 'tests\paged-kv\c6_lifecycle_timing.cpp')) `
-            -Lib $lib.Lib -ForceInclude $refHeader -Includes @((Join-Path $lib.Src 'include'), (Join-Path $Repo 'tests\paged-kv'))
-    }
-}
-
 # ---- idle check -------------------------------------------------------------------------------
 function Get-IdleReport {
     $offenders = @()
     if (Test-Path -LiteralPath 'D:\_ssu_build_lock') { $offenders += 'D:\_ssu_build_lock present' }
-    $procs = @(Get-Process -Name 'UnrealEditor', 'UnrealEditor-Cmd', 'cl', 'link', 'dotnet', 'UnrealBuildTool' -ErrorAction SilentlyContinue)
+    $procs = @(Get-Process -Name 'UnrealEditor', 'UnrealEditor-Cmd', 'cl', 'link', 'dotnet',
+        'UnrealBuildTool', 'smoke_adapter_driver', 'superslm_pkv_*' -ErrorAction SilentlyContinue)
     foreach ($p in $procs) { $offenders += "process $($p.ProcessName) (pid $($p.Id))" }
     $load = @()
     for ($i = 0; $i -lt 3; ++$i) {
@@ -215,7 +198,10 @@ function Get-IdleReport {
 # ---- run --------------------------------------------------------------------------------------
 $envNames = @('SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR',
     'SUPERSLM_PAGED_KV_LIFE_OUT', 'SUPERSLM_PAGED_KV_LIFE_BASELINE',
-    'SUPERSLM_PAGED_KV_LIFE_COMMISSIONED', 'SUPERSLM_PAGED_KV_FIXTURE_DIR')
+    'SUPERSLM_PAGED_KV_LIFE_COMMISSIONED', 'SUPERSLM_PAGED_KV_FIXTURE_DIR',
+    'SUPERSLM_PAGED_KV_74_FLOOR_CONTROL_TICKS', 'SUPERSLM_PAGED_KV_74_ORDER_BIAS_TICKS',
+    'SUPERSLM_PAGED_KV_74_CAP32768_FILE', 'SUPERSLM_PAGED_KV_74_ADOPT_MUTANT',
+    'SUPERSLM_PAGED_KV_74_RESET_MUTANT')
 $results = @{}
 foreach ($leg in $legs) {
     $marker = Get-MarkerPath $leg
@@ -234,7 +220,6 @@ foreach ($leg in $legs) {
     }
     foreach ($n in $envNames) { Remove-Item -Path "Env:\$n" -ErrorAction SilentlyContinue }
     $env:SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR = $ArtDir
-    if ($leg.Name -eq 'lifecycle-v1.11.0') { $env:SUPERSLM_PAGED_KV_LIFE_OUT = "$BaselineLife.partial" }
     if ($leg.Name -eq 'lifecycle/C6') { $env:SUPERSLM_PAGED_KV_LIFE_BASELINE = $BaselineLife }
     # The assertion variables come from the record itself, so the record says exactly what was set.
     $assertEnv = Get-PkvRecordEnv $record
@@ -242,7 +227,9 @@ foreach ($leg in $legs) {
         if ($envNames -notcontains $k) { throw "assertion variable $k is not cleared between legs" }
         Set-Item -Path "Env:\$k" -Value $assertEnv[$k]
     }
-    $timingLock = if ($leg.Kind -eq 'timing') { Enter-PkvTimingLock } else { $null }
+    # Direct 7.4 acquires the same lock inside its process. Other timing legs
+    # retain the runner lock so both direct and orchestrated paths serialize.
+    $timingLock = if ($leg.Kind -eq 'timing' -and $leg.Name -ne '7.4/C6') { Enter-PkvTimingLock } else { $null }
     try {
     $log = Get-LogPath $leg
     $before = $null
@@ -266,7 +253,6 @@ foreach ($leg in $legs) {
     $last = $tail | Where-Object { $_ -match '^\d+ cells, \d+ red; \d+ checks, \d+ failures$' } | Select-Object -Last 1
     $verdict = switch ($code) { 0 { 'GREEN' } 1 { 'RED' } default { "CRASH($code)" } }
     if ($last -match '^0 cells') { $verdict = 'NO-CELL' }
-    if ($leg.Name -eq 'lifecycle-v1.11.0' -and $code -eq 0) { Move-Item -LiteralPath "$BaselineLife.partial" -Destination $BaselineLife -Force }
     $line = '{0} exit={1} {2} ({3} s) {4} {5}' -f $verdict, $code, $last, $secs, (Get-Date -Format s), $idleNote
     $record.Outcome = $line
     Write-PkvLegRecord $marker $record
