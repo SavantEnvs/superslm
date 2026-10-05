@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -22,6 +23,17 @@ class PairSeed(unittest.TestCase):
                                    (4294967296, 40), (-1, 40)):
                 with self.subTest(seed=seed):
                     output = Path(folder) / f"{seed}.csv"
+                    if os.name == "nt":
+                        while True:
+                            listing = subprocess.run([
+                                "C:/Windows/System32/tasklist.exe", "/FI",
+                                "IMAGENAME eq smoke_adapter_driver.exe", "/NH"],
+                                capture_output=True, text=True, timeout=15)
+                            self.assertEqual(listing.returncode, 0, listing.stderr)
+                            if "smoke_adapter_driver.exe" not in listing.stdout.lower():
+                                break
+                            print("waiting for smoke_adapter_driver.exe before seed control", flush=True)
+                            time.sleep(30)
                     result = subprocess.run([
                         str(BUILD / "superslm_pkv_pair.exe"), "pair79b", model.name,
                         "4096", "2", "2", "48", "1", str(seed), str(output)],
