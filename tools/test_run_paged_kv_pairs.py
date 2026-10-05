@@ -303,7 +303,10 @@ class PairCells(unittest.TestCase):
     def test_load_generator_record_hash_invalidates_reuse(self):
         args = self.args(self.root / "loaded.json")
         args.load_record = self.root / "load.json"
-        args.load_record.write_text('{"form":"square-0.1"}')
+        load_state = {"form": "square-0.1", "pid": os.getpid(),
+                      "worker_pids": [os.getpid()], "phase": "on", "complete": False,
+                      "started_monotonic": 1.0, "calibration": None}
+        args.load_record.write_text(json.dumps(load_state), encoding="utf-8")
         def fake_run(command, log, cap, env):
             Path(command[-1]).write_text("".join(f"{i},A,100,100,12,12\n" for i in range(508)))
             return 0
@@ -313,9 +316,12 @@ class PairCells(unittest.TestCase):
              patch.object(pair, "box_observation", return_value={"cpu_percent": 1}):
             first = pair.run(args)
             self.assertEqual(first["load_sha256"], pair.sha(args.load_record))
-            args.load_record.write_text('{"form":"square-1"}')
+            self.assertEqual(first["status"], "QUARANTINED")
+            load_state["form"] = "square-1"
+            args.load_record.write_text(json.dumps(load_state), encoding="utf-8")
             second = pair.run(args)
             self.assertNotEqual(first["load_sha256"], second["load_sha256"])
+            self.assertEqual(second["load_record_after_sha256"], pair.sha(args.load_record))
             self.assertEqual(execute.call_count, 2)
 
     def test_79_14_dead_or_inactive_load_generator_cannot_authorize(self):
