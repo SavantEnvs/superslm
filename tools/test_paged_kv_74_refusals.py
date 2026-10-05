@@ -103,6 +103,16 @@ class RefusalCells(unittest.TestCase):
                 self.assertAlmostEqual(row["corrected_ticks"], row["raw_ticks"] - reference,
                                        delta=1, msg=row)
 
+    def test_74_14_direct_hooked_cell_declares_quarantine(self):
+        for hook in ("ADOPT", "RESET"):
+            with self.subTest(hook=hook):
+                result = self.call(FORCE_VITALITY_FAILURE="1",
+                                   **{hook + "_MUTANT": "1"})
+                self.assertNotEqual(result.returncode, 76, result.stdout + result.stderr)
+                self.assertIn(f"7.4 hook_state={hook.lower()}=1", result.stdout)
+                self.assertIn("publication=quarantined", result.stdout)
+                self.assertIn("7.4 budget", result.stdout)
+
     def test_timer_vitality_and_unresolved_refusals(self):
         self.check_refusal(75, "sign interval did not resolve", FORCE_UNRESOLVED="1")
 
