@@ -26,5 +26,30 @@ class LoadCells(unittest.TestCase):
             self.assertEqual(result["worker_exits"], [0])
             self.assertGreaterEqual(result["elapsed_s"], .15)
 
+    def test_79_15_each_form_records_live_probe_calibration(self):
+        # Mechanism probe only. A real decode slowdown on this box remains a
+        # separately permitted, source-bound calibration before any C6 grade.
+        for form in (*load.FORMS, "random-dwell"):
+            with self.subTest(form=form), tempfile.TemporaryDirectory(prefix="pkv-load-cal-") as folder:
+                record = Path(folder) / "load.json"
+                calls = []
+                def probe(phase, worker_pids):
+                    calls.append((phase, tuple(worker_pids)))
+                    self.assertTrue(worker_pids, "calibration needs live generator workers")
+                    return 1.0 if phase == "off" else 2.81
+                result = load.run(form, .15, 1, 79, record, calibration_probe=probe)
+                self.assertEqual([phase for phase, _ in calls], ["off", "on"])
+                self.assertEqual(result["calibration"]["slowdown"], 2.81)
+                self.assertTrue(result["calibration"]["qualified"])
+                self.assertEqual(json.loads(record.read_text())["calibration"], result["calibration"])
+
+    def test_79_15_below_2_8_cannot_authorize_a_load(self):
+        with tempfile.TemporaryDirectory(prefix="pkv-load-under-") as folder:
+            def probe(phase, worker_pids):
+                return 1.0 if phase == "off" else 2.79
+            with self.assertRaisesRegex(ValueError, "2.8"):
+                load.run("square-0.1", .15, 1, 79, Path(folder) / "load.json",
+                         calibration_probe=probe)
+
 if __name__ == "__main__":
     unittest.main()
