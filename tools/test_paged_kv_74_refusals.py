@@ -83,6 +83,32 @@ class RefusalCells(unittest.TestCase):
                 self.assertGreaterEqual(min(counts.values()), 60, counts)
                 self.assertLessEqual(max(counts.values()), 145, counts)
 
+    def test_74_12_order_changes_measured_adopt_ratio(self):
+        # The trace alone can lie: a fixed-call-order mutant can still print
+        # the RNG choice. The grader's own rank interval must see both sides
+        # of the first-call bias in the measured pair ratios.
+        with tempfile.TemporaryDirectory(prefix="pkv-74-order-effect-") as temp:
+            trace = Path(temp) / "order.csv"
+            result = self.call(ORDER_TRACE=str(trace), ORDER_BIAS_TICKS="1000000")
+            self.assertNotIn(result.returncode, (71, 73, 74, 76), result.stdout + result.stderr)
+            self.assertTrue(trace.is_file(), result.stdout + result.stderr)
+            with trace.open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+            for holder in ("budget", "whole_reserve"):
+                arm = [row for row in rows if row["holder"] == holder]
+                self.assertEqual(len(arm), 205)
+                choices = {name: sum(row["first"] == name for row in arm)
+                           for name in ("small", "large")}
+                self.assertGreaterEqual(min(choices.values()), 60, choices)
+                match = re.search(rf"7\.4 {holder} adopt r\(86\)=([0-9.]+) "
+                                  rf"r\(120\)=([0-9.]+) bound=2\.0 (\S+(?: RESULT)?)",
+                                  result.stdout)
+                self.assertIsNotNone(match, result.stdout + result.stderr)
+                lower, upper = float(match.group(1)), float(match.group(2))
+                print(f"P-13 {holder}: first={choices} r(86)={lower} r(120)={upper}", flush=True)
+                self.assertLess(lower, 0.5, "large-first bias must not own every pair")
+                self.assertGreater(upper, 4.0, "small-first bias must not own every pair")
+
     def test_74_13_every_timed_call_subtracts_independent_empty_median(self):
         with tempfile.TemporaryDirectory(prefix="pkv-74-calls-") as temp:
             trace = Path(temp) / "calls.json"
