@@ -3,7 +3,9 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import unittest
+import csv
 
 BUILD = Path(os.environ.get("PKV_C6_BUILD", "D:/_scratch/T-3112/build-c6"))
 FIXTURES = Path(os.environ.get("PKV_C6_FIXTURES", "D:/_scratch/T-3112/fixtures"))
@@ -60,6 +62,25 @@ class RefusalCells(unittest.TestCase):
             self.assertGreaterEqual((hooked - base) / base, 5.0,
                                     "reset hook must inject the specified 7× extra cost")
             self.assertLessEqual((hooked - base) / base, 9.0)
+
+    def test_74_12_pair_order_random_under_first_call_load(self):
+        with tempfile.TemporaryDirectory(prefix="pkv-74-order-") as temp:
+            trace = Path(temp) / "order.csv"
+            result = self.call(ORDER_TRACE=str(trace), ORDER_BIAS_TICKS="1000",
+                               FORCE_VITALITY_FAILURE="1")
+            self.assertNotEqual(result.returncode, 76, result.stdout + result.stderr)
+            self.assertTrue(trace.is_file(), result.stdout + result.stderr)
+            with trace.open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+            for holder in ("budget", "whole_reserve"):
+                arm = [row for row in rows if row["holder"] == holder]
+                self.assertEqual(len(arm), 205)
+                self.assertEqual({int(row["pair"]) for row in arm}, set(range(205)))
+                self.assertEqual({int(row["bias_ticks"]) for row in arm}, {1000})
+                counts = {first: sum(row["first"] == first for row in arm)
+                          for first in ("small", "large")}
+                self.assertGreaterEqual(min(counts.values()), 60, counts)
+                self.assertLessEqual(max(counts.values()), 145, counts)
 
     def test_timer_vitality_and_unresolved_refusals(self):
         self.check_refusal(75, "sign interval did not resolve", FORCE_UNRESOLVED="1")
