@@ -165,6 +165,17 @@ def box_observation() -> dict:
 
 
 def run_logged(command: list[str], log: Path, cap: int, env: dict[str, str]) -> int | None:
+    if os.name == "nt":
+        while True:
+            listing = subprocess.run(["C:/Windows/System32/tasklist.exe", "/FI",
+                                      "IMAGENAME eq smoke_adapter_driver.exe", "/NH"],
+                                     capture_output=True, text=True, timeout=15)
+            if listing.returncode:
+                raise Refusal("cannot check smoke_adapter_driver before process start")
+            if "smoke_adapter_driver.exe" not in listing.stdout.lower():
+                break
+            print("waiting for smoke_adapter_driver.exe before process start", flush=True)
+            time.sleep(30)
     start = time.monotonic()
     with log.open("wb") as output:
         process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, env=env)
