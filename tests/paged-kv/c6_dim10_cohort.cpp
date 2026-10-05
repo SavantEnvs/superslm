@@ -415,6 +415,7 @@ void CellCacheVersion() {
 	if (!fx.ok) return;
 	const std::string exe = ExecutableSha();
 	PKV_CHECK_MSG(exe.size() == 64, "cohort executable hash missing");
+	std::printf("cohort executable sha256=%s\n", exe.c_str());
 #if defined(_WIN32)
 	const auto pid = GetCurrentProcessId();
 #else
@@ -435,6 +436,15 @@ void CellCacheVersion() {
 	PKV_CHECK(CohortCache(fx,path,"test-head",&loaded,true));
 	{
 		std::fstream f(path,std::ios::binary|std::ios::in|std::ios::out);
+		std::string line;
+		for(int i=0;i<3;++i) PKV_CHECK(GetTextLine(f,line));
+		const auto at=f.tellg();
+		f.seekp(at);f.put(exe[0]=='0'?'1':'0');f.flush();
+		PKV_CHECK(!CohortCache(fx,path,"test-head",&loaded,true));
+		f.seekp(at);f.put(exe[0]);
+	}
+	{
+		std::fstream f(path,std::ios::binary|std::ios::in|std::ios::out);
 		f.seekp(std::string("PKVC6-CACHE-").size());f.put('1');
 	}
 	PKV_CHECK(!CohortCache(fx,path,"test-head",&loaded,true));
@@ -442,6 +452,15 @@ void CellCacheVersion() {
 		r.mid_rows[i].clear();r.lim_rows[i].clear();r.end[i]=SSLM_OK;}
 	PKV_CHECK(CohortShardCache(fx,shard,"test-head",0,&r,false));
 	PKV_CHECK(CohortShardCache(fx,shard,"test-head",0,&loaded,true));
+	{
+		std::fstream f(shard,std::ios::binary|std::ios::in|std::ios::out);
+		std::string line;
+		for(int i=0;i<3;++i) PKV_CHECK(GetTextLine(f,line));
+		const auto at=f.tellg();
+		f.seekp(at);f.put(exe[0]=='0'?'1':'0');f.flush();
+		PKV_CHECK(!CohortShardCache(fx,shard,"test-head",0,&loaded,true));
+		f.seekp(at);f.put(exe[0]);
+	}
 	{
 		std::fstream f(shard,std::ios::binary|std::ios::in|std::ios::out);
 		f.seekp(std::string("PKVC6-SHARD-").size());f.put('1');
