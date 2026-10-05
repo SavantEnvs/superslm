@@ -356,6 +356,7 @@ def run(args) -> dict:
     model_b = (args.model_b or args.model_a).resolve()
     if not model_a.is_file() or not model_b.is_file() or model_a.parent != model_b.parent:
         raise Refusal("both models must exist in one artifact directory")
+    model_hashes = [sha(model_a), sha(model_b)]
     if args.kind == "79b" and args.model_b:
         raise Refusal("7.9b uses one model")
     manifest_hashes, blobs = [], []
@@ -396,7 +397,7 @@ def run(args) -> dict:
     standing = receipt_bound and load_qualified
     expected = {"kind": args.kind, "exe_sha256": exe_sha, "library_sha256": lib_sha,
                 "source_manifest_sha256": source_manifest_sha,
-                "model_hashes": [sha(model_a), sha(model_b)], "manifest_hashes": manifest_hashes,
+                "model_hashes": model_hashes, "manifest_hashes": manifest_hashes,
                 "pair_count": args.pairs, "seed": seed, "hook": hook, "load_sha256": load_sha,
                 "status": "MUTANT_CONSTRUCTION" if hook else
                           "MECHANISM_ONLY" if getattr(args, "mechanism", False) else
@@ -421,6 +422,18 @@ def run(args) -> dict:
             command = [str(exe), "pair79b", model_a.name, str(args.cap_a), str(args.layers), str(args.heads),
                        str(args.dim), str(args.pairs), str(seed), str(pairs_file)]
         exit_code = run_logged(command, result.with_suffix(".log"), args.cap_seconds, env)
+        if ([sha(model_a), sha(model_b)] != model_hashes or production_library(exe) != (exe_sha, lib_sha)):
+            raise Refusal("model or production build changed during pair run")
+        if args.kind == "79":
+            for manifest, model, cap, prior_blob, prior_digest in zip(
+                    (args.manifest_a, args.manifest_b), (model_a, model_b), (args.cap_a, args.cap_b),
+                    blobs, manifest_hashes):
+                blob, digest = checked_blob(manifest.resolve(), model, args.width,
+                                            [cap, args.layers, args.heads, args.dim])
+                if blob != prior_blob or digest != prior_digest:
+                    raise Refusal("prompt inputs changed during pair run")
+        if receipt_bound and source_bound_receipt(exe, args.kind) != (True, source_manifest_sha):
+            raise Refusal("receipt source changed during pair run")
         load_after_sha = None
         if load_record:
             after_load = live_load_state(load_record)
@@ -442,7 +455,7 @@ def run(args) -> dict:
             stats["status"] = "STANDING"
         record = {"kind": args.kind, "complete": True, "exe_sha256": exe_sha, "library_sha256": lib_sha,
                   "source_manifest_sha256": source_manifest_sha,
-                  "model_hashes": [sha(model_a), sha(model_b)], "manifest_hashes": manifest_hashes,
+                  "model_hashes": model_hashes, "manifest_hashes": manifest_hashes,
                   "token_sha256": token_sha, "pairs_sha256": sha(pairs_file), "seed": seed,
                   "hook": hook, "load_sha256": load_sha, "load_record_after_sha256": load_after_sha,
                   "load_before": before, "load_after": after, **stats}

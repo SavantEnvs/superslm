@@ -241,6 +241,13 @@ foreach ($leg in $legs) {
     $t0 = Get-Date
     $code = Invoke-PkvLogged -Exe $exe[$leg.Bin] -Arguments @("=$($leg.Cell)") -Log $log -WorkingDirectory $C6
     $secs = [int]((Get-Date) - $t0).TotalSeconds
+    foreach ($n in $envNames) { Remove-Item -Path "Env:\$n" -ErrorAction SilentlyContinue }
+    $postRecord = Get-LegRecord $leg
+    if (-not (Test-PkvLegRecordCurrent $record $postRecord)) {
+        $record['Commissioned'] = ''
+        $record['HookState'] = 'post-run provenance changed'
+        Add-Content -LiteralPath $log -Value 'SOURCE-QUARANTINE: deciding input changed during leg'
+    }
     $after = $null
     $idleNote = ''
     if ($leg.Kind -eq 'timing') {
