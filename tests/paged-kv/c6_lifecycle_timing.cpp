@@ -48,7 +48,9 @@
 #if defined(PKV_LIFECYCLE_PRODUCTION_LEG) && \
     (defined(SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS) || defined(SUPERSLM_ENABLE_BAD_ALLOC_INJECTION) || \
      defined(SUPERSLM_ENABLE_MATVEC_TEST_SEAMS) || defined(SUPERSLM_ENABLE_MATMUL_DISPATCH_INSTRUMENT) || \
-     defined(SUPERSLM_ENABLE_GPU_CHUNK_DISPATCH_INSTRUMENT) || defined(SUPERSLM_ENABLE_GPU_BENCH_PRE_BATCHING))
+     defined(SUPERSLM_ENABLE_GPU_CHUNK_DISPATCH_INSTRUMENT) || defined(SUPERSLM_ENABLE_GPU_BENCH_PRE_BATCHING) || \
+     defined(SUPERSLM_ENABLE_GPU_API_FAILURE_INJECTION) || defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION) || \
+     defined(SUPERSLM_FORCE_SCALAR_MATMUL))
 #error A paged lifecycle production leg with a seam or injection definition cannot publish a result.
 #endif
 #include "pkv_budget_c_helpers.h"

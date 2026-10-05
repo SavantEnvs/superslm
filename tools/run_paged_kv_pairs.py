@@ -103,6 +103,46 @@ def production_library(exe: Path) -> tuple[str, str]:
     return sha(exe), sha(lib)
 
 
+def source_bound_receipt(exe: Path, kind: str) -> tuple[bool, str | None]:
+    """Check a verified successor receipt against the link manifest and live files."""
+    receipt_id = "PKV-TIMING-79-C6-R168" if kind == "79" else "PKV-TIMING-79B-C6"
+    registry_path = Path(os.environ.get("PKV_C6_REGISTRY", "D:/Wizard/Claude/Tooling/instrument-registry.json"))
+    manifest_path = exe.with_suffix(exe.suffix + ".source-set.json")
+    if not registry_path.is_file() or not manifest_path.is_file():
+        return False, None
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        entry = registry.get(receipt_id)
+        if not entry:
+            return False, sha(manifest_path)
+        verifier = Path(os.environ.get("PKV_C6_RECEIPT_VERIFIER",
+                                       "D:/Wizard/Claude/Tooling/instrument-commission.ps1"))
+        verified = subprocess.run(["powershell", "-NoProfile", "-File", str(verifier), "-Verify"],
+                                  capture_output=True, text=True, timeout=120)
+        if f"COMMISSIONED  {receipt_id}" not in verified.stdout.splitlines():
+            return False, sha(manifest_path)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema") != "pkv-c6-source-set/1":
+            return False, sha(manifest_path)
+        repo = Path(__file__).resolve().parents[1]
+        source = Path(entry["instrument"]).resolve()
+        relative = source.relative_to(repo).as_posix()
+        if manifest["sources"].get(relative) != entry["instrument_sha256"]:
+            return False, sha(manifest_path)
+        for name, expected in manifest["sources"].items():
+            current = (repo / name).resolve()
+            current.relative_to(repo)
+            if hashlib.sha256(current.read_bytes().replace(b"\r\n", b"\n")).hexdigest() != expected:
+                return False, sha(manifest_path)
+        for name, expected in manifest["invoked"].items():
+            current = (exe.parent if name.endswith((".exe", ".lib")) else repo / "tools") / name
+            if sha(current) != expected:
+                return False, sha(manifest_path)
+        return True, sha(manifest_path)
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+        return False, sha(manifest_path)
+
+
 def box_observation() -> dict:
     if os.name != "nt":
         try:
@@ -286,6 +326,7 @@ def run(args) -> dict:
         raise Refusal("incomplete graded pair set: exactly 508 required")
     exe = args.exe.resolve()
     exe_sha, lib_sha = production_library(exe)
+    receipt_bound, source_manifest_sha = source_bound_receipt(exe, args.kind)
     model_a = args.model_a.resolve()
     model_b = (args.model_b or args.model_a).resolve()
     if not model_a.is_file() or not model_b.is_file() or model_a.parent != model_b.parent:
@@ -312,12 +353,32 @@ def run(args) -> dict:
     load_record = getattr(args, "load_record", None)
     if load_record and not load_record.is_file():
         raise Refusal(f"load generator record missing: {load_record}")
+    load_qualified = not load_record
+    if load_record:
+        try:
+            load_state = json.loads(load_record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise Refusal("load generator record torn") from None
+        # Older construction records have no live authority. They can still be
+        # recorded for mechanism cells, but never qualify a load condition.
+        if "pid" in load_state or "phase" in load_state:
+            if not pid_live(int(load_state.get("pid", 0))):
+                raise Refusal("load generator dead")
+            if load_state.get("phase") != "on":
+                raise Refusal("load generator inactive phase")
+            if not all(pid_live(int(pid)) for pid in load_state.get("worker_pids", [])):
+                raise Refusal("load generator dead worker")
+            calibration = load_state.get("calibration") or {}
+            load_qualified = bool(calibration.get("qualified") and calibration.get("slowdown", 0) >= 2.8)
     load_sha = sha(load_record) if load_record else None
+    standing = receipt_bound and load_qualified
     expected = {"kind": args.kind, "exe_sha256": exe_sha, "library_sha256": lib_sha,
+                "source_manifest_sha256": source_manifest_sha,
                 "model_hashes": [sha(model_a), sha(model_b)], "manifest_hashes": manifest_hashes,
                 "pair_count": args.pairs, "seed": seed, "hook": hook, "load_sha256": load_sha,
                 "status": "MUTANT_CONSTRUCTION" if hook else
-                          "MECHANISM_ONLY" if getattr(args, "mechanism", False) else "QUARANTINED"}
+                          "MECHANISM_ONLY" if getattr(args, "mechanism", False) else
+                          "STANDING" if standing else "QUARANTINED"}
     with PidLock(BOX_LOCK):
         prior = read_result(result, expected)
         if prior is not None:
@@ -344,7 +405,10 @@ def run(args) -> dict:
             stats["status"] = "MUTANT_CONSTRUCTION"
         elif getattr(args, "mechanism", False):
             stats["status"] = "MECHANISM_ONLY"
+        elif standing:
+            stats["status"] = "STANDING"
         record = {"kind": args.kind, "complete": True, "exe_sha256": exe_sha, "library_sha256": lib_sha,
+                  "source_manifest_sha256": source_manifest_sha,
                   "model_hashes": [sha(model_a), sha(model_b)], "manifest_hashes": manifest_hashes,
                   "token_sha256": token_sha, "pairs_sha256": sha(pairs_file), "seed": seed,
                   "hook": hook, "load_sha256": load_sha, "load_before": before, "load_after": after, **stats}

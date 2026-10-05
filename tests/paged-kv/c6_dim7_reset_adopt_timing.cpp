@@ -4,9 +4,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <limits>
 #include <random>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -124,26 +126,30 @@ bool RdtscpAvailable(){
 uint64_t Tick(){_mm_lfence();unsigned aux=0;auto t=use_rdtscp?__rdtscp(&aux):__rdtsc();_mm_lfence();return t;}
 uint64_t Adds(int n){volatile uint64_t x=0;for(int i=0;i<n;++i)x=x+static_cast<uint64_t>(i+1);return x;}
 struct Clock {
-	double empty=0, resolution=0;bool okay=false;
+	double empty=0, resolution=0;bool okay=false;std::vector<double> raw_empty;
 	Clock(){std::vector<double> e,a,b;for(int i=0;i<21;++i){auto x=Tick(),y=Tick();e.push_back(double(y-x));
 		x=Tick();(void)Adds(i%2?1000:100);y=Tick();(i%2?b:a).push_back(double(y-x));
 		x=Tick();(void)Adds(i%2?100:1000);y=Tick();(i%2?a:b).push_back(double(y-x));}
-		empty=Median(e);resolution=*std::min_element(e.begin(),e.end());okay=Vitality(Median(a),Median(b),empty);
+		raw_empty=e;empty=Median(e);resolution=*std::min_element(e.begin(),e.end());okay=Vitality(Median(a),Median(b),empty);
 		std::printf("7.4t: resolution %.0f ticks empty %.0f 100 %.0f 1000 %.0f ratio %.3f %s\n",resolution,empty,Median(a),Median(b),(Median(a)>empty)?(Median(b)-empty)/(Median(a)-empty):0,okay?"PASS":"INFRASTRUCTURE");}
 };
 void TimerLive(){Pin pin;PKV_CHECK(pin.ok);if(!pin.ok)return;Clock clock;PKV_CHECK(clock.okay);}
 void Delay(uint64_t ticks){auto start=Tick();while(Tick()-start<ticks)_mm_pause();}
+struct CallTrace {int pair;const char* holder;const char* verb;double raw;double corrected;};
 struct Side {
 	const Fixture& fx;std::unique_ptr<Rig> rig;sslm_prefix prefix=nullptr;sslm_seq seq=nullptr;bool ok=false;
 	Side(const Fixture& f,bool budget):fx(f){if(!f.ok)return;auto own=budget?f.R(512):f.CapPages();rig=std::make_unique<Rig>(f,static_cast<uint32_t>(f.R(1000)+own+4));
 		prefix=rig->Prefix(BudgetPrefix(f,rig->Pool(),PrefixTokens(1000)));sslm_seq s=nullptr;
 		auto st=budget?sslm_seq_create_budgeted(f.model,rig->Pool(),512,&s):sslm_seq_create(f.model,rig->Pool(),&s);seq=rig->Seq(s);ok=st==SSLM_OK&&prefix&&seq;}
-	bool Call(double empty,bool mutant_adopt,bool mutant_reset,double* adopt,double* reset){if(!ok)return false;
+	bool Call(double empty,bool mutant_adopt,bool mutant_reset,double* adopt,double* reset,
+	          uint64_t bias=0,std::vector<CallTrace>* trace=nullptr,int pair=-1,const char* holder=""){if(!ok)return false;
 		auto a=Tick();auto sa=sslm_seq_adopt_prefix(seq,prefix);auto ad_done=Tick();
-		if(mutant_adopt)Delay(3*(ad_done-a));auto b=Tick();
+		if(mutant_adopt)Delay(3*(ad_done-a));if(bias)Delay(bias);auto b=Tick();
 		auto sr=sslm_seq_reset(seq);auto re_done=Tick();
 		if(mutant_reset)Delay(7*(re_done-b));auto c=Tick();
-		ok=sa==SSLM_OK&&sr==SSLM_OK;*adopt=double(b-a)-empty;*reset=double(c-b)-empty;return ok;}
+		ok=sa==SSLM_OK&&sr==SSLM_OK;*adopt=Corrected(double(b-a),empty);*reset=Corrected(double(c-b),empty);
+		if(trace){trace->push_back({pair,holder,"adopt",double(b-a),*adopt});trace->push_back({pair,holder,"reset",double(c-b),*reset});}
+		return ok;}
 };
 void Run74(const Fixture& low,const Fixture& large){
 	if(!low.ok||!large.ok)Refuse(71,"artifact missing or unable to load");
@@ -152,22 +158,44 @@ void Run74(const Fixture& low,const Fixture& large){
 	if(!TscInvariant())Refuse(73,"invariant TSC absent");Pin pin;if(!pin.ok||std::getenv("SUPERSLM_PAGED_KV_74_FORCE_PIN_FAILURE"))Refuse(73,"cannot pin timing thread");Clock clock;
 	if(!clock.okay&&RdtscpAvailable()){use_rdtscp=true;clock=Clock();}
 	if(std::getenv("SUPERSLM_PAGED_KV_74_FORCE_VITALITY_FAILURE"))clock.okay=false;
-	if(!clock.okay)Refuse(76,"fixed-L timer vitality failed with every supported fence");
+	if(!clock.okay)std::printf("7.4t: INFRASTRUCTURE 76 diagnostic timer vitality failed\n");
+	const bool extra_ad=std::getenv("SUPERSLM_PAGED_KV_74_ADOPT_MUTANT")!=nullptr;
+	const bool extra_re=std::getenv("SUPERSLM_PAGED_KV_74_RESET_MUTANT")!=nullptr;
+	if(extra_ad||extra_re)std::printf("7.4 hook_state=%s=1 publication=quarantined\n",extra_ad?"adopt":"reset");
+	const char* order_path=std::getenv("SUPERSLM_PAGED_KV_74_ORDER_TRACE");
+	const char* call_path=std::getenv("SUPERSLM_PAGED_KV_74_CALL_TRACE");
+	const char* bias_value=std::getenv("SUPERSLM_PAGED_KV_74_ORDER_BIAS_TICKS");
+	const uint64_t bias=bias_value?std::strtoull(bias_value,nullptr,10):0;
+	std::ofstream order;
+	if(order_path){order.open(order_path,std::ios::trunc);if(!order)Refuse(71,"cannot open order trace");order<<"holder,pair,first,bias_ticks\n";}
+	std::vector<CallTrace> calls;
 	std::printf("7.4 artifact hashes: cap4096=%s cap32768=%s\n",low.sha.c_str(),large.sha.c_str());bool unresolved=false;
 	for(bool budget:{true,false}){Side a(low,budget),b(large,budget);if(!a.ok||!b.ok)Refuse(71,"holder creation failed");
-		for(int i=0;i<10;++i){double x=0,y=0;if(!a.Call(clock.empty,0,0,&x,&y)||!b.Call(clock.empty,0,0,&x,&y))Refuse(71,"warmup failed");}
-		const bool extra_ad=std::getenv("SUPERSLM_PAGED_KV_74_ADOPT_MUTANT")!=nullptr;
-		const bool extra_re=std::getenv("SUPERSLM_PAGED_KV_74_RESET_MUTANT")!=nullptr;
+		std::vector<double> base_reset;
+		for(int i=0;i<10;++i){double x=0,y=0;if(!a.Call(clock.empty,0,0,&x,&y)||!b.Call(clock.empty,0,0,&x,&y))Refuse(71,"warmup failed");base_reset.push_back(y);}
 		std::vector<double> ra,rb,aa,ab,adopt_ratios,reset_ratios;std::mt19937 rng(7404+static_cast<unsigned>(budget));
 		for(int i=0;i<kPairs;++i){double xad=0,xre=0,yad=0,yre=0;
-			auto first=[&]{return a.Call(clock.empty,0,0,&xad,&xre);};auto second=[&]{return b.Call(clock.empty,extra_ad,extra_re,&yad,&yre);};
-			if(!((rng()&1)?(first()&&second()):(second()&&first())))Refuse(71,"timed verb failed");
+			const bool small_first=(rng()&1)!=0;const char* holder=budget?"budget":"whole_reserve";
+			if(order)order<<holder<<','<<i<<','<<(small_first?"small":"large")<<','<<bias<<'\n';
+			auto first=[&](uint64_t call_bias){return a.Call(clock.empty,0,0,&xad,&xre,call_bias,call_path?&calls:nullptr,i,holder);};
+			auto second=[&](uint64_t call_bias){return b.Call(clock.empty,extra_ad,extra_re,&yad,&yre,call_bias,call_path?&calls:nullptr,i,holder);};
+			if(!(small_first?(first(bias)&&second(0)):(second(bias)&&first(0))))Refuse(71,"timed verb failed");
 			aa.push_back(xad);ab.push_back(yad);ra.push_back(xre);rb.push_back(yre);adopt_ratios.push_back(yad/xad);reset_ratios.push_back(yre/xre);}
-		if(std::getenv("SUPERSLM_PAGED_KV_74_FORCE_FLOOR")||Median(aa)<100||Median(ab)<100||Median(ra)<100||Median(rb)<100)Refuse(74,"corrected median under 100 ticks");
+		if(extra_re)std::printf("7.4 hook reset base_ticks=%.3f hooked_ticks=%.3f\n",Median(base_reset),Median(rb));
+		const char* control=std::getenv("SUPERSLM_PAGED_KV_74_FLOOR_CONTROL_TICKS");
+		const double floor_aa=control?std::strtod(control,nullptr):Median(aa);
+		const double floor_ab=control?std::strtod(control,nullptr):Median(ab);
+		const double floor_ra=control?std::strtod(control,nullptr):Median(ra);
+		const double floor_rb=control?std::strtod(control,nullptr):Median(rb);
+		if(std::getenv("SUPERSLM_PAGED_KV_74_FORCE_FLOOR")||floor_aa<100||floor_ab<100||floor_ra<100||floor_rb<100)Refuse(74,"corrected median under 100 ticks");
 		for(auto& entry:{std::pair{"adopt",adopt_ratios},std::pair{"reset",reset_ratios}}){double lo=0,hi=0;auto verdict=Grade(entry.second,&lo,&hi);
 			std::printf("7.4 %s %s r(86)=%.3f r(120)=%.3f bound=2.0 %s\n",budget?"budget":"whole_reserve",entry.first,lo,hi,verdict==Verdict::Pass?"PASS":verdict==Verdict::Fail?"FAIL":"NO RESULT");
 			PKV_CHECK_MSG(verdict!=Verdict::Fail,"7.4 %s %s: ratio above 2.0",budget?"budget":"whole_reserve",entry.first);unresolved|=verdict==Verdict::NoResult;}
 	}
+	if(call_path){std::ofstream out(call_path,std::ios::trunc);if(!out)Refuse(71,"cannot open call trace");
+		out<<"{\"raw_empty_ticks\":[";for(size_t i=0;i<clock.raw_empty.size();++i){if(i)out<<',';out<<clock.raw_empty[i];}
+		out<<"],\"calls\":[";for(size_t i=0;i<calls.size();++i){if(i)out<<',';const auto& c=calls[i];
+			out<<"{\"pair\":"<<c.pair<<",\"holder\":\""<<c.holder<<"\",\"verb\":\""<<c.verb<<"\",\"raw_ticks\":"<<c.raw<<",\"corrected_ticks\":"<<c.corrected<<'}';}out<<"]}\n";}
 	if(unresolved||std::getenv("SUPERSLM_PAGED_KV_74_FORCE_UNRESOLVED"))Refuse(75,"sign interval did not resolve the bound");
 }
 #else

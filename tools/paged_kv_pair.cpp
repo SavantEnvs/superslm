@@ -3,7 +3,8 @@
 #if defined(SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS) || defined(SUPERSLM_ENABLE_BAD_ALLOC_INJECTION) || \
     defined(SUPERSLM_ENABLE_MATVEC_TEST_SEAMS) || defined(SUPERSLM_ENABLE_MATMUL_DISPATCH_INSTRUMENT) || \
     defined(SUPERSLM_ENABLE_GPU_CHUNK_DISPATCH_INSTRUMENT) || \
-    defined(SUPERSLM_ENABLE_GPU_BENCH_PRE_BATCHING)
+    defined(SUPERSLM_ENABLE_GPU_BENCH_PRE_BATCHING) || defined(SUPERSLM_ENABLE_GPU_API_FAILURE_INJECTION) || \
+    defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION) || defined(SUPERSLM_FORCE_SCALAR_MATMUL)
 #error A C6 production pair must not carry a seam or injection definition.
 #endif
 #include "pkv_budget_c_helpers.h"
@@ -108,7 +109,13 @@ void Pairs(int argc,char** argv,bool shared){
 }
 int main(int argc,char** argv){
 	try{Require(argc>=2,"mode required");const std::string mode=argv[1];
-		if(mode=="identity") {Require(argc==2,"identity argument count");std::cout<<"PKV_PAIR_PRODUCTION_V2 defs=none\n";}
+		if(mode=="identity") {Require(argc==2,"identity argument count");
+#if defined(PKV_C6_IDENTITY_PROBE)
+			std::cout<<"PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE\n";
+#else
+			std::cout<<"PKV_PAIR_PRODUCTION_V2 defs=none\n";
+#endif
+		}
 		else if(mode=="prefill")Prefill(argc,argv);else if(mode=="pair79")Pairs(argc,argv,false);else if(mode=="pair79b")Pairs(argc,argv,true);else throw std::runtime_error("unknown mode");
 		return 0;
 	}catch(const std::exception& error){std::cerr<<"INFRASTRUCTURE: "<<error.what()<<'\n';return 40;}

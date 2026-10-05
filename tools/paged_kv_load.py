@@ -39,7 +39,8 @@ def burn(active: mp.Event, stop: mp.Event) -> None:
     if value < 0:
         raise AssertionError("unreachable")
 
-def run(form: str, duration: float, workers: int, seed: int, record: Path) -> dict:
+def run(form: str, duration: float, workers: int, seed: int, record: Path,
+        calibration_probe=None) -> dict:
     if workers < 1:
         raise ValueError("at least one worker required")
     events = schedule(form, duration, seed)
@@ -47,10 +48,29 @@ def run(form: str, duration: float, workers: int, seed: int, record: Path) -> di
     processes = [mp.Process(target=burn, args=(active, stop)) for _ in range(workers)]
     start = time.monotonic()
     started = []
+    calibration = None
+    def publish(phase: str) -> None:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        snapshot = {"form": form, "pid": os.getpid(), "worker_pids": [p.pid for p in started],
+                    "phase": phase, "complete": False, "calibration": calibration,
+                    "seed": seed, "started_monotonic": start}
+        temporary = record.with_suffix(record.suffix + ".partial")
+        temporary.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, record)
     try:
         for process in processes:
             process.start()
             started.append(process)
+        if calibration_probe is not None:
+            active.clear()
+            publish("off")
+            off = float(calibration_probe("off", [p.pid for p in started]))
+            active.set()
+            publish("on")
+            on = float(calibration_probe("on", [p.pid for p in started]))
+            if not math.isfinite(off) or not math.isfinite(on) or off <= 0 or on / off < 2.8:
+                raise ValueError("live load calibration below 2.8x")
+            calibration = {"off": off, "on": on, "slowdown": on / off, "qualified": True}
         for offset, on in events:
             while time.monotonic() - start < offset:
                 time.sleep(min(.01, max(0.0, offset - (time.monotonic() - start))))
@@ -58,6 +78,7 @@ def run(form: str, duration: float, workers: int, seed: int, record: Path) -> di
                 active.set()
             else:
                 active.clear()
+            publish("on" if on else "off")
         while time.monotonic() - start < duration:
             time.sleep(.01)
     finally:
@@ -69,7 +90,8 @@ def run(form: str, duration: float, workers: int, seed: int, record: Path) -> di
                 process.join()
     result = {"form": form, "duration_requested_s": duration, "elapsed_s": time.monotonic() - start,
               "workers": workers, "seed": seed, "pid": os.getpid(), "events": events,
-              "worker_exits": [p.exitcode for p in processes]}
+              "worker_pids": [p.pid for p in processes], "phase": "stopped", "complete": True,
+              "calibration": calibration, "worker_exits": [p.exitcode for p in processes]}
     record.parent.mkdir(parents=True, exist_ok=True)
     temporary = record.with_suffix(record.suffix + ".partial")
     temporary.write_text(json.dumps(result, indent=2) + "\n")

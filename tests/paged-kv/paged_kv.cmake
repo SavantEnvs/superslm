@@ -69,6 +69,35 @@ endif()
 # production library. Its result cannot carry a seam or injection definition.
 superslm_pkv_target(superslm_pkv_lifecycle_prod LIBRARY superslm SOURCES ${PKV_DIR}/c6_lifecycle_timing.cpp)
 target_compile_definitions(superslm_pkv_lifecycle_prod PRIVATE PKV_LIFECYCLE_PRODUCTION_LEG=1)
+
+# Link-time source-set receipts are build artifacts. The box runners re-hash
+# these files and the invoked binaries/scripts before accepting commissioning.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+function(pkv_source_manifest target library)
+	set(args --repo ${CMAKE_CURRENT_SOURCE_DIR} --exe $<TARGET_FILE:${target}>
+		--library $<TARGET_FILE:${library}>)
+	foreach(source IN LISTS ARGN)
+		list(APPEND args --source ${source})
+	endforeach()
+	if(target STREQUAL "superslm_pkv_pair")
+		list(APPEND args --invoked ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_paged_kv_pairs.py
+			--invoked ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_load.py)
+	endif()
+	add_custom_command(TARGET ${target} POST_BUILD
+		COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/write_paged_kv_source_manifest.py ${args}
+		VERBATIM)
+endfunction()
+set(PKV_DECIDING_COMMON ${PKV_DIR}/pkv_main.cpp ${PKV_DIR}/pkv_common.h
+	${PKV_DIR}/pkv_budget_c_helpers.h ${PKV_DIR}/pkv_engine_api.h)
+pkv_source_manifest(superslm_pkv_c6 superslm_test_injection ${PKV_C6_SOURCES}
+	${PKV_DECIDING_COMMON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_paged_kv_c6_box.ps1
+	${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_c6_provenance.ps1)
+pkv_source_manifest(superslm_pkv_lifecycle_prod superslm ${PKV_DIR}/c6_lifecycle_timing.cpp
+	${PKV_DECIDING_COMMON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_paged_kv_c6_box.ps1
+	${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_c6_provenance.ps1)
+pkv_source_manifest(superslm_pkv_pair superslm ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_pair.cpp
+	${PKV_DIR}/pkv_common.h ${PKV_DIR}/pkv_budget_c_helpers.h
+	${CMAKE_CURRENT_SOURCE_DIR}/tools/run_paged_kv_pairs.py ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_load.py)
 get_target_property(PKV_PROD_DEFS superslm COMPILE_DEFINITIONS)
 if("${PKV_PROD_DEFS}" MATCHES "SUPERSLM_.*(SEAM|INJECTION|INSTRUMENT|BENCH)")
 	message(FATAL_ERROR "production superslm library carries a seam/injection definition; lifecycle grading refused")

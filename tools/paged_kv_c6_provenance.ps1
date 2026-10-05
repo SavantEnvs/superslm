@@ -18,13 +18,13 @@
 $PkvC6Instruments = [ordered]@{
     oracle    = @{ Registry = 'PKV-ORACLE-R0'; Env = '' }
     admission = @{ Registry = 'PKV-LEGACY-COUNT-C4, PKV-FILL-PROBE-C5, PKV-FILL-PROBE-ONESTATE-C5'; Env = '' }
-    timing74  = @{ Registry = 'PKV-TIMING-74-C6'; Env = '' }
-    lifecycle = @{ Registry = 'PKV-LIFECYCLE-C6'; Env = 'SUPERSLM_PAGED_KV_LIFE_COMMISSIONED' }
+    timing74  = @{ Registry = 'PKV-TIMING-74-C6-R168'; Env = '' }
+    lifecycle = @{ Registry = 'PKV-LIFECYCLE-C6-R168'; Env = 'SUPERSLM_PAGED_KV_LIFE_COMMISSIONED' }
 }
-$PkvC6RecordSchema = 'pkv-c6-leg/3'
+$PkvC6RecordSchema = 'pkv-c6-leg/4'
 # The fields a stored record must match for a leg to be skipped. Outcome and the binary's path are
 # kept for the reader, not compared.
-$PkvC6RecordKeys = @('Schema', 'Leg', 'Head', 'BinarySha256', 'Inputs', 'Commissioned', 'AssertEnv', 'HookState')
+$PkvC6RecordKeys = @('Schema', 'Leg', 'Head', 'BinarySha256', 'SourceManifestSha256', 'Inputs', 'Commissioned', 'AssertEnv', 'HookState')
 $PkvC6TimingLock = 'D:\_scratch\SuperSLM\pkv-c6-timing.lock'
 
 function Enter-PkvTimingLock {
@@ -89,6 +89,53 @@ function Get-PkvRunnerCommissionedIds {
     return (Get-PkvVerifiedIds $VerifyLines)
 }
 
+function Get-PkvNormalizedSha256 {
+    param([string]$Path)
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $normalized = New-Object System.Collections.Generic.List[byte] ($bytes.Length)
+    for ($i = 0; $i -lt $bytes.Length; ++$i) {
+        if ($bytes[$i] -eq 13 -and $i + 1 -lt $bytes.Length -and $bytes[$i + 1] -eq 10) { continue }
+        $normalized.Add($bytes[$i])
+    }
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($hash.ComputeHash($normalized.ToArray())).Replace('-', '').ToLowerInvariant() }
+    finally { $hash.Dispose() }
+}
+
+# The receipt verifier establishes the registry entry; this check establishes
+# that its source is in this link's source set and the invoked bytes still match.
+function Test-PkvSourceBinding {
+    param([string]$Binary, [string]$RegistryId, [string]$Repo,
+          [string]$RegistryPath = 'D:\Wizard\Claude\Tooling\instrument-registry.json')
+    $path = "$Binary.source-set.json"
+    if (-not (Test-Path -LiteralPath $path) -or -not (Test-Path -LiteralPath $RegistryPath)) { return $false }
+    try {
+        $manifest = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        $registry = Get-Content -LiteralPath $RegistryPath -Raw | ConvertFrom-Json
+        $entry = $registry.PSObject.Properties[$RegistryId].Value
+        if (-not $entry -or $manifest.schema -cne 'pkv-c6-source-set/1') { return $false }
+        $root = [IO.Path]::GetFullPath($Repo).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        $instrument = [IO.Path]::GetFullPath("$($entry.instrument)")
+        if (-not $instrument.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $relative = $instrument.Substring($root.Length).Replace('\', '/')
+        $source = $manifest.sources.PSObject.Properties[$relative]
+        if (-not $source -or "$($source.Value)" -cne "$($entry.instrument_sha256)") { return $false }
+        foreach ($item in $manifest.sources.PSObject.Properties) {
+            $file = [IO.Path]::GetFullPath((Join-Path $Repo $item.Name))
+            if (-not $file.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or
+                -not (Test-Path -LiteralPath $file) -or
+                (Get-PkvNormalizedSha256 $file) -cne "$($item.Value)") { return $false }
+        }
+        foreach ($item in $manifest.invoked.PSObject.Properties) {
+            $file = if ($item.Name -match '\.(exe|lib)$') { Join-Path (Split-Path -Parent $Binary) $item.Name }
+                    else { Join-Path (Join-Path $Repo 'tools') $item.Name }
+            if (-not (Test-Path -LiteralPath $file) -or
+                (Get-PkvSha256 $file) -cne "$($item.Value)") { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
 # The assertion variables a leg resting on $Rests gets: only for an instrument that is both rested on
 # and commissioned.
 function Get-PkvLegAssertionEnv {
@@ -119,6 +166,7 @@ function New-PkvLegRecord {
         [string]$Head = '',
         [string]$Binary = '',
         [string]$BinarySha256 = '',
+        [string]$SourceManifestSha256 = '',
         [System.Collections.IDictionary]$Inputs = @{},
         [string[]]$Commissioned = @(),
         [string]$HookState = ''
@@ -131,6 +179,7 @@ function New-PkvLegRecord {
         Head         = $Head
         Binary       = $Binary
         BinarySha256 = $BinarySha256
+        SourceManifestSha256 = $SourceManifestSha256
         Inputs       = (ConvertTo-PkvPairs $Inputs)
         Commissioned = ($relevant -join ',')
         AssertEnv    = (ConvertTo-PkvPairs $envs)

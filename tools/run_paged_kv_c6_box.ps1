@@ -126,6 +126,18 @@ function Get-LegInputs($leg) {
 function Get-LegRecord($leg) {
     $bin = $exe[$leg.Bin]
     $sha = if ($bin -and (Test-Path -LiteralPath $bin -PathType Leaf)) { Get-PkvSha256 $bin } else { 'missing' }
+    $manifestPath = "$bin.source-set.json"
+    $manifestSha = if ($bin -and (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { Get-PkvSha256 $manifestPath } else { 'missing' }
+    $bound = @($Commissioned)
+    foreach ($kind in @('timing74', 'lifecycle')) {
+        if ($leg.Rests -contains $kind -and $bound -contains $kind) {
+            $id = $PkvC6Instruments[$kind].Registry
+            if (-not (Test-PkvSourceBinding -Binary $bin -RegistryId $id -Repo $Repo)) {
+                Write-Host "SOURCE-QUARANTINE $($leg.Name): receipt $id does not bind the invoked source set"
+                $bound = @($bound | Where-Object { $_ -ne $kind })
+            }
+        }
+    }
     $hook = ''
     if ($leg.Name -eq '7.4/C6') {
         $hook = "adopt=$env:SUPERSLM_PAGED_KV_74_ADOPT_MUTANT;reset=$env:SUPERSLM_PAGED_KV_74_RESET_MUTANT"
@@ -134,7 +146,7 @@ function Get-LegRecord($leg) {
         $hook = "reset=$env:SUPERSLM_PAGED_KV_LIFE_RESET_MUTANT"
     }
     return New-PkvLegRecord -Leg $leg.Name -Rests $leg.Rests -Head $Head -Binary "$bin" -BinarySha256 $sha `
-        -Inputs (Get-LegInputs $leg) -Commissioned $Commissioned -HookState $hook
+        -SourceManifestSha256 $manifestSha -Inputs (Get-LegInputs $leg) -Commissioned $bound -HookState $hook
 }
 function Test-LegCurrent($leg) { return Test-PkvLegRecordCurrent (Read-PkvLegRecord (Get-MarkerPath $leg)) (Get-LegRecord $leg) }
 
