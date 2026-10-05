@@ -182,21 +182,26 @@ struct Side {
 		if(trace){trace->push_back({pair,holder,"adopt",double(b-a),*adopt});trace->push_back({pair,holder,"reset",double(c-b),*reset});}
 		return ok;}
 };
+bool Same74Geometry(const superslm::SslmModelConfig& small_config,
+                    const superslm::SslmModelConfig& large_config,
+                    const Geometry& small_claim,const Geometry& large_claim) {
+	return small_config.num_hidden_layers==large_config.num_hidden_layers&&
+	       small_config.num_key_value_heads==large_config.num_key_value_heads&&
+	       small_config.head_dim==large_config.head_dim&&
+	       small_config.hidden_size==large_config.hidden_size&&
+	       small_config.kv_block_size==large_config.kv_block_size&&
+	       small_config.num_hidden_layers==small_claim.layers&&large_config.num_hidden_layers==large_claim.layers&&
+	       small_config.num_key_value_heads==small_claim.kv_heads&&large_config.num_key_value_heads==large_claim.kv_heads&&
+	       small_config.head_dim==small_claim.head_dim&&large_config.head_dim==large_claim.head_dim;
+}
 void Run74(const Fixture& low,const Fixture& large){
-	Lock74();
 	if(!low.ok||!large.ok)Refuse(71,"artifact missing or unable to load");
 	superslm::SslmModelView low_view,large_view;std::string error;
 	if(superslm::SslmModel::Load(low.bytes.p,low.size,low_view,&error)!=superslm::SslmModelStatus::Ok||
 	   superslm::SslmModel::Load(large.bytes.p,large.size,large_view,&error)!=superslm::SslmModelStatus::Ok)
 		Refuse(71,"artifact config cannot be parsed");
 	const auto& small_config=low_view.config;const auto& large_config=large_view.config;
-	if(small_config.num_hidden_layers!=large_config.num_hidden_layers||
-	   small_config.num_key_value_heads!=large_config.num_key_value_heads||
-	   small_config.head_dim!=large_config.head_dim||small_config.hidden_size!=large_config.hidden_size||
-	   small_config.kv_block_size!=large_config.kv_block_size||
-	   small_config.num_hidden_layers!=low.geo.layers||large_config.num_hidden_layers!=large.geo.layers||
-	   small_config.num_key_value_heads!=low.geo.kv_heads||large_config.num_key_value_heads!=large.geo.kv_heads||
-	   small_config.head_dim!=low.geo.head_dim||large_config.head_dim!=large.geo.head_dim)
+	if(!Same74Geometry(small_config,large_config,low.geo,large.geo))
 		Refuse(71,"geometry mismatch");
 	if(sslm_kv_block_size(low.model)!=size_t{small_config.context_cap}*low.BytesPerToken()||
 	   sslm_kv_block_size(large.model)!=size_t{large_config.context_cap}*large.BytesPerToken())Refuse(71,"block size mismatch");
@@ -248,9 +253,9 @@ void Run74(const Fixture& low,const Fixture& large){
 void Run74(const Fixture&,const Fixture&){Refuse(73,"x86 invariant TSC required");}
 void TimerLive(){Refuse(73,"x86 invariant TSC required");}
 #endif
-void Box(){const char* large=std::getenv("SUPERSLM_PAGED_KV_74_CAP32768_FILE");Run74(GetArtifact("qwen2.5-0.5b-instruct-cap4096-aex.sslm",Geometry{24,2,64,4096}),
+void Box(){Lock74();const char* large=std::getenv("SUPERSLM_PAGED_KV_74_CAP32768_FILE");Run74(GetArtifact("qwen2.5-0.5b-instruct-cap4096-aex.sslm",Geometry{24,2,64,4096}),
   GetArtifact(large?large:"qwen2.5-0.5b-instruct-cap32768-aex.sslm",Geometry{24,2,64,32768}));}
-void Fixtures(){const char* low=std::getenv("SUPERSLM_PAGED_KV_74_FIXTURE_LOW");const char* large=std::getenv("SUPERSLM_PAGED_KV_74_FIXTURE_LARGE");
+void Fixtures(){Lock74();const char* low=std::getenv("SUPERSLM_PAGED_KV_74_FIXTURE_LOW");const char* large=std::getenv("SUPERSLM_PAGED_KV_74_FIXTURE_LARGE");
 	Run74(GetFixture(low?low:"pkv_def"),GetFixture(large?large:"pkv_32k"));}
 PKV_CELL("7.4/C6","C6",Box);
 PKV_CELL("7.4/C6:fixtures","C6",Fixtures);
