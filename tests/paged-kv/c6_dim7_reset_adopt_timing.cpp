@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -35,6 +36,10 @@
 #endif
 #else
 #define PKV_74_X86 0
+#endif
+
+#if !defined(_WIN32)
+extern char** environ;
 #endif
 
 namespace {
@@ -94,6 +99,30 @@ void Lock74(const char* path=nullptr) {
 }
 void LockConstruction(){const char* path=std::getenv("PKV_DEBUNK_74_TEST_LOCK_PATH");
 	if(!path||!*path)Refuse(77,"C6 lock construction path missing");Lock74(path);PKV_CHECK(true);}
+void Print74Hooks(){
+	std::vector<std::string> hooks;
+	if(std::getenv("SUPERSLM_PAGED_KV_74_ADOPT_MUTANT"))hooks.emplace_back("adopt=1");
+	if(std::getenv("SUPERSLM_PAGED_KV_74_RESET_MUTANT"))hooks.emplace_back("reset=1");
+	const size_t aliases=hooks.size();
+	constexpr const char* prefix="SUPERSLM_PAGED_KV_74_";
+	constexpr size_t prefix_size=21;
+#if defined(_WIN32)
+	LPCH block=GetEnvironmentStringsA();
+	if(!block)hooks.emplace_back("environment_read_failed");
+	else {for(const char* entry=block;*entry;entry+=std::strlen(entry)+1)
+		if(std::strncmp(entry,prefix,prefix_size)==0)hooks.emplace_back(entry);
+		FreeEnvironmentStringsA(block);}
+#else
+	for(char** entry=environ;*entry;++entry)
+		if(std::strncmp(*entry,prefix,prefix_size)==0)hooks.emplace_back(*entry);
+#endif
+	if(hooks.empty())return;
+	std::sort(hooks.begin()+aliases,hooks.end());
+	std::printf("7.4 hook_state=");
+	for(size_t i=0;i<hooks.size();++i)std::printf("%s%s",i?";":"",hooks[i].c_str());
+	std::printf(" publication=quarantined\n");
+}
+void HookConstruction(){Print74Hooks();PKV_CHECK(true);}
 
 double Median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v.empty() ? 0 : v[v.size()/2]; }
 double Corrected(double raw,double empty) {
@@ -249,7 +278,7 @@ void Run74(const Fixture& low,const Fixture& large){
 	if(!clock.okay)std::printf("7.4t: INFRASTRUCTURE 76 diagnostic timer vitality failed\n");
 	const bool extra_ad=std::getenv("SUPERSLM_PAGED_KV_74_ADOPT_MUTANT")!=nullptr;
 	const bool extra_re=std::getenv("SUPERSLM_PAGED_KV_74_RESET_MUTANT")!=nullptr;
-	if(extra_ad||extra_re)std::printf("7.4 hook_state=%s=1 publication=quarantined\n",extra_ad?"adopt":"reset");
+	Print74Hooks();
 	const char* order_path=std::getenv("SUPERSLM_PAGED_KV_74_ORDER_TRACE");
 	const char* call_path=std::getenv("SUPERSLM_PAGED_KV_74_CALL_TRACE");
 	const char* bias_value=std::getenv("SUPERSLM_PAGED_KV_74_ORDER_BIAS_TICKS");
@@ -298,5 +327,6 @@ PKV_CELL("7.4/C6","C6",Box);
 PKV_CELL("7.4/C6:fixtures","C6",Fixtures);
 PKV_CELL("7.4t/C6:constructions","C6",Constructions);
 PKV_CELL("7.4t/C6:lock","C6",LockConstruction);
+PKV_CELL("7.4t/C6:hooks","C6",HookConstruction);
 PKV_CELL("7.4t/C6:live","C6",TimerLive);
 }

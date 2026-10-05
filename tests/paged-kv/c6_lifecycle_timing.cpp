@@ -15,11 +15,11 @@
 // SUPERSLM_PAGED_KV_LIFE_COMMISSIONED=1. This changes provenance and the quarantine label, not the
 // plan's lack of a lifecycle performance bar. The 7.9 commissioning variable remains separate.
 //
-// This file calls legacy verbs only, so it builds against the v1.11.0 library and against the paged
-// build (a legacy holder in a page pool), like c6_dim7_throughput.cpp. The box run is two runs of it:
-//   1. built against v1.11.0, with SUPERSLM_PAGED_KV_LIFE_OUT=<file>: writes one line per reading,
+// This file calls legacy verbs through the paged production library. The v1.11.0 baseline is a cited
+// historical reading; its old binary has no current source-bound receipt. The box run consumes:
+//   1. the cited v1.11.0 SUPERSLM_PAGED_KV_LIFE_OUT=<file>: one line per reading,
 //      "<target>:<verb> <median ns> <relative spread>";
-//   2. built as superslm_pkv_c6, with SUPERSLM_PAGED_KV_LIFE_BASELINE=<that file>: measures the same
+//   2. superslm_pkv_lifecycle_prod with SUPERSLM_PAGED_KV_LIFE_BASELINE=<that file>: measures the same
 //      readings and prints each against its baseline.
 // The cloud twin ("lifecycle/C6:fixtures", on pkv_def and pkv_32k) reads the same two variables, so the
 // two-binary flow runs on the fixtures too; without them it prints the figures alone.

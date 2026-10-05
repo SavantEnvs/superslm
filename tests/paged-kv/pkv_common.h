@@ -745,13 +745,6 @@ inline const char* TimingVerdictName(TimingVerdict v) {
 	return "?";
 }
 
-// SUPERSLM_PAGED_KV_TIMING_COMMISSIONED=1: the timing harness is commissioned (§8), so 7.9's verdict
-// is asserted; otherwise its readings are quarantined (recorded, never acted on).
-inline bool TimingCommissioned() {
-	const char* c = std::getenv("SUPERSLM_PAGED_KV_TIMING_COMMISSIONED");
-	return c && std::string(c) == "1";
-}
-
 // Grades `value` against `bound` with a resolving power, all three in one unit: a verdict is drawn only
 // when the bound lies outside value +- resolving. PASS: value + resolving <= bound. FAIL: value -
 // resolving > bound. Otherwise NO RESULT. (7.9 also calls an effect below the resolving power no
