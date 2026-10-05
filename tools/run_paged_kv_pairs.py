@@ -187,6 +187,7 @@ def wait_for_smoke() -> None:
             print("waiting for smoke_adapter_driver.exe before process start", flush=True)
             time.sleep(30)
 def run_logged(command: list[str], log: Path, cap: int, env: dict[str, str]) -> int | None:
+    wait_for_smoke()
     start = time.monotonic()
     with log.open("wb") as output:
         process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, env=env)
