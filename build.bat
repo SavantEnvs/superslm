@@ -618,8 +618,8 @@ rem 1.12.0 declares 49 C verbs: 38 before paged KV and 11 added by this release.
 rem Use native PowerShell so this gate does not depend on WSL or Git Bash.
 rem T2139_VERB_COUNT is read and compared OUTSIDE any parenthesized if-block on purpose: %VAR%
 rem inside a `( ... )` block expands at PARSE time (before the block's own `set /p` line has
-rem run) without `setlocal enabledelayedexpansion`, which this script does not otherwise need
-rem and this step does not want to turn on globally -- goto/labels sidestep it instead.
+rem run). Delayed expansion is enabled above, but this count uses %VAR%; the goto/label path
+rem reads it only after the `set /p` command has executed.
 powershell -NoLogo -NoProfile -NonInteractive -Command ". 'tests/t2807-api-slot/c_abi_verbs.ps1'; $n = @(Get-CAbiVerbs 'include/superslm'); $n.Count | Set-Content -Encoding ascii 'out/t2139/verb_count.txt'"
 if errorlevel 1 (
 	echo ABI verb inventory command failed ^(exit %errorlevel%^) -- this is not a measured verb-count drift
