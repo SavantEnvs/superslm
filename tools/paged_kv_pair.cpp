@@ -11,6 +11,7 @@
 #include <chrono>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 
@@ -21,6 +22,9 @@ using clock_type = std::chrono::steady_clock;
 
 void Require(bool okay, const std::string& why) { if (!okay || State().failures) throw std::runtime_error(why); }
 int Number(const char* s) { size_t at=0; int v=std::stoi(s,&at); Require(at==std::string(s).size(),"invalid integer"); return v; }
+uint32_t Seed(const char* s) { Require(s[0]!='-',"seed out of range"); size_t at=0;
+	const auto value=std::stoull(s,&at);Require(at==std::string(s).size()&&value<=std::numeric_limits<uint32_t>::max(),"seed out of range");
+	return static_cast<uint32_t>(value); }
 const Fixture& Model(const char* file,int cap,int layers,int heads,int dim) {
 	const Fixture& fx=GetArtifact(file,Geometry{static_cast<uint32_t>(layers),static_cast<uint32_t>(heads),static_cast<uint32_t>(dim),cap});
 	Require(fx.ok,"model did not load");return fx;
@@ -83,19 +87,19 @@ void Pairs(int argc,char** argv,bool shared){
 	// pair79 A B CAP_A CAP_B LAYERS HEADS DIM BLOB_A BLOB_B PAIRS SEED OUT
 	// pair79b MODEL CAP LAYERS HEADS DIM PAIRS SEED OUT
 	Require(argc==(shared?10:14),"pair argument count");
-	const Fixture* fa=nullptr;const Fixture* fb=nullptr;int pairs=0,seed=0;const char* output=nullptr;
+	const Fixture* fa=nullptr;const Fixture* fb=nullptr;int pairs=0;uint32_t seed=0;const char* output=nullptr;
 	if(shared){fa=&Model(argv[2],Number(argv[3]),Number(argv[4]),Number(argv[5]),Number(argv[6]));fb=fa;
-		pairs=Number(argv[7]);seed=Number(argv[8]);output=argv[9];}
+		pairs=Number(argv[7]);seed=Seed(argv[8]);output=argv[9];}
 	else {fa=&Model(argv[2],Number(argv[4]),Number(argv[6]),Number(argv[7]),Number(argv[8]));
 		fb=&Model(argv[3],Number(argv[5]),Number(argv[6]),Number(argv[7]),Number(argv[8]));
-		pairs=Number(argv[11]);seed=Number(argv[12]);output=argv[13];}
+		pairs=Number(argv[11]);seed=Seed(argv[12]);output=argv[13];}
 	Require(pairs>0&&pairs<=508,"pair count must be 1..508");
 	Arm a(*fa),b(*fb);
 	if(shared){a.Shared();b.Contiguous();}else{a.Restore(argv[9]);b.Restore(argv[10]);}
 	Require(a.Ready()==b.Ready(),"ready tokens differ");
 	for(int i=0;i<4;++i)Require(a.Decode().second==b.Decode().second,"warmup tokens differ");
 	std::ofstream out(output,std::ios::binary|std::ios::trunc);Require(bool(out),"pair output cannot open");
-	std::mt19937 random(static_cast<uint32_t>(seed));
+	std::mt19937 random(seed);
 	const char* mutant=std::getenv("SUPERSLM_PAGED_KV_79_SLOW_ARM");
 	const bool slow_a=mutant&&std::string(mutant)=="A",slow_b=mutant&&std::string(mutant)=="B";
 	for(int i=0;i<pairs;++i){std::pair<double,int32_t> x,y;const bool first=(random()&1)!=0;
