@@ -274,12 +274,8 @@ private:
 		const sslm_status r = sslm_seq_reset(s);
 		const auto reset_done = clock_type::now();
 		if (std::getenv("SUPERSLM_PAGED_KV_LIFE_RESET_MUTANT")) {
-			double target_ns = Ns(t0, reset_done) * 64.0;
-			if (baseline_) {
-				const auto it = baseline_->find(target_ + ":reset@" + std::to_string(lengths_[l]));
-				if (it != baseline_->end()) target_ns = std::max(target_ns, it->second.median * 64.0);
-			}
-			while (Ns(t0, clock_type::now()) < target_ns) {}
+			// Fixed injected work. The reference being graded must never size its challenger.
+			while (Ns(reset_done, clock_type::now()) < 64'000'000.0) {}
 		}
 		const auto t1 = clock_type::now();
 		sslm_seq_release(s);
