@@ -382,7 +382,16 @@ def run(args) -> dict:
     if load_record:
         load_state = live_load_state(load_record)
         calibration = load_state.get("calibration") or {}
-        load_qualified = bool(calibration.get("qualified") and calibration.get("slowdown", 0) >= 2.8)
+        load_qualified = False
+        if receipt_bound and calibration.get("qualified") and calibration.get("slowdown", 0) >= 2.8:
+            try:
+                rid = "PKV-TIMING-79-C6-R168" if args.kind == "79" else "PKV-TIMING-79B-C6"
+                claim = json.loads(Path("D:/Wizard/Claude/Tooling/instrument-registry.json").read_text())[rid]["source_binding"]
+                probe = Path(calibration["probe_path"]).resolve()
+                load_qualified = (probe.is_file() and sha(probe) == calibration["probe_sha256"] ==
+                                  claim["load_probe_sha256"])
+            except (OSError, ValueError, KeyError, TypeError):
+                load_qualified = False
     load_sha = sha(load_record) if load_record else None
     standing = receipt_bound and load_qualified
     expected = {"kind": args.kind, "exe_sha256": exe_sha, "library_sha256": lib_sha,
@@ -416,7 +425,8 @@ def run(args) -> dict:
         if load_record:
             after_load = live_load_state(load_record)
             if (after_load.get("pid") != load_state.get("pid") or
-                after_load.get("started_monotonic") != load_state.get("started_monotonic")):
+                after_load.get("started_monotonic") != load_state.get("started_monotonic") or
+                after_load.get("calibration") != load_state.get("calibration")):
                 raise Refusal("load generator changed during pair run")
             load_after_sha = sha(load_record)
         after = box_observation()

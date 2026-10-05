@@ -5,6 +5,7 @@ commissioning. This program records the exact schedule; it never grades a pair.
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -42,7 +43,7 @@ def burn(active: mp.Event, stop: mp.Event) -> None:
         raise AssertionError("unreachable")
 
 def run(form: str, duration: float, workers: int, seed: int, record: Path,
-        calibration_probe=None) -> dict:
+        calibration_probe=None, calibration_source: Path | None = None) -> dict:
     if workers < 1:
         raise ValueError("at least one worker required")
     events = schedule(form, duration, seed)
@@ -73,6 +74,10 @@ def run(form: str, duration: float, workers: int, seed: int, record: Path,
             if not math.isfinite(off) or not math.isfinite(on) or off <= 0 or on / off < 2.8:
                 raise ValueError("live load calibration below 2.8x")
             calibration = {"off": off, "on": on, "slowdown": on / off, "qualified": True}
+            if calibration_source is not None:
+                source = calibration_source.resolve()
+                calibration["probe_path"] = str(source)
+                calibration["probe_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
         for offset, on in events:
             while time.monotonic() - start < offset:
                 time.sleep(min(.01, max(0.0, offset - (time.monotonic() - start))))
@@ -115,4 +120,4 @@ if __name__ == "__main__":
         result = subprocess.run(command, capture_output=True, text=True, timeout=300, check=True)
         return float(result.stdout.strip())
     print(json.dumps(run(args.form, args.duration, args.workers, args.seed, args.record,
-                         calibration_probe=probe)))
+                         calibration_probe=probe, calibration_source=args.calibration_probe)))
