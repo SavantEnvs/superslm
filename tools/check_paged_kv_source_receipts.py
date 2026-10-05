@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+from verify_paged_kv_binding import canonical, measurement_env, sha
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,8 +29,16 @@ spec.loader.exec_module(pair)
 
 class ReceiptBinding(unittest.TestCase):
     def registry(self, path: Path, receipt_id: str, instrument: Path, source_hash: str) -> None:
+        target = "superslm_pkv_pair.exe" if "TIMING-79" in receipt_id else "superslm_pkv_lifecycle_prod.exe"
+        manifest_path = BUILD / (target + ".source-set.json")
+        manifest = json.loads(manifest_path.read_text())
+        head = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
+        tree = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD^{tree}"], text=True).strip()
         path.write_text(json.dumps({receipt_id: {"instrument": str(instrument),
-                                                "instrument_sha256": source_hash}}), encoding="utf-8")
+            "instrument_sha256": source_hash,
+            "source_binding": {"manifest_sha256": sha(manifest_path), "git_head": head,
+                               "git_tree": tree, "build_recipe_sha256": canonical(manifest["build_recipe"]),
+                               "measurement_env": measurement_env()}}}), encoding="utf-8")
 
     def powershell_binding(self, binary: Path, registry: Path, receipt_id: str) -> bool:
         code = (f'. "{PROVENANCE}"\n'
