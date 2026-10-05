@@ -245,7 +245,8 @@ foreach ($leg in $legs) {
     $postRecord = Get-LegRecord $leg
     if (-not (Test-PkvLegRecordCurrent $record $postRecord)) {
         $record['Commissioned'] = ''
-        $record['HookState'] = 'post-run provenance changed'
+        $record['HookState'] = ((@($record['HookState'], 'post-run provenance changed') |
+            Where-Object { $_ }) -join ';')
         Add-Content -LiteralPath $log -Value 'SOURCE-QUARANTINE: deciding input changed during leg'
     }
     $after = $null
