@@ -2,6 +2,7 @@
 #include "pkv_budget_c_helpers.h"
 #include "superslm/model.h"
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 #include <vector>
 #if !defined(_WIN32)
 #include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 #endif
 
@@ -41,22 +43,57 @@ using namespace pkv::bc;
 constexpr int kPairs = 205;
 enum class Verdict { Pass, Fail, NoResult };
 [[noreturn]] void Refuse(int code,const char* why);
-void Lock74() {
+std::string locked74_path;
+void Lock74(const char* path=nullptr) {
 #if defined(_WIN32)
-	CreateDirectoryA("D:\\_scratch\\SuperSLM",nullptr);
-	const char* path="D:\\_scratch\\SuperSLM\\pkv-c6-timing.lock";
-	HANDLE handle=CreateFileA(path,GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
-	if(handle==INVALID_HANDLE_VALUE)Refuse(71,"C6 timing lock already held");
-	const auto pid=std::to_string(GetCurrentProcessId());DWORD written=0;
-	WriteFile(handle,pid.data(),static_cast<DWORD>(pid.size()),&written,nullptr);CloseHandle(handle);
-	std::atexit([]{DeleteFileA("D:\\_scratch\\SuperSLM\\pkv-c6-timing.lock");});
+	if(!path){CreateDirectoryA("D:\\_scratch\\SuperSLM",nullptr);path="D:\\_scratch\\SuperSLM\\pkv-c6-timing.lock";}
+	for(int attempt=0;attempt<10;++attempt){
+		HANDLE handle=CreateFileA(path,GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+		if(handle!=INVALID_HANDLE_VALUE){
+			const auto pid=std::to_string(GetCurrentProcessId());DWORD written=0;
+			const bool okay=WriteFile(handle,pid.data(),static_cast<DWORD>(pid.size()),&written,nullptr)&&written==pid.size();
+			CloseHandle(handle);
+			if(!okay){DeleteFileA(path);Refuse(77,"C6 timing lock owner write failed");}
+			locked74_path=path;std::atexit([]{DeleteFileA(locked74_path.c_str());});return;
+		}
+		if(GetLastError()!=ERROR_FILE_EXISTS&&GetLastError()!=ERROR_ALREADY_EXISTS)Refuse(77,"C6 timing lock create failed");
+		HANDLE old=CreateFileA(path,GENERIC_READ|DELETE,0,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+		if(old==INVALID_HANDLE_VALUE){Sleep(50);continue;}
+		char buffer[32]{};DWORD count=0;
+		const bool read=ReadFile(old,buffer,sizeof(buffer)-1,&count,nullptr)!=0;
+		char* end=nullptr;errno=0;const unsigned long owner=read?std::strtoul(buffer,&end,10):0;
+		if(!read||!count){CloseHandle(old);Sleep(50);continue;}
+		if(buffer[0]<'0'||buffer[0]>'9'||errno==ERANGE||!owner||owner>std::numeric_limits<DWORD>::max()||end!=buffer+count){
+			CloseHandle(old);Refuse(77,"C6 timing lock owner record torn");}
+		HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,static_cast<DWORD>(owner));
+		if(process){const DWORD state=WaitForSingleObject(process,0);CloseHandle(process);
+			if(state!=WAIT_OBJECT_0){CloseHandle(old);Refuse(77,"C6 timing lock already held");}}
+		else if(GetLastError()!=ERROR_INVALID_PARAMETER){CloseHandle(old);Refuse(77,"C6 timing lock owner cannot be checked");}
+		FILE_DISPOSITION_INFO disposition{TRUE};
+		const bool removed=SetFileInformationByHandle(old,FileDispositionInfo,&disposition,sizeof(disposition))!=0;
+		CloseHandle(old);
+		if(!removed)Refuse(77,"C6 dead-owner lock cannot be reclaimed");
+	}
+	Refuse(77,"C6 timing lock owner record incomplete");
 #else
-	const char* path="/tmp/superslm-pkv-c6-timing.lock";
-	const int fd=open(path,O_CREAT|O_EXCL|O_WRONLY,0600);
-	if(fd<0)Refuse(71,"C6 timing lock already held");close(fd);
-	std::atexit([]{unlink("/tmp/superslm-pkv-c6-timing.lock");});
+	if(!path)path="/tmp/superslm-pkv-c6-timing.lock";
+	for(int attempt=0;attempt<10;++attempt){
+		const int fd=open(path,O_CREAT|O_EXCL|O_WRONLY,0600);
+		if(fd>=0){const auto pid=std::to_string(getpid());const bool okay=write(fd,pid.data(),pid.size())==static_cast<ssize_t>(pid.size());close(fd);
+			if(!okay){unlink(path);Refuse(77,"C6 timing lock owner write failed");}
+			locked74_path=path;std::atexit([]{unlink(locked74_path.c_str());});return;}
+		if(errno!=EEXIST)Refuse(77,"C6 timing lock create failed");
+		std::ifstream old(path);std::string record;if(!(old>>record)){usleep(50000);continue;}
+		char* end=nullptr;const long owner=std::strtol(record.c_str(),&end,10);
+		if(owner<=0||*end)Refuse(77,"C6 timing lock owner record torn");
+		if(kill(static_cast<pid_t>(owner),0)==0||errno!=ESRCH)Refuse(77,"C6 timing lock already held");
+		if(unlink(path)!=0&&errno!=ENOENT)Refuse(77,"C6 dead-owner lock cannot be reclaimed");
+	}
+	Refuse(77,"C6 timing lock owner record incomplete");
 #endif
 }
+void LockConstruction(){const char* path=std::getenv("PKV_DEBUNK_74_TEST_LOCK_PATH");
+	if(!path||!*path)Refuse(77,"C6 lock construction path missing");Lock74(path);PKV_CHECK(true);}
 
 double Median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v.empty() ? 0 : v[v.size()/2]; }
 double Corrected(double raw,double empty) {
@@ -260,5 +297,6 @@ void Fixtures(){Lock74();const char* low=std::getenv("SUPERSLM_PAGED_KV_74_FIXTU
 PKV_CELL("7.4/C6","C6",Box);
 PKV_CELL("7.4/C6:fixtures","C6",Fixtures);
 PKV_CELL("7.4t/C6:constructions","C6",Constructions);
+PKV_CELL("7.4t/C6:lock","C6",LockConstruction);
 PKV_CELL("7.4t/C6:live","C6",TimerLive);
 }
