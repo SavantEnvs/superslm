@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BUILD = Path(os.environ.get("PKV_C6_BUILD", "D:/_scratch/T-3114/build-c6"))
+BUILD = Path(os.environ.get("PKV_C6_BUILD", "D:/_scratch/T-3114/build-c6-opt"))
 PROVENANCE = ROOT / "tools/paged_kv_c6_provenance.ps1"
 PAIR_SCRIPT = ROOT / "tools/run_paged_kv_pairs.py"
 spec = importlib.util.spec_from_file_location("pkv_receipt_pair", PAIR_SCRIPT)
