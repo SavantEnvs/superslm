@@ -44,15 +44,15 @@ class RefusalCells(unittest.TestCase):
         self.check_refusal(74, "corrected median under 100 ticks", FORCE_FLOOR="1")
 
     def test_74_10_floor_at_99_and_control_at_101(self):
-        below = self.call(FLOOR_CONTROL_TICKS="99", FORCE_VITALITY_FAILURE="1")
+        below = self.call(FLOOR_CONTROL_TICKS="99")
         self.assertEqual(below.returncode, 74, below.stdout + below.stderr)
         self.assertIn("corrected median under 100 ticks", below.stderr)
-        above = self.call(FLOOR_CONTROL_TICKS="101", FORCE_VITALITY_FAILURE="1")
+        above = self.call(FLOOR_CONTROL_TICKS="101")
         self.assertNotIn(above.returncode, (74, 76), above.stdout + above.stderr)
         self.assertIn("7.4 budget", above.stdout)
 
     def test_74_11_reset_hook_has_sevenfold_extra_cost(self):
-        result = self.call(RESET_MUTANT="1", FORCE_VITALITY_FAILURE="1")
+        result = self.call(RESET_MUTANT="1")
         self.assertNotEqual(result.returncode, 76, result.stdout + result.stderr)
         self.assertIn("7.4 budget reset r(86)=", result.stdout)
         rows = re.findall(r"7\.4 hook reset base_ticks=([0-9.]+) hooked_ticks=([0-9.]+)",
@@ -68,8 +68,7 @@ class RefusalCells(unittest.TestCase):
     def test_74_12_pair_order_random_under_first_call_load(self):
         with tempfile.TemporaryDirectory(prefix="pkv-74-order-") as temp:
             trace = Path(temp) / "order.csv"
-            result = self.call(ORDER_TRACE=str(trace), ORDER_BIAS_TICKS="1000",
-                               FORCE_VITALITY_FAILURE="1")
+            result = self.call(ORDER_TRACE=str(trace), ORDER_BIAS_TICKS="1000")
             self.assertNotEqual(result.returncode, 76, result.stdout + result.stderr)
             self.assertTrue(trace.is_file(), result.stdout + result.stderr)
             with trace.open(newline="", encoding="utf-8") as stream:
@@ -87,7 +86,7 @@ class RefusalCells(unittest.TestCase):
     def test_74_13_every_timed_call_subtracts_independent_empty_median(self):
         with tempfile.TemporaryDirectory(prefix="pkv-74-calls-") as temp:
             trace = Path(temp) / "calls.json"
-            result = self.call(CALL_TRACE=str(trace), FORCE_VITALITY_FAILURE="1")
+            result = self.call(CALL_TRACE=str(trace))
             self.assertNotEqual(result.returncode, 76, result.stdout + result.stderr)
             self.assertTrue(trace.is_file(), result.stdout + result.stderr)
             data = json.loads(trace.read_text(encoding="utf-8"))
@@ -106,8 +105,7 @@ class RefusalCells(unittest.TestCase):
     def test_74_14_direct_hooked_cell_declares_quarantine(self):
         for hook in ("ADOPT", "RESET"):
             with self.subTest(hook=hook):
-                result = self.call(FORCE_VITALITY_FAILURE="1",
-                                   **{hook + "_MUTANT": "1"})
+                result = self.call(**{hook + "_MUTANT": "1"})
                 self.assertNotEqual(result.returncode, 76, result.stdout + result.stderr)
                 self.assertIn(f"7.4 hook_state={hook.lower()}=1", result.stdout)
                 self.assertIn("publication=quarantined", result.stdout)
