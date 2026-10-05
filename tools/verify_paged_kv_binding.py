@@ -59,6 +59,9 @@ def bound(binary: Path, repo: Path, registry_path: Path, receipt_id: str) -> tup
             return False, digest
         if claim["measurement_env"] != measurement_env():
             return False, digest
+        verifier = Path("D:/Wizard/Claude/Tooling/instrument-commission.ps1")
+        if not verifier.is_file() or sha(verifier) != claim["verifier_sha256"]:
+            return False, digest
         instrument = Path(entry["instrument"]).resolve().relative_to(repo.resolve()).as_posix()
         if manifest["sources"][instrument] != entry["instrument_sha256"]:
             return False, digest

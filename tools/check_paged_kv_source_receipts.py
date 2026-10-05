@@ -38,6 +38,7 @@ class ReceiptBinding(unittest.TestCase):
             "instrument_sha256": source_hash,
             "source_binding": {"manifest_sha256": sha(manifest_path), "git_head": head,
                                "git_tree": tree, "build_recipe_sha256": canonical(manifest["build_recipe"]),
+                               "verifier_sha256": sha(Path("D:/Wizard/Claude/Tooling/instrument-commission.ps1")),
                                "measurement_env": measurement_env()}}}), encoding="utf-8")
 
     def powershell_binding(self, binary: Path, registry: Path, receipt_id: str) -> bool:
