@@ -56,6 +56,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -340,6 +341,15 @@ void CellLifecycleConstructions() {
 	PKV_CHECK(Report("boundary-exact-4", Reading{true, 4000.0, .30}, &baseline));
 	PKV_CHECK(Report("boundary-below-quarter", Reading{true, 250.0, .30}, &baseline));
 	PKV_CHECK(Report("reset-64-to-1", Reading{true, 64000.0, 2.804}, &baseline));
+	// LC-5: a large ratio cannot authorize publication when either reading
+	// is invalid. Infinity and false ok are independent guard operands.
+	const Reading infinite{true, std::numeric_limits<double>::infinity(), .02};
+	const Reading failed{false, 4000.0, .02};
+	const Reading failed_base{false, 1000.0, .02};
+	PKV_CHECK(!ChangeResolved(infinite, baseline) && !Report("invalid-infinite", infinite, &baseline));
+	PKV_CHECK(!ChangeResolved(failed, baseline) && !Report("invalid-paged-ok", failed, &baseline));
+	PKV_CHECK(!ChangeResolved(Reading{true, 4000.0, .02}, failed_base) &&
+	          !Report("invalid-base-ok", Reading{true, 4000.0, .02}, &failed_base));
 }
 
 // Prints one reading against its baseline. A ratio below 4 is within the observed load
