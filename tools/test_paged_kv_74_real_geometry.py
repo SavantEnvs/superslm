@@ -7,6 +7,8 @@ import struct
 import subprocess
 import tempfile
 import unittest
+import hashlib
+import shutil
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +16,7 @@ SOURCE = Path(os.environ.get(
     "PKV_C6_SOURCE", ROOT / "tests/paged-kv/c6_dim7_reset_adopt_timing.cpp"))
 ARTIFACTS = Path(os.environ.get(
     "PKV_C6_ARTIFACT_DIR", "D:/_artifacts/SuperSLM/t3114"))
+BUILD = Path(os.environ.get("PKV_C6_BUILD", "D:/_scratch/T-3112/build-c6"))
 VCVARS = Path("C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Auxiliary/Build/vcvars64.bat")
 
 
@@ -40,6 +43,52 @@ def config(path):
 
 
 class RealGeometryCells(unittest.TestCase):
+    def test_p5_real_artifact_block_mismatch_refuses_before_timer(self):
+        small_name = "qwen2.5-0.5b-instruct-cap4096-aex.sslm"
+        large_name = "qwen2.5-0.5b-instruct-cap32768-aex.sslm"
+        with tempfile.TemporaryDirectory(prefix="pkv-p5-real-", dir="D:/_scratch/T-3112") as temp:
+            folder = Path(temp)
+            os.link(ARTIFACTS / small_name, folder / small_name)
+            os.link(ARTIFACTS / large_name, folder / large_name)
+            env = os.environ.copy()
+            env["SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR"] = str(folder)
+            env["SUPERSLM_PAGED_KV_74_FORCE_PIN_FAILURE"] = "1"
+
+            def invoke():
+                listing = subprocess.run(["tasklist", "/FI", "IMAGENAME eq smoke_adapter_driver.exe"],
+                                         capture_output=True, text=True, timeout=15)
+                self.assertNotIn("smoke_adapter_driver.exe", listing.stdout)
+                return subprocess.run([str(BUILD / "superslm_pkv_c6.exe"), "=7.4/C6"],
+                                      env=env, capture_output=True, text=True, timeout=90)
+
+            control = invoke()
+            self.assertEqual(control.returncode, 73, control.stdout + control.stderr)
+            self.assertIn("cannot pin timing thread", control.stderr)
+
+            (folder / large_name).unlink()  # break the hard link before modifying CFG1
+            shutil.copyfile(ARTIFACTS / large_name, folder / large_name)
+            with (folder / large_name).open("r+b") as stream:
+                header = stream.read(104)
+                config_offset = struct.unpack_from("<Q", header, 72)[0]
+                stream.seek(config_offset + 48)  # CFG1 kv_block_size, after magic + 11 u32s
+                old = struct.unpack("<I", stream.read(4))[0]
+                self.assertEqual(old, 16)
+                stream.seek(config_offset + 48)
+                stream.write(struct.pack("<I", 17))
+                stream.seek(32)
+                stream.write(bytes(32))
+                stream.seek(0)
+                digest = hashlib.sha256()
+                while chunk := stream.read(8 * 1024 * 1024):
+                    digest.update(chunk)
+                stream.seek(32)
+                stream.write(digest.digest())
+
+            refused = invoke()
+            self.assertEqual(refused.returncode, 71, refused.stdout + refused.stderr)
+            self.assertIn("geometry mismatch", refused.stderr)
+            self.assertNotIn("cannot pin timing thread", refused.stderr)
+
     def test_p5_hidden_size_and_block_size_from_real_configs(self):
         source = SOURCE.read_text(encoding="utf-8")
         function = re.search(r"bool Same74Geometry\(.*?\n}\n(?=void Run74)", source, re.S)
