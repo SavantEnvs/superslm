@@ -3,6 +3,9 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'paged_kv_c6_provenance.ps1')
 $script:failures = 0
 function Check([bool]$ok, [string]$label) { if ($ok) { Write-Output "ok $label" } else { Write-Output "FAIL $label"; $script:failures++ } }
+# The box runner supplies this helper from paged_kv_box_common.ps1 before it
+# loads provenance. Keep this cell standalone without entering its build shell.
+function Get-PkvSha256([string]$Path) { return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() }
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("pkv-c6-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
@@ -16,8 +19,68 @@ try {
     Check ((Get-PkvLegStanding -Rests @('timing74') -Record $read) -like 'quarantined*') 'uncommissioned 7.4 quarantined'
     $verified = Get-PkvRunnerCommissionedIds -Requested @('timing74') -VerifyLines @('QUARANTINED   PKV-TIMING-74-C6')
     Check ($verified.Count -eq 0) 'caller flag without receipt-verifier result confers no standing'
-    $verified = Get-PkvRunnerCommissionedIds -VerifyLines @('COMMISSIONED  PKV-TIMING-74-C6')
-    Check ($verified -contains 'timing74') 'exact verified receipt confers timing74 standing'
+    # Build a source-set fixture with an instrument, executable and invoked
+    # runner. The receipt names this exact source hash; the manifest names the
+    # same source and the bytes the leg would invoke.
+    $repo = Join-Path $tmp 'current-source'
+    $sourceDir = Join-Path $repo 'tests/paged-kv'
+    $toolsDir = Join-Path $repo 'tools'
+    $buildDir = Join-Path $tmp 'build'
+    New-Item -ItemType Directory -Path $sourceDir, $toolsDir, $buildDir -Force | Out-Null
+    $instrument = Join-Path $sourceDir 'c6_dim7_reset_adopt_timing.cpp'
+    $runner = Join-Path $toolsDir 'run_paged_kv_c6_box.ps1'
+    $binary = Join-Path $buildDir 'superslm_pkv_c6.exe'
+    [IO.File]::WriteAllText($instrument, "int main() { return 74; }`n", [Text.Encoding]::ASCII)
+    [IO.File]::WriteAllText($runner, "# current invoked runner`n", [Text.Encoding]::ASCII)
+    [IO.File]::WriteAllBytes($binary, [byte[]](74, 168, 4, 1))
+    $sourceSha = Get-PkvSha256 $instrument
+    $runnerSha = Get-PkvSha256 $runner
+    $binarySha = Get-PkvSha256 $binary
+    $successorId = 'PKV-TIMING-74-C6-R168'
+    $registryPath = Join-Path $tmp 'registry.json'
+    $registry = [ordered]@{
+        'PKV-TIMING-74-C6' = @{ instrument = $instrument; instrument_sha256 = $sourceSha }
+        $successorId = @{ instrument = $instrument; instrument_sha256 = $sourceSha }
+    }
+    $registry | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $registryPath -Encoding utf8
+    $manifest = [ordered]@{
+        schema = 'pkv-c6-source-set/1'
+        sources = [ordered]@{ 'tests/paged-kv/c6_dim7_reset_adopt_timing.cpp' = $sourceSha }
+        invoked = [ordered]@{ 'superslm_pkv_c6.exe' = $binarySha; 'run_paged_kv_c6_box.ps1' = $runnerSha }
+    }
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$binary.source-set.json" -Encoding utf8
+    $currentBase = @{} + $base
+    $currentBase.Binary = $binary
+    $currentBase.BinarySha256 = $binarySha
+    $currentBase.Inputs = [ordered]@{ instrument = $sourceSha; runner = $runnerSha }
+    # A T-3093 receipt is withdrawn even if its registry entry names the
+    # current instrument and the leg records the current invoked bytes.
+    $legacyVerified = Get-PkvRunnerCommissionedIds -VerifyLines @('COMMISSIONED  PKV-TIMING-74-C6')
+    $legacyRecord = New-PkvLegRecord -Leg '7.4/C6' -Rests @('timing74') -Commissioned $legacyVerified @currentBase
+    Check ((Get-PkvLegStanding -Rests @('timing74') -Record $legacyRecord) -like 'quarantined*') 'superseded T-3093 receipt quarantines current 7.4 leg'
+    $successorVerified = Get-PkvRunnerCommissionedIds -VerifyLines @("COMMISSIONED  $successorId")
+    $hasSourceBinding = [bool](Get-Command Test-PkvSourceBinding -ErrorAction SilentlyContinue)
+    $bound = $false
+    if ($hasSourceBinding) {
+        $bound = Test-PkvSourceBinding -Binary $binary -RegistryId $successorId -Repo $repo -RegistryPath $registryPath
+    }
+    Check ($successorVerified -contains 'timing74' -and $bound) 'source-bound successor receipt accepts current source and invoked bytes'
+    $successorRecord = New-PkvLegRecord -Leg '7.4/C6' -Rests @('timing74') -Commissioned @($successorVerified | Where-Object { $bound }) @currentBase
+    Check ((Get-PkvLegStanding -Rests @('timing74') -Record $successorRecord) -eq 'standing') 'source-bound successor confers 7.4 standing'
+    if ($hasSourceBinding) {
+        [IO.File]::AppendAllText($instrument, "// changed source`n", [Text.Encoding]::ASCII)
+        Check (-not (Test-PkvSourceBinding -Binary $binary -RegistryId $successorId -Repo $repo -RegistryPath $registryPath)) 'changed source quarantines successor'
+        [IO.File]::WriteAllText($instrument, "int main() { return 74; }`n", [Text.Encoding]::ASCII)
+        [IO.File]::AppendAllText($runner, "# changed invocation`n", [Text.Encoding]::ASCII)
+        Check (-not (Test-PkvSourceBinding -Binary $binary -RegistryId $successorId -Repo $repo -RegistryPath $registryPath)) 'changed invoked runner quarantines successor'
+        [IO.File]::WriteAllText($runner, "# current invoked runner`n", [Text.Encoding]::ASCII)
+        [IO.File]::WriteAllBytes($binary, [byte[]](74, 168, 4, 2))
+        Check (-not (Test-PkvSourceBinding -Binary $binary -RegistryId $successorId -Repo $repo -RegistryPath $registryPath)) 'changed executable quarantines successor'
+    } else {
+        Check $false 'changed source quarantines successor'
+        Check $false 'changed invoked runner quarantines successor'
+        Check $false 'changed executable quarantines successor'
+    }
     $verified = Get-PkvVerifiedIds @('COMMISSIONED  PKV-LEGACY-COUNT-C4')
     Check ($verified -notcontains 'admission') 'partial grouped admission receipts confer no standing'
     $next = New-PkvLegRecord -Leg '7.4/C6' -Rests @('timing74') -Commissioned @('timing74') @base
