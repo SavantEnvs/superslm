@@ -107,32 +107,12 @@ function Get-PkvNormalizedSha256 {
 function Test-PkvSourceBinding {
     param([string]$Binary, [string]$RegistryId, [string]$Repo,
           [string]$RegistryPath = 'D:\Wizard\Claude\Tooling\instrument-registry.json')
-    $path = "$Binary.source-set.json"
-    if (-not (Test-Path -LiteralPath $path) -or -not (Test-Path -LiteralPath $RegistryPath)) { return $false }
+    $checker = Join-Path $Repo 'tools/verify_paged_kv_binding.py'
+    if (-not (Test-Path -LiteralPath $checker) -or -not (Test-Path -LiteralPath $RegistryPath)) { return $false }
     try {
-        $manifest = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-        $registry = Get-Content -LiteralPath $RegistryPath -Raw | ConvertFrom-Json
-        $entry = $registry.PSObject.Properties[$RegistryId].Value
-        if (-not $entry -or $manifest.schema -cne 'pkv-c6-source-set/1') { return $false }
-        $root = [IO.Path]::GetFullPath($Repo).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-        $instrument = [IO.Path]::GetFullPath("$($entry.instrument)")
-        if (-not $instrument.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { return $false }
-        $relative = $instrument.Substring($root.Length).Replace('\', '/')
-        $source = $manifest.sources.PSObject.Properties[$relative]
-        if (-not $source -or "$($source.Value)" -cne "$($entry.instrument_sha256)") { return $false }
-        foreach ($item in $manifest.sources.PSObject.Properties) {
-            $file = [IO.Path]::GetFullPath((Join-Path $Repo $item.Name))
-            if (-not $file.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or
-                -not (Test-Path -LiteralPath $file) -or
-                (Get-PkvNormalizedSha256 $file) -cne "$($item.Value)") { return $false }
-        }
-        foreach ($item in $manifest.invoked.PSObject.Properties) {
-            $file = if ($item.Name -match '\.(exe|lib)$') { Join-Path (Split-Path -Parent $Binary) $item.Name }
-                    else { Join-Path (Join-Path $Repo 'tools') $item.Name }
-            if (-not (Test-Path -LiteralPath $file) -or
-                (Get-PkvSha256 $file) -cne "$($item.Value)") { return $false }
-        }
-        return $true
+        $result = & python $checker --binary $Binary --repo $Repo --registry $RegistryPath --id $RegistryId 2>$null
+        if ($LASTEXITCODE -ne 0) { return $false }
+        return [bool](($result | ConvertFrom-Json).bound)
     } catch { return $false }
 }
 

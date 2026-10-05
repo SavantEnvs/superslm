@@ -57,8 +57,9 @@ struct Arm {
 	explicit Arm(const Fixture& f):fx(f){}
 	sslm_kv_pool* Pool() {return legacy?&legacy->pool:&page->pool;}
 	~Arm(){if(seq)sslm_seq_release(seq);if(persona)sslm_prefix_release(persona);if(world)sslm_prefix_release(world);}
-	void Restore(const char* path){legacy=std::make_unique<LegacyPool>(fx.model,1);Require(legacy->status==SSLM_OK,"pool failed");
+	void Restore(const char* path,int expected){legacy=std::make_unique<LegacyPool>(fx.model,1);Require(legacy->status==SSLM_OK,"pool failed");
 		auto blob=Blob(path);Require(IsMagic(blob,"SSB5"),"prompt blob is not SSB5");
+		Require(BlobLe64(blob,60)==expected,"restored prompt length differs from width minus 512");
 		Require(sslm_seq_restore(fx.model,Pool(),blob.data(),blob.size(),&seq)==SSLM_OK,"prompt restore failed");}
 	void Shared(){page=std::make_unique<PagePool>(fx.model,static_cast<uint32_t>(fx.R(1000)+fx.R(200)+fx.R(512)+8));
 		Require(page->status==SSLM_OK,"shared pool failed");
@@ -86,7 +87,7 @@ struct Arm {
 void Pairs(int argc,char** argv,bool shared){
 	// pair79 A B CAP_A CAP_B LAYERS HEADS DIM BLOB_A BLOB_B PAIRS SEED OUT
 	// pair79b MODEL CAP LAYERS HEADS DIM PAIRS SEED OUT
-	Require(argc==(shared?10:14),"pair argument count");
+	Require(argc==(shared?10:15),"pair argument count");
 	const Fixture* fa=nullptr;const Fixture* fb=nullptr;int pairs=0;uint32_t seed=0;const char* output=nullptr;
 	if(shared){fa=&Model(argv[2],Number(argv[3]),Number(argv[4]),Number(argv[5]),Number(argv[6]));fb=fa;
 		pairs=Number(argv[7]);seed=Seed(argv[8]);output=argv[9];}
@@ -95,7 +96,7 @@ void Pairs(int argc,char** argv,bool shared){
 		pairs=Number(argv[11]);seed=Seed(argv[12]);output=argv[13];}
 	Require(pairs>0&&pairs<=508,"pair count must be 1..508");
 	Arm a(*fa),b(*fb);
-	if(shared){a.Shared();b.Contiguous();}else{a.Restore(argv[9]);b.Restore(argv[10]);}
+	if(shared){a.Shared();b.Contiguous();}else{const int expected=Number(argv[14]);a.Restore(argv[9],expected);b.Restore(argv[10],expected);}
 	Require(a.Ready()==b.Ready(),"ready tokens differ");
 	for(int i=0;i<4;++i)Require(a.Decode().second==b.Decode().second,"warmup tokens differ");
 	std::ofstream out(output,std::ios::binary|std::ios::trunc);Require(bool(out),"pair output cannot open");

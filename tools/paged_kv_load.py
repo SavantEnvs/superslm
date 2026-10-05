@@ -11,6 +11,8 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import random
+import subprocess
+import sys
 import time
 
 FORMS = {"square-0.1": .1, "square-1": 1.0, "square-60": 60.0}
@@ -105,5 +107,12 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, required=True)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--record", type=Path, required=True)
+    parser.add_argument("--calibration-probe", type=Path, required=True,
+                        help="independent decode probe; called as PROBE on|off WORKER_PID... and prints median time")
     args = parser.parse_args()
-    print(json.dumps(run(args.form, args.duration, args.workers, args.seed, args.record)))
+    def probe(phase: str, workers: list[int]) -> float:
+        command = [sys.executable, str(args.calibration_probe), phase, *(str(pid) for pid in workers)]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=300, check=True)
+        return float(result.stdout.strip())
+    print(json.dumps(run(args.form, args.duration, args.workers, args.seed, args.record,
+                         calibration_probe=probe)))

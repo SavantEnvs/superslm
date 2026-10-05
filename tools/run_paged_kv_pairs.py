@@ -69,6 +69,18 @@ def pid_live(pid: int) -> bool:
         return False
 
 
+def live_load_state(record: Path) -> dict:
+    try:
+        state = json.loads(record.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise Refusal("load generator record torn") from None
+    if (not pid_live(int(state.get("pid", 0))) or state.get("phase") not in ("on", "off") or
+        state.get("complete") is not False or not state.get("worker_pids") or
+        not all(pid_live(int(pid)) for pid in state["worker_pids"])):
+        raise Refusal("load generator stopped or worker dead")
+    return state
+
+
 class PidLock:
     def __init__(self, path: Path):
         self.path = path
@@ -100,11 +112,21 @@ def production_library(exe: Path) -> tuple[str, str]:
     identity = subprocess.run([str(exe), "identity"], capture_output=True, text=True, timeout=30)
     if identity.returncode or identity.stdout.strip() != "PKV_PAIR_PRODUCTION_V2 defs=none":
         raise Refusal("production pair identity or build definitions invalid")
+    try:
+        manifest = json.loads(Path(str(exe) + ".source-set.json").read_text(encoding="utf-8"))
+        commands = manifest["build_recipe"]["commands"]
+        compiled = [line for block in commands.values() for line in block.splitlines()
+                    if re.search(r"(?:cl\.exe|clang\+\+|g\+\+).*\.(?:cpp|cc|cxx)\b", line, re.I)]
+        if (not compiled or any(re.search(r"(?:/Od\b|-O0\b)", line, re.I) or
+                                not re.search(r"(?:/O2\b|-O[23]\b)", line, re.I) for line in compiled)):
+            raise Refusal("production pair build is not optimized")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        raise Refusal("production pair build recipe missing") from None
     return sha(exe), sha(lib)
 
 
 def source_bound_receipt(exe: Path, kind: str) -> tuple[bool, str | None]:
-    """Check a verified successor receipt against the link manifest and live files."""
+    """Check a verified successor receipt against independent source authority."""
     receipt_id = "PKV-TIMING-79-C6-R168" if kind == "79" else "PKV-TIMING-79B-C6"
     registry_path = Path(os.environ.get("PKV_C6_REGISTRY", "D:/Wizard/Claude/Tooling/instrument-registry.json"))
     manifest_path = exe.with_suffix(exe.suffix + ".source-set.json")
@@ -121,25 +143,10 @@ def source_bound_receipt(exe: Path, kind: str) -> tuple[bool, str | None]:
                                   capture_output=True, text=True, timeout=120)
         if f"COMMISSIONED  {receipt_id}" not in verified.stdout.splitlines():
             return False, sha(manifest_path)
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("schema") != "pkv-c6-source-set/1":
-            return False, sha(manifest_path)
         repo = Path(__file__).resolve().parents[1]
-        source = Path(entry["instrument"]).resolve()
-        relative = source.relative_to(repo).as_posix()
-        if manifest["sources"].get(relative) != entry["instrument_sha256"]:
-            return False, sha(manifest_path)
-        for name, expected in manifest["sources"].items():
-            current = (repo / name).resolve()
-            current.relative_to(repo)
-            if hashlib.sha256(current.read_bytes().replace(b"\r\n", b"\n")).hexdigest() != expected:
-                return False, sha(manifest_path)
-        for name, expected in manifest["invoked"].items():
-            current = (exe.parent if name.endswith((".exe", ".lib")) else repo / "tools") / name
-            if sha(current) != expected:
-                return False, sha(manifest_path)
-        return True, sha(manifest_path)
-    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+        from verify_paged_kv_binding import bound
+        return bound(exe, repo, registry_path, receipt_id)
+    except (OSError, ValueError, KeyError, ImportError, subprocess.TimeoutExpired):
         return False, sha(manifest_path)
 
 
@@ -149,7 +156,7 @@ def box_observation() -> dict:
             return {"load_1m": os.getloadavg()[0], "offenders": []}
         except OSError:
             return {"load_1m": None, "offenders": []}
-    command = ("$p=Get-Process -Name UnrealEditor,UnrealEditor-Cmd,cl,link,dotnet,UnrealBuildTool "
+    command = ("$p=Get-Process -Name UnrealEditor,UnrealEditor-Cmd,cl,link,dotnet,UnrealBuildTool,smoke_adapter_driver,superslm_pkv_* "
                "-ErrorAction SilentlyContinue | ForEach-Object { \"$($_.ProcessName):$($_.Id)\" };"
                "$cpu=(Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average;"
                "@{cpu_percent=$cpu;offenders=@($p);build_lock=(Test-Path 'D:\\_ssu_build_lock')} "
@@ -164,7 +171,7 @@ def box_observation() -> dict:
     return {"cpu_percent": None, "offenders": [], "observation_error": True}
 
 
-def run_logged(command: list[str], log: Path, cap: int, env: dict[str, str]) -> int | None:
+def wait_for_smoke() -> None:
     if os.name == "nt":
         while True:
             listing = subprocess.run(["C:/Windows/System32/tasklist.exe", "/FI",
@@ -176,6 +183,7 @@ def run_logged(command: list[str], log: Path, cap: int, env: dict[str, str]) -> 
                 break
             print("waiting for smoke_adapter_driver.exe before process start", flush=True)
             time.sleep(30)
+def run_logged(command: list[str], log: Path, cap: int, env: dict[str, str]) -> int | None:
     start = time.monotonic()
     with log.open("wb") as output:
         process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, env=env)
@@ -274,7 +282,10 @@ def checked_blob(manifest_path: Path, model: Path, width: int,
         validate_manifest(manifest, sha(model), width, manifest_path.parent, geometry) != width - 512):
         raise Refusal(f"blob/manifest mismatch: {manifest_path}")
     blob = manifest_path.parent / manifest.get("final_blob", "")
-    if not blob.is_file() or sha(blob) != manifest.get("final_sha256"):
+    pieces = manifest.get("pieces") or []
+    if (not pieces or manifest.get("final_blob") != pieces[-1].get("file") or
+        manifest.get("final_sha256") != pieces[-1].get("sha256") or
+        not blob.is_file() or sha(blob) != manifest.get("final_sha256")):
         raise Refusal(f"final blob mismatch: {blob}")
     return blob, sha(manifest_path)
 
@@ -366,21 +377,9 @@ def run(args) -> dict:
         raise Refusal(f"load generator record missing: {load_record}")
     load_qualified = not load_record
     if load_record:
-        try:
-            load_state = json.loads(load_record.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raise Refusal("load generator record torn") from None
-        # Older construction records have no live authority. They can still be
-        # recorded for mechanism cells, but never qualify a load condition.
-        if "pid" in load_state or "phase" in load_state:
-            if not pid_live(int(load_state.get("pid", 0))):
-                raise Refusal("load generator dead")
-            if load_state.get("phase") != "on":
-                raise Refusal("load generator inactive phase")
-            if not all(pid_live(int(pid)) for pid in load_state.get("worker_pids", [])):
-                raise Refusal("load generator dead worker")
-            calibration = load_state.get("calibration") or {}
-            load_qualified = bool(calibration.get("qualified") and calibration.get("slowdown", 0) >= 2.8)
+        load_state = live_load_state(load_record)
+        calibration = load_state.get("calibration") or {}
+        load_qualified = bool(calibration.get("qualified") and calibration.get("slowdown", 0) >= 2.8)
     load_sha = sha(load_record) if load_record else None
     standing = receipt_bound and load_qualified
     expected = {"kind": args.kind, "exe_sha256": exe_sha, "library_sha256": lib_sha,
@@ -391,6 +390,9 @@ def run(args) -> dict:
                           "MECHANISM_ONLY" if getattr(args, "mechanism", False) else
                           "STANDING" if standing else "QUARANTINED"}
     with PidLock(BOX_LOCK):
+        wait_for_smoke()
+        if load_record:
+            live_load_state(load_record)
         prior = read_result(result, expected)
         if prior is not None:
             return prior
@@ -402,11 +404,18 @@ def run(args) -> dict:
         if args.kind == "79":
             command = [str(exe), "pair79", model_a.name, model_b.name, str(args.cap_a), str(args.cap_b),
                        str(args.layers), str(args.heads), str(args.dim), str(blobs[0]), str(blobs[1]),
-                       str(args.pairs), str(seed), str(pairs_file)]
+                       str(args.pairs), str(seed), str(pairs_file), str(args.width - 512)]
         else:
             command = [str(exe), "pair79b", model_a.name, str(args.cap_a), str(args.layers), str(args.heads),
                        str(args.dim), str(args.pairs), str(seed), str(pairs_file)]
         exit_code = run_logged(command, result.with_suffix(".log"), args.cap_seconds, env)
+        load_after_sha = None
+        if load_record:
+            after_load = live_load_state(load_record)
+            if (after_load.get("pid") != load_state.get("pid") or
+                after_load.get("started_monotonic") != load_state.get("started_monotonic")):
+                raise Refusal("load generator changed during pair run")
+            load_after_sha = sha(load_record)
         after = box_observation()
         if exit_code is None or exit_code != 0 or not pairs_file.is_file():
             raise Refusal("production pair runner failed or capped; see log")
@@ -422,7 +431,8 @@ def run(args) -> dict:
                   "source_manifest_sha256": source_manifest_sha,
                   "model_hashes": [sha(model_a), sha(model_b)], "manifest_hashes": manifest_hashes,
                   "token_sha256": token_sha, "pairs_sha256": sha(pairs_file), "seed": seed,
-                  "hook": hook, "load_sha256": load_sha, "load_before": before, "load_after": after, **stats}
+                  "hook": hook, "load_sha256": load_sha, "load_record_after_sha256": load_after_sha,
+                  "load_before": before, "load_after": after, **stats}
         os.replace(pairs_file, result.with_suffix(".pairs.csv"))
         atomic_json(result, record)
         return record
