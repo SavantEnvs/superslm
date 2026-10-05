@@ -19,36 +19,57 @@ try {
     Check ((Get-PkvLegStanding -Rests @('timing74') -Record $read) -like 'quarantined*') 'uncommissioned 7.4 quarantined'
     $verified = Get-PkvRunnerCommissionedIds -Requested @('timing74') -VerifyLines @('QUARANTINED   PKV-TIMING-74-C6')
     Check ($verified.Count -eq 0) 'caller flag without receipt-verifier result confers no standing'
-    # Build a source-set fixture with an instrument, executable and invoked
-    # runner. The receipt names this exact source hash; the manifest names the
-    # same source and the bytes the leg would invoke.
+    # A local clone supplies a clean committed tree even while this test file is
+    # being edited. The manifest is link evidence; registry.source_binding is
+    # the independent claim over that evidence and the invoked environment.
     $repo = Join-Path $tmp 'current-source'
-    $sourceDir = Join-Path $repo 'tests/paged-kv'
-    $toolsDir = Join-Path $repo 'tools'
+    $origin = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    & git clone --quiet --shared $origin $repo
+    if ($LASTEXITCODE -ne 0) { throw 'fixture clone failed' }
     $buildDir = Join-Path $tmp 'build'
-    New-Item -ItemType Directory -Path $sourceDir, $toolsDir, $buildDir -Force | Out-Null
-    $instrument = Join-Path $sourceDir 'c6_dim7_reset_adopt_timing.cpp'
-    $runner = Join-Path $toolsDir 'run_paged_kv_c6_box.ps1'
+    New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+    $instrument = Join-Path $repo 'tests/paged-kv/c6_dim7_reset_adopt_timing.cpp'
+    $runner = Join-Path $repo 'tools/run_paged_kv_c6_box.ps1'
     $binary = Join-Path $buildDir 'superslm_pkv_c6.exe'
-    [IO.File]::WriteAllText($instrument, "int main() { return 74; }`n", [Text.Encoding]::ASCII)
-    [IO.File]::WriteAllText($runner, "# current invoked runner`n", [Text.Encoding]::ASCII)
     [IO.File]::WriteAllBytes($binary, [byte[]](74, 168, 4, 1))
-    $sourceSha = Get-PkvSha256 $instrument
+    $sourceSha = Get-PkvNormalizedSha256 $instrument
     $runnerSha = Get-PkvSha256 $runner
     $binarySha = Get-PkvSha256 $binary
     $successorId = 'PKV-TIMING-74-C6-R168'
     $registryPath = Join-Path $tmp 'registry.json'
-    $registry = [ordered]@{
-        'PKV-TIMING-74-C6' = @{ instrument = $instrument; instrument_sha256 = $sourceSha }
-        $successorId = @{ instrument = $instrument; instrument_sha256 = $sourceSha }
-    }
-    $registry | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $registryPath -Encoding utf8
+    $head = (& git -C $repo rev-parse HEAD).Trim()
+    $tree = (& git -C $repo rev-parse 'HEAD^{tree}').Trim()
+    $recipe = [ordered]@{ commands = [ordered]@{ 'superslm_pkv_c6.exe' = 'cl /O2 /DNDEBUG c6_dim7_reset_adopt_timing.cpp' }; compiler_sha256 = ('d' * 64) }
     $manifest = [ordered]@{
-        schema = 'pkv-c6-source-set/1'
-        sources = [ordered]@{ 'tests/paged-kv/c6_dim7_reset_adopt_timing.cpp' = $sourceSha }
+        schema = 'pkv-c6-source-set/2'
+        git_head = $head
+        git_tree = $tree
+        build_recipe = $recipe
+        sources = [ordered]@{ 'tests/paged-kv/c6_dim7_reset_adopt_timing.cpp' = $sourceSha; 'tools/run_paged_kv_c6_box.ps1' = (Get-PkvNormalizedSha256 $runner) }
         invoked = [ordered]@{ 'superslm_pkv_c6.exe' = $binarySha; 'run_paged_kv_c6_box.ps1' = $runnerSha }
     }
-    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$binary.source-set.json" -Encoding utf8
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText("$binary.source-set.json", ($manifest | ConvertTo-Json -Depth 5), $utf8)
+    $recipeJson = ConvertTo-Json -InputObject $recipe -Compress -Depth 5
+    $recipeBytes = [Text.Encoding]::UTF8.GetBytes($recipeJson)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $recipeSha = [BitConverter]::ToString($sha.ComputeHash($recipeBytes)).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+    $environment = [ordered]@{}
+    $named = @('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','CUDA_VISIBLE_DEVICES','CL','CXXFLAGS','LDFLAGS')
+    foreach ($variable in (Get-ChildItem Env: | Sort-Object Name)) {
+        if (($variable.Name.StartsWith('SUPERSLM_PAGED_KV_') -or $variable.Name.StartsWith('PKV_DEBUNK_') -or $named -contains $variable.Name) -and
+            $variable.Name -notin @('PKV_C6_REGISTRY','PKV_C6_RECEIPT_VERIFIER')) { $environment[$variable.Name] = $variable.Value }
+    }
+    $verifier = 'D:/Wizard/Claude/Tooling/instrument-commission.ps1'
+    $registry = [ordered]@{
+        'PKV-TIMING-74-C6' = @{ instrument = $instrument; instrument_sha256 = $sourceSha }
+        $successorId = @{ instrument = $instrument; instrument_sha256 = $sourceSha;
+            source_binding = @{ manifest_sha256 = (Get-PkvSha256 "$binary.source-set.json"); git_head = $head;
+                git_tree = $tree; build_recipe_sha256 = $recipeSha; verifier_sha256 = (Get-PkvSha256 $verifier);
+                measurement_env = $environment } }
+    }
+    [IO.File]::WriteAllText($registryPath, ($registry | ConvertTo-Json -Depth 8), $utf8)
     $currentBase = @{} + $base
     $currentBase.Binary = $binary
     $currentBase.BinarySha256 = $binarySha
@@ -70,10 +91,10 @@ try {
     if ($hasSourceBinding) {
         [IO.File]::AppendAllText($instrument, "// changed source`n", [Text.Encoding]::ASCII)
         Check (-not (Test-PkvSourceBinding -Binary $binary -RegistryId $successorId -Repo $repo -RegistryPath $registryPath)) 'changed source quarantines successor'
-        [IO.File]::WriteAllText($instrument, "int main() { return 74; }`n", [Text.Encoding]::ASCII)
-        [IO.File]::AppendAllText($runner, "# changed invocation`n", [Text.Encoding]::ASCII)
+        & git -C $repo checkout -- 'tests/paged-kv/c6_dim7_reset_adopt_timing.cpp'
+        [IO.File]::AppendAllText($runner, "`n# changed invocation`n", [Text.Encoding]::ASCII)
         Check (-not (Test-PkvSourceBinding -Binary $binary -RegistryId $successorId -Repo $repo -RegistryPath $registryPath)) 'changed invoked runner quarantines successor'
-        [IO.File]::WriteAllText($runner, "# current invoked runner`n", [Text.Encoding]::ASCII)
+        & git -C $repo checkout -- 'tools/run_paged_kv_c6_box.ps1'
         [IO.File]::WriteAllBytes($binary, [byte[]](74, 168, 4, 2))
         Check (-not (Test-PkvSourceBinding -Binary $binary -RegistryId $successorId -Repo $repo -RegistryPath $registryPath)) 'changed executable quarantines successor'
     } else {
