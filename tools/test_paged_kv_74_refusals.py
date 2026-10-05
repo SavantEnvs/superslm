@@ -6,6 +6,8 @@ import subprocess
 import tempfile
 import unittest
 import csv
+import json
+import statistics
 
 BUILD = Path(os.environ.get("PKV_C6_BUILD", "D:/_scratch/T-3112/build-c6"))
 FIXTURES = Path(os.environ.get("PKV_C6_FIXTURES", "D:/_scratch/T-3112/fixtures"))
@@ -81,6 +83,25 @@ class RefusalCells(unittest.TestCase):
                           for first in ("small", "large")}
                 self.assertGreaterEqual(min(counts.values()), 60, counts)
                 self.assertLessEqual(max(counts.values()), 145, counts)
+
+    def test_74_13_every_timed_call_subtracts_independent_empty_median(self):
+        with tempfile.TemporaryDirectory(prefix="pkv-74-calls-") as temp:
+            trace = Path(temp) / "calls.json"
+            result = self.call(CALL_TRACE=str(trace), FORCE_VITALITY_FAILURE="1")
+            self.assertNotEqual(result.returncode, 76, result.stdout + result.stderr)
+            self.assertTrue(trace.is_file(), result.stdout + result.stderr)
+            data = json.loads(trace.read_text(encoding="utf-8"))
+            empty = data["raw_empty_ticks"]
+            self.assertEqual(len(empty), 21)
+            reference = statistics.median(empty)
+            self.assertGreater(reference, 0)
+            calls = [row for row in data["calls"] if row["pair"] >= 0]
+            self.assertEqual(len(calls), 2 * 205 * 2 * 2)
+            self.assertEqual({row["verb"] for row in calls}, {"reset", "adopt"})
+            self.assertEqual({row["holder"] for row in calls}, {"budget", "whole_reserve"})
+            for row in calls:
+                self.assertAlmostEqual(row["corrected_ticks"], row["raw_ticks"] - reference,
+                                       delta=1, msg=row)
 
     def test_timer_vitality_and_unresolved_refusals(self):
         self.check_refusal(75, "sign interval did not resolve", FORCE_UNRESOLVED="1")
