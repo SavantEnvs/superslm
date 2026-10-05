@@ -1,6 +1,7 @@
 """Executed subprocess constructions for 7.4 infrastructure refusals."""
 import os
 from pathlib import Path
+import re
 import subprocess
 import unittest
 
@@ -45,6 +46,20 @@ class RefusalCells(unittest.TestCase):
         above = self.call(FLOOR_CONTROL_TICKS="101", FORCE_VITALITY_FAILURE="1")
         self.assertNotIn(above.returncode, (74, 76), above.stdout + above.stderr)
         self.assertIn("7.4 budget", above.stdout)
+
+    def test_74_11_reset_hook_has_sevenfold_extra_cost(self):
+        result = self.call(RESET_MUTANT="1", FORCE_VITALITY_FAILURE="1")
+        self.assertNotEqual(result.returncode, 76, result.stdout + result.stderr)
+        self.assertIn("7.4 budget reset r(86)=", result.stdout)
+        rows = re.findall(r"7\.4 hook reset base_ticks=([0-9.]+) hooked_ticks=([0-9.]+)",
+                          result.stdout)
+        self.assertEqual(len(rows), 2, result.stdout)
+        for base, hooked in rows:
+            base, hooked = float(base), float(hooked)
+            self.assertGreater(base, 0)
+            self.assertGreaterEqual((hooked - base) / base, 5.0,
+                                    "reset hook must inject the specified 7× extra cost")
+            self.assertLessEqual((hooked - base) / base, 9.0)
 
     def test_timer_vitality_and_unresolved_refusals(self):
         self.check_refusal(75, "sign interval did not resolve", FORCE_UNRESOLVED="1")
