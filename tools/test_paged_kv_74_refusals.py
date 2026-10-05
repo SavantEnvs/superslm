@@ -140,6 +140,18 @@ class RefusalCells(unittest.TestCase):
     def test_timer_vitality_and_unresolved_refusals(self):
         self.check_refusal(75, "sign interval did not resolve", FORCE_UNRESOLVED="1")
 
+    def test_p2_fail_stands_when_later_interval_is_unresolved(self):
+        # A real Run74 fixture invocation produces FAIL rows, then reaches
+        # Refuse(75). Its verdict must remain the already-observed cell FAIL.
+        result = self.call(RESET_MUTANT="1", FORCE_UNRESOLVED="1")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        for holder in ("budget", "whole_reserve"):
+            self.assertRegex(result.stdout,
+                             rf"7\.4 {holder} reset r\(86\)=[0-9.]+ r\(120\)=[0-9.]+ bound=2\.0 FAIL")
+        self.assertIn("[C6] 7.4/C6 RED", result.stdout)
+        self.assertRegex(result.stdout, r"1 cells, 1 red; [0-9]+ checks, [1-9][0-9]* failures")
+        self.assertIn("sign interval did not resolve", result.stderr)
+
     def test_4t_diagnostic_failure_is_reported_without_gating_74(self):
         result = self.call(FORCE_VITALITY_FAILURE="1")
         self.assertNotEqual(result.returncode, 76, result.stdout + result.stderr)
