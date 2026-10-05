@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
-from verify_paged_kv_binding import canonical, measurement_env, sha
+from verify_paged_kv_binding import bound, canonical, measurement_env, sha
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,23 +98,24 @@ class ReceiptBinding(unittest.TestCase):
             self.registry(registry, receipt_id, source, current_hash)
             with patch.dict(os.environ, {"PKV_C6_REGISTRY": str(registry),
                                          "PKV_C6_RECEIPT_VERIFIER": str(verifier)}):
-                self.assertTrue(pair.source_bound_receipt(exe, "79")[0])
+                self.assertFalse(pair.source_bound_receipt(exe, "79")[0], "redirected authority must quarantine")
+                self.assertTrue(bound(exe, ROOT, registry, receipt_id)[0])
                 old_source = Path("D:/SuperSLM/.worktrees/T-3093/tests/paged-kv/c6_dim7_throughput.cpp")
                 self.registry(registry, receipt_id, old_source, current_hash)
-                self.assertFalse(pair.source_bound_receipt(exe, "79")[0])
+                self.assertFalse(bound(exe, ROOT, registry, receipt_id)[0])
                 self.registry(registry, receipt_id, source, current_hash)
                 copied = temp / exe.name
                 for name in (exe.name, "superslm.lib", exe.name + ".source-set.json"):
                     shutil.copy2(BUILD / name, temp / name)
-                self.assertTrue(pair.source_bound_receipt(copied, "79")[0])
+                self.assertTrue(bound(copied, ROOT, registry, receipt_id)[0])
                 with copied.open("ab") as output:
                     output.write(b"changed executable")
-                self.assertFalse(pair.source_bound_receipt(copied, "79")[0])
+                self.assertFalse(bound(copied, ROOT, registry, receipt_id)[0])
                 shutil.copy2(exe, copied)
                 changed = json.loads((temp / manifest_path.name).read_text())
                 changed["invoked"][PAIR_SCRIPT.name] = "0" * 64
                 (temp / manifest_path.name).write_text(json.dumps(changed), encoding="utf-8")
-                self.assertFalse(pair.source_bound_receipt(copied, "79")[0])
+                self.assertFalse(bound(copied, ROOT, registry, receipt_id)[0])
 
 
 if __name__ == "__main__":

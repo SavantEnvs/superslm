@@ -128,7 +128,11 @@ def production_library(exe: Path) -> tuple[str, str]:
 def source_bound_receipt(exe: Path, kind: str) -> tuple[bool, str | None]:
     """Check a verified successor receipt against independent source authority."""
     receipt_id = "PKV-TIMING-79-C6-R168" if kind == "79" else "PKV-TIMING-79B-C6"
-    registry_path = Path(os.environ.get("PKV_C6_REGISTRY", "D:/Wizard/Claude/Tooling/instrument-registry.json"))
+    # Test fixtures may call verify_paged_kv_binding.bound directly. A graded
+    # run must never redirect its registry or verifier through its environment.
+    if "PKV_C6_REGISTRY" in os.environ or "PKV_C6_RECEIPT_VERIFIER" in os.environ:
+        return False, None
+    registry_path = Path("D:/Wizard/Claude/Tooling/instrument-registry.json")
     manifest_path = exe.with_suffix(exe.suffix + ".source-set.json")
     if not registry_path.is_file() or not manifest_path.is_file():
         return False, None
@@ -137,8 +141,7 @@ def source_bound_receipt(exe: Path, kind: str) -> tuple[bool, str | None]:
         entry = registry.get(receipt_id)
         if not entry:
             return False, sha(manifest_path)
-        verifier = Path(os.environ.get("PKV_C6_RECEIPT_VERIFIER",
-                                       "D:/Wizard/Claude/Tooling/instrument-commission.ps1"))
+        verifier = Path("D:/Wizard/Claude/Tooling/instrument-commission.ps1")
         verified = subprocess.run(["powershell", "-NoProfile", "-File", str(verifier), "-Verify"],
                                   capture_output=True, text=True, timeout=120)
         if f"COMMISSIONED  {receipt_id}" not in verified.stdout.splitlines():
