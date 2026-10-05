@@ -68,6 +68,18 @@ class LifecyclePublication(unittest.TestCase):
             self.assertIn("malformed baseline row", duplicate.stderr)
             self.assertNotIn("published change", duplicate.stdout)
 
+    def test_lc6_all_near_boundary_envelope_arms_execute(self):
+        result = subprocess.run([str(BUILD / "superslm_pkv_lifecycle_prod.exe"),
+                                 "=lifecycle/C6:constructions"],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = [line for line in result.stdout.splitlines()
+                 if "lifecycle boundary-no-change:" in line and "resolving power" in line]
+        self.assertEqual(len(lines), 20, result.stdout)
+        self.assertEqual(sum("paged 3.90" in line for line in lines), 4, result.stdout)
+        self.assertEqual(sum("resolving power 100.00%" in line for line in lines), 5,
+                         result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
