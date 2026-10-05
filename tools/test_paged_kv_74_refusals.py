@@ -38,6 +38,14 @@ class RefusalCells(unittest.TestCase):
     def test_74_8_corrected_median_floor(self):
         self.check_refusal(74, "corrected median under 100 ticks", FORCE_FLOOR="1")
 
+    def test_74_10_floor_at_99_and_control_at_101(self):
+        below = self.call(FLOOR_CONTROL_TICKS="99", FORCE_VITALITY_FAILURE="1")
+        self.assertEqual(below.returncode, 74, below.stdout + below.stderr)
+        self.assertIn("corrected median under 100 ticks", below.stderr)
+        above = self.call(FLOOR_CONTROL_TICKS="101", FORCE_VITALITY_FAILURE="1")
+        self.assertNotIn(above.returncode, (74, 76), above.stdout + above.stderr)
+        self.assertIn("7.4 budget", above.stdout)
+
     def test_timer_vitality_and_unresolved_refusals(self):
         self.check_refusal(75, "sign interval did not resolve", FORCE_UNRESOLVED="1")
 
