@@ -1,16 +1,10 @@
 """Schedule and short process smoke for the four C6 load forms."""
-import importlib.util
 import json
-import sys
 from pathlib import Path
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).with_name("paged_kv_load.py")
-spec = importlib.util.spec_from_file_location("pkv_load", SCRIPT)
-load = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = load
-spec.loader.exec_module(load)
+import paged_kv_load as load
 
 class LoadCells(unittest.TestCase):
     def test_four_forms_and_50_percent_duty(self):
