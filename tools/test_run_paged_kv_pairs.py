@@ -318,6 +318,22 @@ class PairCells(unittest.TestCase):
             self.assertNotEqual(first["load_sha256"], second["load_sha256"])
             self.assertEqual(execute.call_count, 2)
 
+    def test_79_14_dead_or_inactive_load_generator_cannot_authorize(self):
+        args = self.args(self.root / "load-bound.json")
+        args.load_record = self.root / "load.json"
+        for owner, phase in ((99999999, "on"), (os.getpid(), "off")):
+            with self.subTest(owner=owner, phase=phase):
+                args.load_record.write_text(json.dumps({
+                    "form": "square-0.1", "pid": owner, "phase": phase,
+                    "complete": True}), encoding="utf-8")
+                with patch.object(pair, "BOX_LOCK", self.root / "global.lock"), \
+                     patch.object(pair, "production_library", return_value=("exe", "lib")), \
+                     patch.object(pair, "box_observation", return_value={"cpu_percent": 1}), \
+                     patch.object(pair, "run_logged", side_effect=AssertionError(
+                         "stale or inactive load record authorized a production pair")):
+                    with self.assertRaisesRegex(pair.Refusal, "load generator.*(dead|inactive|phase)"):
+                        pair.run(args)
+
     def test_79_11_and_79b_10_torn_results_are_missing(self):
         for name in ("79", "79b"):
             result = self.root / f"{name}.json"
