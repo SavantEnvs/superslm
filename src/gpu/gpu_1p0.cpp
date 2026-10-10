@@ -3160,14 +3160,16 @@ bool RestoredSchemaBindingValid(const SslmGpuModelHandle* model, int32_t restore
 //   136         budget i32 (the declared budget)
 //   140         origin i64
 //   148         the residual (hidden_codes_size bytes)
-//   148 + R     kv_positions u64 = L' = context_length + (layer_index > 0 ? 1 : 0)
+//   148 + R     kv_positions u64 = L' = context_length + (0 < layer_index < num_hidden_layers ? 1 : 0)
 //   156 + R     the rows [0, L') in canonical layout [layer][K|V][kv_head][pos < L'][d] (int8)
-// The rows are gathered from the pool's host mirror (complete by G24) through the holder's table, and at
-// row `context_length` the layers >= layer_index are written as zero bytes whatever the page holds (§3.7)
-// -- every layer of it when layer_index == num_hidden_layers, the GPU's rest after a full-depth token,
-// whose row L was never written (SavePooledSlm6) -- so the blob is a function of the sequence's valid
-// state alone. No relation between
-// the per-site counters and the aggregate is validated (§3.7).
+// L' is §3.7's rule applied as the CPU twin applies it: row `context_length` is in the blob only for a
+// mid-token save. The GPU rests a full-depth token at layer_index == num_hidden_layers with context_length
+// already advanced -- a completed token, so row `context_length` holds no state (the CPU rests the same
+// history at layer_index 0, and both write L' = context_length). The blob still carries layer_index, so a
+// restore keeps the GPU's rest. The rows are gathered from the pool's host mirror (complete by G24)
+// through the holder's table, and at a mid-token save's row `context_length` the layers >= layer_index
+// are written as zero bytes whatever the page holds (§3.7), so the blob is a function of the sequence's
+// valid state alone. No relation between the per-site counters and the aggregate is validated (§3.7).
 constexpr uint32_t kGpuSeqBlobMagicSlm6 = 0x364D4C53u;  // "SLM6" little-endian u32
 constexpr size_t kSlm6OffLayerIndex = 4;
 constexpr size_t kSlm6OffScaleM = 8;
@@ -3227,8 +3229,19 @@ uint8_t* PooledMirrorRow(const SslmGpuKvPoolHandle* pool, const superslm::kv_pag
 // §4 item 10: a pooled sequence's save, the 'SLM6' writer. The size contract is SaveGpuSequenceState's:
 // a null or too-small `out_blob` reports the required size through *out_blob_size and returns false, and
 // the caller maps false to the status the 'SLM5' save returns for it.
+// L' (§3.7, as the CPU twin applies it): row `context_length` is carried only mid-token. layer_index ==
+// num_hidden_layers is the GPU's rest after a completed token, whose row `context_length` holds no state.
+int64_t Slm6Lprime(int64_t context_length, uint32_t layer_index, uint32_t num_hidden_layers) {
+	return context_length + ((layer_index > 0 && layer_index < num_hidden_layers) ? 1 : 0);
+}
+
 bool SavePooledSlm6(const SslmGpuSequenceHandle* seq, void* out_blob, size_t* out_blob_size) {
-	if (!out_blob_size || seq->pool == nullptr || seq->holder == nullptr || seq->model == nullptr) return false;
+	if (!out_blob_size) return false;
+	// An internal invariant failing reports size 0, so a size query never returns a stale size (F4).
+	if (seq->pool == nullptr || seq->holder == nullptr || seq->model == nullptr) {
+		*out_blob_size = 0;
+		return false;
+	}
 	const SslmGpuModelHandle* model = seq->model;
 	const SslmGpuKvPoolHandle* pool = seq->pool;
 	const superslm::SequenceLayerState& st = seq->live_state;
@@ -3236,8 +3249,11 @@ bool SavePooledSlm6(const SslmGpuSequenceHandle* seq, void* out_blob, size_t* ou
 	const size_t runs = GpuKvRuns(model);
 	const int64_t L = st.context_length;
 	const uint32_t layer_index = st.layer_index;
-	const int64_t lprime = L + (layer_index > 0 ? 1 : 0);
-	if (L < 0 || lprime > seq->context_cap) return false;
+	const int64_t lprime = Slm6Lprime(L, layer_index, model->num_hidden_layers);
+	if (L < 0 || lprime > seq->context_cap) {
+		*out_blob_size = 0;
+		return false;
+	}
 	const size_t residual = seq->hidden_codes.size();
 	const size_t rows_bytes = static_cast<size_t>(lprime) * runs * D;
 	const size_t required = kSlm6FixedBytes + residual + kSlm6KvPositionsBytes + rows_bytes;
@@ -3245,16 +3261,11 @@ bool SavePooledSlm6(const SslmGpuSequenceHandle* seq, void* out_blob, size_t* ou
 		*out_blob_size = required;  // report the size a real call needs, never truncate
 		return false;
 	}
-	// The layers of row L that hold committed state. The engine advances context_length when a token's
-	// last layer commits (forward_sites.cpp), so a GPU sequence resting after a full-depth token carries
-	// layer_index == num_hidden_layers with row L never written: §3.7's formula (written against the CPU,
-	// which rests at layer_index 0) still counts that row in L', and none of its layers is valid state,
-	// so all of them are zero-substituted. A mid-token save (0 < layer_index < layers) keeps the layers
-	// below layer_index. Only rows the sequence wrote are read, and each lies in a page the holder maps.
-	const uint32_t valid_layers_at_l = layer_index < model->num_hidden_layers ? layer_index : 0u;
-	const int64_t rows_read = valid_layers_at_l > 0 ? lprime : L;
-	if (superslm_gpu::kv_pool::PagesToCover(rows_read, pool->geo.page_positions) >
+	// Every row read lies in a page the holder maps: rows [0, L') and, mid-token, row L's layers below
+	// layer_index (the token being computed wrote them).
+	if (superslm_gpu::kv_pool::PagesToCover(lprime, pool->geo.page_positions) >
 	    superslm::kv_pages::HolderMapped(seq->holder)) {
+		*out_blob_size = 0;
 		return false;
 	}
 	uint8_t* dst = static_cast<uint8_t*>(out_blob);
@@ -3294,7 +3305,7 @@ bool SavePooledSlm6(const SslmGpuSequenceHandle* seq, void* out_blob, size_t* ou
 		}
 		if (lprime > L) {
 			uint8_t* row = run_dst + static_cast<size_t>(L) * D;
-			if (r / per_layer < valid_layers_at_l) {
+			if (r / per_layer < layer_index) {
 				std::memcpy(row, PooledMirrorRow(pool, seq->holder, r, L, D), D);
 			} else {
 				std::memset(row, 0, D);  // §3.7's zero substitution
@@ -3350,7 +3361,7 @@ SslmGpuStatus ParseSlm6Body(const SslmGpuModelHandle* model, const void* blob, s
 	if (origin < 0 || origin > context_length) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	if (context_length > superslm_gpu::kv_pool::HolderLimit(origin, budget, cap)) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	if (layer_index > model->num_hidden_layers) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
-	const int64_t lprime = context_length + (layer_index > 0 ? 1 : 0);
+	const int64_t lprime = Slm6Lprime(context_length, layer_index, model->num_hidden_layers);
 	if (lprime > cap) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	if (residual != static_cast<uint64_t>(model->hidden_size)) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	// Every term below is bounded: lprime <= cap (a u32), runs and head_dim are the model's own.

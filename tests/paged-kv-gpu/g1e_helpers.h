@@ -390,7 +390,9 @@ inline Slm6View Slm6Parse(const std::vector<uint8_t>& b, const Geo& g) {
 	v.kv_mode = Le32(b, kSlm6KvModeOff);
 	v.budget = static_cast<int32_t>(Le32(b, kSlm6BudgetOff));
 	v.origin = static_cast<int64_t>(Le64(b, kSlm6OriginOff));
-	v.Lp = v.context_length + (v.layer_index > 0 ? 1 : 0);
+	// L' (§3.7 as the CPU twin applies it, the G5 review ruling): row context_length only mid-token; the
+	// GPU's rest at layer_index == L is a completed token.
+	v.Lp = v.context_length + ((v.layer_index > 0 && v.layer_index < g.L) ? 1 : 0);
 	const size_t kvpos_off = pkvg_slm6::OffKvPositions(hidden);
 	if (b.size() < kvpos_off + pkvg_slm6::kKvPositionsBytes) return v;
 	const uint64_t kv_positions = Le64(b, kvpos_off);
