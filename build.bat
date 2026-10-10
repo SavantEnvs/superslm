@@ -170,7 +170,7 @@ if not exist out\t2180 mkdir out\t2180
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /Itools /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2180_rung6_public_bridge_sweep.cpp /Fo:out\t2180\ /Fe:out\t2180_rung6_sweep.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -191,7 +191,7 @@ if not exist out\t2180 mkdir out\t2180
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /Itools /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_ENABLE_GPU_BENCH_PRE_BATCHING ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2180_rung6_tokps.cpp /Fo:out\t2180\ /Fe:out\t2180_rung6_tokps.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -237,7 +237,7 @@ if not exist out\t2701 mkdir out\t2701
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /Itools /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2701_cpu_forward_probe.cpp /Fo:out\t2701\ /Fe:out\t2701_cpu_forward_probe.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -246,7 +246,7 @@ if errorlevel 1 (
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /Itools /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2701_gpu_tokens.cpp /Fo:out\t2701\ /Fe:out\t2701_gpu_tokens.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -264,7 +264,7 @@ if not exist out\b1 mkdir out\b1
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_O11_ALLOC_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2113_b1_context_smoke.cpp /Fo:out\b1\ /Fe:out\t2113_b1_context_smoke.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -282,7 +282,7 @@ if not exist out\b2 mkdir out\b2
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_O11_ALLOC_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2113_b2_model_smoke.cpp /Fo:out\b2\ /Fe:out\t2113_b2_model_smoke.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -298,7 +298,7 @@ if not exist out\b3 mkdir out\b3
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_O11_ALLOC_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2113_b3_sequence_smoke.cpp /Fo:out\b3\ /Fe:out\t2113_b3_sequence_smoke.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -314,7 +314,7 @@ if not exist out\b35 mkdir out\b35
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_O11_ALLOC_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2113_b35_embed_smoke.cpp /Fo:out\b35\ /Fe:out\t2113_b35_embed_smoke.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -334,7 +334,7 @@ if not exist out\b5 mkdir out\b5
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_O11_ALLOC_INJECTION /DSUPERSLM_GPU_T2106_FAULT_PINS ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2113_b5_async_smoke.cpp /Fo:out\b5\ /Fe:out\t2113_b5_async_smoke.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -351,7 +351,7 @@ if not exist out\b6 mkdir out\b6
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_O11_ALLOC_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2113_b6_adapter_smoke.cpp /Fo:out\b6\ /Fe:out\t2113_b6_adapter_smoke.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -366,7 +366,7 @@ if not exist out\b6b mkdir out\b6b
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_O11_ALLOC_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2113_b6b_adapter_delta_smoke.cpp /Fo:out\b6b\ /Fe:out\t2113_b6b_adapter_delta_smoke.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -381,7 +381,7 @@ if not exist out\b7 mkdir out\b7
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_O11_ALLOC_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2113_b7_batch_smoke.cpp /Fo:out\b7\ /Fe:out\t2113_b7_batch_smoke.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -395,7 +395,7 @@ if not exist out\b8 mkdir out\b8
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_O11_ALLOC_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2113_b8_thread_smoke.cpp /Fo:out\b8\ /Fe:out\t2113_b8_thread_smoke.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -411,7 +411,7 @@ if not exist out\t2124 mkdir out\t2124
 cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_O11_ALLOC_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
-	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
+	src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
 	tools\t2124_adapter_uaf_repro.cpp /Fo:out\t2124\ /Fe:out\t2124_adapter_uaf_repro.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
@@ -1711,7 +1711,7 @@ if errorlevel 1 (
 	type out\t2956\cpu_lib.log
 	goto :hard_fail
 )
-cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /MD /DSUPERSLM_GPU_ALLOC_FAULT_INJECTION /Iinclude /Isrc\gpu /c src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp /Fo:out\t2956\gpu\ > out\t2956\gpu.log 2>&1
+cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /MD /DSUPERSLM_GPU_ALLOC_FAULT_INJECTION /Iinclude /Isrc\gpu /c src\kv_pages.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp /Fo:out\t2956\gpu\ > out\t2956\gpu.log 2>&1
 if errorlevel 1 (
 	type out\t2956\gpu.log
 	echo T-2956 GPU test-seam library build FAILED

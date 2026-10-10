@@ -38,6 +38,7 @@
 
 #include "d3d12_harness.h"
 #include "shaders/kv_page_addr_model.h"
+#include "gpu_kv_pool_geometry.h"  // paged-KV G3: the coverage twin's chunk-wide form
 
 #include <shlwapi.h>  // PathIsRelativeW (shader-directory override validation)
 #pragma comment(lib, "shlwapi.lib")
@@ -1924,6 +1925,12 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
     // mirror's size in bytes -- the size of the device K/V buffer the view addresses. A legacy caller
     // passes GpuOnePageView(workspace, workspace_size, context_cap) and workspace_size.
     const superslm::KvPageView& kv_view, size_t kv_host_bytes,
+    // Paged-KV plan §4 items 5 and 6a, step G3: a pooled holder's own per-sequence table buffer
+    // (null for every one-page view, which keeps the per-call upload of its one constant entry);
+    // whether this submission uploads the view's mapped entries into it at its head (the holder's
+    // mappings changed since its last submission); and the rows this call and the rest of its
+    // chunk write from `context_length` on, for the chunk-wide coverage twin (1 for a decode).
+    ID3D12Resource* kv_table_resident, bool kv_table_upload, uint32_t coverage_tokens,
     ID3D12Resource* external_kv_resident, bool* io_external_kv_needs_resume_barrier,
     ID3D12Resource* external_weights_resident, ID3D12Resource* external_rope_cos_resident,
     ID3D12Resource* external_rope_sin_resident, bool external_rope_has,
@@ -2068,15 +2075,18 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 		return superslm::SslmForwardStatus::KvCapacityExhausted;  // KvCapacityExhausted
 	}
 	// KvPageUnmapped (the coverage guard in `RunLayerLoopImpl` (`forward_sites.cpp`), paged-KV
-	// plan §3.2 items 4-5): from G2 the twin evaluates the call's real view (§4 item 6a) -- the row this
-	// call writes, `context_length`, must lie in a mapped logical page, `context_length / page_positions
-	// < mapped_pages` (the CPU's own form: no product to overflow; `context_length >= 0` and
-	// `page_positions >= 1` are established above). Checked before any recording, so a view one page
-	// short is refused before any dispatch and before the shaders could read a table entry past the
-	// mapped ones. For a legacy sequence's one-page view (one page of B = its own cap)
-	// KvCapacityExhausted above already implies it.
-	if (static_cast<uint64_t>(seq.context_length) / static_cast<uint64_t>(kv_view.page_positions) >=
-	    kv_view.mapped_pages) {
+	// plan §3.2 items 4-5): from G2 the twin evaluates the call's real view (§4 item 6a). From G3 it is
+	// the CHUNK-WIDE form (§4 item 6a, before paged prefill): every row this call and the rest of its
+	// chunk write, `[context_length, context_length + coverage_tokens)` clamped to the cap, lies in a
+	// mapped logical page (kv_pool::CoverageRefused, src/gpu/gpu_kv_pool_geometry.h). For a decode
+	// (`coverage_tokens == 1`) that is the CPU's own single-row form, `context_length / page_positions
+	// < mapped_pages`. `context_length >= 0` and `page_positions >= 1` are established above. Checked
+	// before any recording, so a view one page short is refused before any dispatch and before the
+	// shaders could read a table entry past the mapped ones. For a legacy sequence's one-page view
+	// (one page of B = its own cap) KvCapacityExhausted above already implies it, and the cap clamp
+	// keeps it so for a chunk.
+	if (kv_pool::CoverageRefused(seq.context_length, coverage_tokens, context_cap, kv_view.page_positions,
+	                             kv_view.mapped_pages)) {
 		return superslm::SslmForwardStatus::KvPageUnmapped;  // KvPageUnmapped
 	}
 	static_assert(static_cast<int>(superslm_gpu::GpuLayerLoopGuard::kCount) == 10,
@@ -2719,9 +2729,30 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 	// UPLOAD-heap idiom as every other per-call SRV above and kept alive to the fence the same way
 	// (`upload_keep_alive`). A legacy dedicated sequence's view is the one-page view, whose table is
 	// the one constant entry {0} (GpuOnePageView), so its addresses are the pre-G2 flat ones.
-	Microsoft::WRL::ComPtr<ID3D12Resource> kv_page_table_buf =
-	    dev.Upload(kv_view.page_table, static_cast<size_t>(kv_view.mapped_pages) * sizeof(uint32_t));
-	upload_keep_alive.push_back(kv_page_table_buf);
+	// G3 (§4 item 5): a pooled holder binds its own per-sequence table buffer instead. Its entries are
+	// uploaded here only when its mappings changed since its last submission (`kv_table_upload`): the
+	// staging copy is made now, and the copy into the table buffer is recorded at the head of the list,
+	// after its Reset (below). Otherwise the buffer already holds the view's entries and is bound as is.
+	Microsoft::WRL::ComPtr<ID3D12Resource> kv_page_table_buf;
+	if (kv_table_resident == nullptr || kv_table_upload) {
+		kv_page_table_buf =
+		    dev.Upload(kv_view.page_table, static_cast<size_t>(kv_view.mapped_pages) * sizeof(uint32_t));
+		upload_keep_alive.push_back(kv_page_table_buf);
+	}
+	if (kv_table_resident != nullptr && kv_table_upload) {
+		// The table buffer rests in COMMON (created there, and a buffer decays to COMMON when the
+		// submission that used it completes): the copy promotes it to COPY_DEST implicitly, and one
+		// transition leaves it readable by every dispatch below.
+		dev.list->CopyBufferRegion(kv_table_resident, 0, kv_page_table_buf.Get(), 0,
+		                           static_cast<UINT64>(kv_view.mapped_pages) * sizeof(uint32_t));
+		D3D12_RESOURCE_BARRIER table_barrier{};
+		table_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		table_barrier.Transition.pResource = kv_table_resident;
+		table_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+		table_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+		table_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		dev.list->ResourceBarrier(1, &table_barrier);
+	}
 	seq_uav = MakeInitializedUav(dev, seq_bytes, upload_keep_alive);
 	// T-2101: no host content -- see the header comment at `kv_fast_hit`'s own declaration above.
 	scratch_uav = dev.MakeBuffer(scratch_layout.total, D3D12_HEAP_TYPE_DEFAULT,
@@ -2891,8 +2922,9 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 	// fits a uint as the cap does; `page_bytes` is the stride, read only through a nonzero table entry,
 	// and a pool whose bytes pass 2^32 is refused at create (§4 item 3), so the clamp below changes
 	// nothing a shader reads (a one-page view's table entry is 0).
-	dev.list->SetComputeRootShaderResourceView(harness::Device::kComposedRootParamKvPageTable,
-	                                           kv_page_table_buf->GetGPUVirtualAddress());
+	dev.list->SetComputeRootShaderResourceView(
+	    harness::Device::kComposedRootParamKvPageTable,
+	    (kv_table_resident != nullptr ? kv_table_resident : kv_page_table_buf.Get())->GetGPUVirtualAddress());
 	{
 		const uint32_t page_constants[harness::Device::kComposedPageConstantCount] = {
 		    static_cast<uint32_t>(kv_view.page_positions),
@@ -3055,7 +3087,8 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
     ID3D12Resource* external_rope_cos_resident, ID3D12Resource* external_rope_sin_resident,
     bool external_rope_has, uint64_t external_rope_cos_elems, uint64_t external_rope_sin_elems,
     const GpuAdapterBridge* adapter_bridge, size_t q_width, uint8_t* out_q_codes,
-    size_t out_q_codes_capacity, uint64_t model_generation, bool model_has_qk_norm) {
+    size_t out_q_codes_capacity, uint64_t model_generation, bool model_has_qk_norm,
+    const GpuPagedKvBinding* paged_kv) {
 	if (out_inflight) *out_inflight = nullptr;
 	// T-2169 (Rung 2b-prep, D-SLM3632/D-SLM3633): the guard ladder, the weight/rope/K-V
 	// pack-and-residency decision, and the once-per-call root-signature/binding setup now live in
@@ -3092,12 +3125,16 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 	    io_external_kv_needs_resume_barrier != nullptr && *io_external_kv_needs_resume_barrier;
 	// Paged-KV plan §4 items 2 and 6 (G2): this flat-workspace entry (every legacy dedicated sequence
 	// and every pre-1.0 caller) binds the one-page view of its workspace; the ladder, the shaders and
-	// the readback offsets below all address K/V through it.
-	const superslm::KvPageView kv_view = GpuOnePageView(workspace, workspace_size, context_cap);
+	// the readback offsets below all address K/V through it. G3: a pooled holder passes its own view
+	// (`paged_kv`), over the pool's host mirror, which is `workspace`.
+	const superslm::KvPageView kv_view =
+	    paged_kv != nullptr ? paged_kv->view : GpuOnePageView(workspace, workspace_size, context_cap);
 	try {
 	const superslm::SslmForwardStatus prep_status = PrepareGpuLayerLoopChunkOpenState(
 	    dev, seq, layers, num_hidden_layers, layer_budget, hidden_size, head_dim, num_key_value_heads,
-	    intermediate_size, context_cap, rope_tables, kv_view, workspace_size, external_kv_resident,
+	    intermediate_size, context_cap, rope_tables, kv_view, workspace_size,
+	    paged_kv != nullptr ? paged_kv->table_resident : nullptr, paged_kv != nullptr && paged_kv->upload_table,
+	    /*coverage_tokens=*/1u, external_kv_resident,
 	    io_external_kv_needs_resume_barrier, external_weights_resident, external_rope_cos_resident,
 	    external_rope_sin_resident, external_rope_has, external_rope_cos_elems,
 	    external_rope_sin_elems, adapter_bridge, &state, q_width, model_generation);
@@ -3563,7 +3600,10 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
     // (T-2577 round 2, D-SLM6278): mirrors `RunLayerLoopGpuSubmit`'s own trailing
     // `model_generation` -- threaded into this call's own `PrepareGpuLayerLoopChunkOpenState`
     // call, below.
-    uint64_t model_generation, bool model_has_qk_norm) {
+    uint64_t model_generation, bool model_has_qk_norm,
+    // Paged-KV plan §4 items 5-6a, step G3: the pooled binding (null: the one-page view) and the rows
+    // the chunk writes from this sub-chunk's open to its end (the chunk-wide coverage twin).
+    const GpuPagedKvBinding* paged_kv, uint32_t coverage_tokens) {
 	if (out_inflight) *out_inflight = nullptr;
 	// T-2184 remedy S3 (Brunel fix round 1, D-SLM3662): this primitive's own catch clauses call
 	// the same file-scope `InvalidateResidencyCachesOnThrow()` `RunLayerLoopGpuSubmit`'s catch
@@ -3607,12 +3647,14 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 	    io_external_kv_needs_resume_barrier != nullptr && *io_external_kv_needs_resume_barrier;
 	// Paged-KV plan §4 items 2 and 6 (G2): as `RunLayerLoopGpuSubmit` -- the one-page view of the
 	// flat workspace, for the ladder, the shaders and the chunk's readback offsets.
-	const superslm::KvPageView kv_view = GpuOnePageView(workspace, workspace_size, context_cap);
+	const superslm::KvPageView kv_view =
+	    paged_kv != nullptr ? paged_kv->view : GpuOnePageView(workspace, workspace_size, context_cap);
 	try {
 	const superslm::SslmForwardStatus prep_status = PrepareGpuLayerLoopChunkOpenState(
 	    dev, seq, layers, num_hidden_layers, /*layer_budget=*/num_hidden_layers, hidden_size, head_dim,
 	    num_key_value_heads, intermediate_size, context_cap, rope_tables, kv_view, workspace_size,
-	    external_kv_resident, io_external_kv_needs_resume_barrier, external_weights_resident,
+	    paged_kv != nullptr ? paged_kv->table_resident : nullptr, paged_kv != nullptr && paged_kv->upload_table,
+	    coverage_tokens, external_kv_resident, io_external_kv_needs_resume_barrier, external_weights_resident,
 	    external_rope_cos_resident, external_rope_sin_resident, external_rope_has,
 	    external_rope_cos_elems, external_rope_sin_elems, adapter_bridge, &state, q_width,
 	    model_generation);
@@ -4049,7 +4091,8 @@ superslm::SslmForwardStatus SubmitChunkToFullDepthForG5Bridge(
     // (T-2577 round 2, D-SLM6278): mirrors `RunLayerLoopGpuSubmit`'s own trailing
     // `model_generation` -- forwarded to every `SubmitOneSubChunkToFullDepthForG5Bridge` call
     // this function's own sub-chunk-splitting loop makes, below.
-    uint64_t model_generation, bool model_has_qk_norm, bool* out_readback_guard_rejected) {
+    uint64_t model_generation, bool model_has_qk_norm, bool* out_readback_guard_rejected,
+    const GpuPagedKvBinding* paged_kv) {
 	if (out_inflight) *out_inflight = nullptr;
 	if (out_readback_guard_rejected) *out_readback_guard_rejected = false;
 	if (chunk_len == 0) {
@@ -4059,6 +4102,12 @@ superslm::SslmForwardStatus SubmitChunkToFullDepthForG5Bridge(
 		return superslm::SslmForwardStatus::Ok;
 	}
 	const size_t embed_block_bytes = static_cast<size_t>(SeqScaleOff(static_cast<uint32_t>(hidden_size))) + 16u;
+	// G3 (§4 item 5): the pooled binding's table upload rides the first sub-chunk that reaches the
+	// device; once one has executed, the table buffer holds the entries and later sub-chunks bind it
+	// as is. A local copy, so the caller's binding is not written.
+	GpuPagedKvBinding paged_local{};
+	if (paged_kv != nullptr) paged_local = *paged_kv;
+	const GpuPagedKvBinding* paged_this = paged_kv != nullptr ? &paged_local : nullptr;
 	uint32_t submitted = 0;
 	while (submitted < chunk_len) {
 		const uint32_t remaining = chunk_len - submitted;
@@ -4073,10 +4122,11 @@ superslm::SslmForwardStatus SubmitChunkToFullDepthForG5Bridge(
 		    external_kv_resident, io_external_kv_needs_resume_barrier, external_weights_resident,
 		    external_rope_cos_resident, external_rope_sin_resident, external_rope_has,
 		    external_rope_cos_elems, external_rope_sin_elems, adapter_bridge, &inflight, q_width,
-		    model_generation, model_has_qk_norm);
+		    model_generation, model_has_qk_norm, paged_this, /*coverage_tokens=*/remaining);
 		if (submit_status != superslm::SslmForwardStatus::Ok) {
 			return submit_status;
 		}
+		paged_local.upload_table = false;
 		if (is_last) {
 			// The caller's own async contract (design Sec4.2/Sec4.3): only the FINAL
 			// (sub-)chunk's own inflight token is handed back unfinished -- the caller drives

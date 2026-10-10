@@ -55,6 +55,14 @@ struct GpuTestSeamState {
 	uint32_t device_logits_scope = 0;  // > 0 while CreateDeviceLogitsBuffers or RunDeviceLogits runs
 	uint32_t close_failures = 0;     // phase-B Close failures still to inject, inside that scope
 	bool map_removed_query = false;  // the next DeviceReportedRemoved query reports removed
+	// Paged-KV plan §4 item 3, step G3 (cell 11.4's seam legs): each counted TryMakeBuffer call's
+	// requested size and heap type, beside `alloc_in_bundle` (SslmGpuAllocRecordForTest), and the
+	// pool create's zero-fill Close seam: while `pool_zero_fill_scope` > 0, the next
+	// `pool_zero_fill_close_failures` Close attempts fail without closing.
+	std::vector<uint64_t> alloc_bytes;
+	std::vector<uint32_t> alloc_heap;
+	uint32_t pool_zero_fill_scope = 0;
+	uint32_t pool_zero_fill_close_failures = 0;
 	bool readback_override_armed = false;
 	int32_t readback_override_row = 0;
 	int64_t readback_override_value = 0;
@@ -535,6 +543,8 @@ public:
 			seam.alloc_count += 1;
 			if (seam.alloc_in_bundle.size() < (1u << 20)) {
 				seam.alloc_in_bundle.push_back(seam.bundle_scope > 0);
+				seam.alloc_bytes.push_back(bytes);
+				seam.alloc_heap.push_back(static_cast<uint32_t>(heap));
 			}
 			if (seam.alloc_fault_countdown != 0 && --seam.alloc_fault_countdown == 0) {
 				return seam.alloc_fault_hr;
@@ -643,6 +653,10 @@ public:
 			if (seam.device_logits_scope > 0 && seam.close_failures > 0) {
 				seam.close_failures -= 1;
 				return E_FAIL;  // injected: the list is not closed
+			}
+			if (seam.pool_zero_fill_scope > 0 && seam.pool_zero_fill_close_failures > 0) {
+				seam.pool_zero_fill_close_failures -= 1;
+				return E_FAIL;  // injected (paged KV G3): the pool zero-fill's list is not closed
 			}
 		}
 #endif

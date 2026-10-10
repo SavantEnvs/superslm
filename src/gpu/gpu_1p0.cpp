@@ -46,6 +46,7 @@ static_assert(sizeof(GpuResidencyConfig) == 4 && offsetof(GpuResidencyConfig, fl
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -59,6 +60,8 @@ static_assert(sizeof(GpuResidencyConfig) == 4 && offsetof(GpuResidencyConfig, fl
 #include <vector>
 
 #include "d3d12_harness.h"
+#include "../kv_pages.h"           // paged KV (G3): the page allocator, one module for both backends
+#include "gpu_kv_pool_geometry.h"  // paged KV (G3): the GPU pool's host-only arithmetic
 #include "superslm/adapter_marshal.h"  // T-2113 B6: LoadAdapterArtifact (relocated, tools/sslm_adapter_loader.h)
 #include "superslm/gpu_1p0_g5_bridge.h"  // G5-5 (T-2132): the build-seat-owned schema/parity bridge
 #include "superslm/gpu_port.h"       // T-2113 B2: GpuLayerLayout/ComputeLayerLayout/PackLayerWeightsBytes
@@ -267,12 +270,19 @@ struct SslmGpuModelHandle {
 	uint32_t num_attention_heads = 0;
 	uint32_t intermediate_size = 0;
 	int64_t context_cap = 0;
+	// Paged-KV plan §3.1, step G3: the artifact's kv_block_size, the page geometry's B when it
+	// divides the cap (superslm_gpu::kv_pool::ComputeGpuPageGeometry).
+	uint32_t kv_block_size = 0;
 	bool has_qk_norm = false;
 	uint32_t dispatches_per_layer = superslm_gpu::kLegacyDispatchesPerLayer;
 
 	// ModelHasLiveSequences guard (design Sec9, Sec4.2's own model_unmap row): T-2113 (B3)
 	// incremented by sslm_gpu_seq_create, decremented on release, below.
 	int64_t live_sequences = 0;
+	// Paged KV (G3): GPU page pools created against this model (sslm_gpu_kv_pool_create, destroy).
+	// A pool keeps a `model` pointer for the budgeted create's model check, so unmap refuses while
+	// one lives (SSLM_MODEL_HAS_LIVE_SEQUENCES; the plan names no status for it, noted at G3).
+	int64_t live_pools = 0;
 
 	// T-2113 (design Sec4.2/Sec9, routed `Claude/Curie/t2112-1p0-red-suite-2026-08-15.md` Sec7.2
 	// item 2, D-SLM3417): design Sec9's own Busy row states `sslm_gpu_model_unmap` returns Busy
@@ -469,6 +479,50 @@ struct SslmGpuAdapterHandle {
 	bool destroyed = false;
 };
 
+struct SslmGpuSequenceHandle;
+// Paged-KV plan §4.4 (rev 11, rev 15.2), step G3: the counting accessor, the one writer of a
+// sequence handle's `state`, of the counts that a move into or out of Submitted raises or lowers,
+// and of a pool's `submitted` holder pointer. Defined below the sequence handle.
+void SetGpuSeqState(SslmGpuSequenceHandle* seq, superslm_gpu::SslmSequenceGpuState next,
+                    const SslmGpuAdapterHandle* adapter);
+
+// Paged-KV plan (rev 16.1) §4 items 3 and 4, step G3: the GPU page pool. One DEFAULT-heap UAV of
+// `page_count * page_bytes` bytes, zero-filled once at create (AllocateZeroFillBuffers and
+// ZeroFillResidentUavBufferSync, below); a host mirror of the same size, kept complete by every
+// pooled submission's readback (G24) and the `base` of the `kv_pages` allocator -- which
+// poison-fills a freed dirty page with 0xCD and never zero-fills, so it addresses the mirror and
+// never device memory; the pool-level resume latch every pooled sequence passes (item 4); and the
+// one Submitted pooled holder, a holder pointer written only by SetGpuSeqState (rev 15.2).
+struct SslmGpuKvPoolHandle {
+	SslmGpuContext* ctx = nullptr;
+	SslmGpuModelHandle* model = nullptr;
+	superslm_gpu::kv_pool::GpuPageGeometry geo{};
+	uint32_t page_count = 0;
+	size_t pool_bytes = 0;
+	Microsoft::WRL::ComPtr<ID3D12Resource> pool_buf;
+	std::vector<uint8_t> host_mirror;
+	superslm::kv_pages::PagePool* pages = nullptr;
+	// Item 4: true once a pooled submission's readback left `pool_buf` in COPY_SOURCE; read and
+	// consumed by the next pooled submission's resume barrier, with 1.8.0's restore-on-failure.
+	bool kv_needs_resume_barrier = false;
+	// Sequences drawn from this pool and not yet released; destroy refuses while nonzero.
+	int64_t live_refs = 0;
+
+	SslmGpuKvPoolHandle() = default;
+	SslmGpuKvPoolHandle(const SslmGpuKvPoolHandle&) = delete;
+	SslmGpuKvPoolHandle& operator=(const SslmGpuKvPoolHandle&) = delete;
+	~SslmGpuKvPoolHandle() {
+		if (pages) superslm::kv_pages::PoolDestroy(pages);
+	}
+	// The pooled handle of this pool that is Submitted, or null. No guard reads it (§4 item 4).
+	const SslmGpuSequenceHandle* submitted() const { return submitted_; }
+
+private:
+	friend void SetGpuSeqState(SslmGpuSequenceHandle*, superslm_gpu::SslmSequenceGpuState,
+	                           const SslmGpuAdapterHandle*);
+	SslmGpuSequenceHandle* submitted_ = nullptr;
+};
+
 // T-2113 (B3, design Sec5.3/Sec10 B3): the real SslmGpuSequenceHandle. Owns a
 // **dedicated** DEFAULT-heap K/V buffer, sized to this handle's own `context_cap` at
 // create() time -- this is the direct replacement for `g_resident_kv`'s single
@@ -596,12 +650,126 @@ struct SslmGpuSequenceHandle {
 	std::vector<int8_t> prefill_hidden_codes;
 	bool prefill_hidden_valid = false;
 
+	// Paged-KV plan §4 items 5, 6b and 7, step G3: a POOLED (budgeted) sequence's own state, all
+	// null or zero on a dedicated sequence (sslm_gpu_seq_create, unchanged). `holder` is its
+	// kv_pages page table and reserve over `pool`; `table_buf` its per-sequence DEFAULT-heap table
+	// buffer (ceil(cap / B) * 4 bytes, resting in COMMON), uploaded at the head of the next
+	// submission while `table_dirty` (a page was mapped, or the table emptied, since the last one).
+	// `limit` = min(origin + budget, cap) (§3.4); origin is 0 until G4's prefixes.
+	SslmGpuKvPoolHandle* pool = nullptr;
+	superslm::kv_pages::PageHolder* holder = nullptr;
+	Microsoft::WRL::ComPtr<ID3D12Resource> table_buf;
+	bool table_dirty = false;
+	int32_t budget = 0;
+	int64_t origin = 0;
+	int64_t limit = 0;
+	// Test seams (sslm_gpu_test_only_arm_view_fault / _last_ladder_status): a one-shot fault on the
+	// view the next pooled submission hands the ladder, and the ladder's status for the last
+	// submission (Ok when it was not refused before recording).
+	uint32_t armed_view_fault = 0;
+	superslm::SslmForwardStatus last_ladder_status = superslm::SslmForwardStatus::Ok;
+
+	// SetGpuSeqState's record of which counts its last move to Submitted raised, so the move out
+	// lowers exactly those (§4.4, *Three states*). Written only by the accessor.
+	bool raised_process = false;
+	bool raised_pooled = false;
+	SslmGpuModelHandle* raised_model = nullptr;
+	const SslmGpuAdapterHandle* raised_adapter = nullptr;
+
 	// T-2114 (S2): see SslmGpuModelHandle's own comment on its `destroyed` field
 	// (gpu_1p0.cpp) -- identical disposition here.
 	bool destroyed = false;
 };
 
+// Paged-KV plan §4.4, step G3: the process count of Submitted POOLED handles, beside
+// g_process_wide_submitted_sequences (which counts every Submitted handle). Written only by
+// SetGpuSeqState. (G3-ledger: the guard's pooled scope reads it, EntrySubmitGuard.)
+static std::atomic<int64_t> g_process_wide_submitted_pooled_sequences{0};
+
+// The counting accessor (§4.4 rev 11; rev 15.2 for the pool pointer). A move to Submitted raises
+// the process count, the handle's model's count, the pooled count and the pool's holder pointer
+// for a pooled handle, and the adapter's count for a non-null `adapter` (recorded as the handle's
+// `in_flight_adapter`), and records on the handle which it raised; a move out of Submitted lowers
+// exactly those and clears `in_flight_adapter` and the pool pointer. A move between two
+// non-Submitted states, or Submitted to Submitted, changes no count.
+// G3-ledger: a move out of Submitted re-registers the handle's `in_flight` record under the
+// current outermost call (§4.4 PR11-B1, the boundary token check's registry).
+void SetGpuSeqState(SslmGpuSequenceHandle* seq, superslm_gpu::SslmSequenceGpuState next,
+                    const SslmGpuAdapterHandle* adapter) {
+	using superslm_gpu::SslmSequenceGpuState;
+	const bool was_submitted = seq->state == SslmSequenceGpuState::Submitted;
+	const bool now_submitted = next == SslmSequenceGpuState::Submitted;
+	seq->state = next;
+	if (!was_submitted && now_submitted) {
+		g_process_wide_submitted_sequences += 1;
+		seq->raised_process = true;
+		if (seq->model != nullptr) {
+			seq->model->submitted_sequences += 1;
+			seq->raised_model = seq->model;
+		}
+		if (seq->pool != nullptr) {
+			g_process_wide_submitted_pooled_sequences += 1;
+			seq->raised_pooled = true;
+			// The process scope admits at most one Submitted pooled handle (§4 item 4), so the
+			// pool records no other holder here (a G3 code-review item).
+			assert(seq->pool->submitted_ == nullptr);
+			seq->pool->submitted_ = seq;
+		}
+		seq->in_flight_adapter = adapter;
+		if (adapter != nullptr) {
+			adapter->submitted_sequences += 1;
+			seq->raised_adapter = adapter;
+		}
+	} else if (was_submitted && !now_submitted) {
+		if (seq->raised_process && g_process_wide_submitted_sequences > 0) {
+			g_process_wide_submitted_sequences -= 1;
+		}
+		seq->raised_process = false;
+		if (seq->raised_model != nullptr && seq->raised_model->submitted_sequences > 0) {
+			seq->raised_model->submitted_sequences -= 1;
+		}
+		seq->raised_model = nullptr;
+		if (seq->raised_pooled) {
+			if (g_process_wide_submitted_pooled_sequences > 0) g_process_wide_submitted_pooled_sequences -= 1;
+			if (seq->pool != nullptr && seq->pool->submitted_ == seq) seq->pool->submitted_ = nullptr;
+		}
+		seq->raised_pooled = false;
+		if (seq->raised_adapter != nullptr && seq->raised_adapter->submitted_sequences > 0) {
+			seq->raised_adapter->submitted_sequences -= 1;
+		}
+		seq->raised_adapter = nullptr;
+		seq->in_flight_adapter = nullptr;
+	}
+}
+
 namespace {
+
+// Paged KV (G3): the host buffer a sequence's K/V view addresses -- the pool's mirror for a pooled
+// sequence, its own dedicated mirror otherwise -- and its size.
+uint8_t* KvHostBase(SslmGpuSequenceHandle* seq) {
+	return seq->pool != nullptr ? seq->pool->host_mirror.data() : seq->host_kv_mirror.data();
+}
+size_t KvHostBytes(const SslmGpuSequenceHandle* seq) {
+	return seq->pool != nullptr ? seq->pool->host_mirror.size() : seq->host_kv_mirror.size();
+}
+
+// Paged KV (G3, §3.6's hot-path map): maps a pooled holder's pages through row `rows - 1` (clamped
+// to the cap), from its own reserve, marking the table dirty when it maps one. No pool mutex, no
+// allocation. SSLM_GPU_KV_POOL_EXHAUSTED for an empty reserve below the limit (unreachable by §3.4).
+SslmGpuStatus MapPooledPagesThrough(SslmGpuSequenceHandle* seq, int64_t rows) {
+	if (seq->pool == nullptr || seq->holder == nullptr) return SSLM_OK;
+	if (rows > seq->context_cap) rows = seq->context_cap;
+	const uint32_t need = superslm_gpu::kv_pool::PagesToCover(rows, seq->pool->geo.page_positions);
+	while (superslm::kv_pages::HolderMapped(seq->holder) < need) {
+		const superslm::kv_pages::PageStatus ps = superslm::kv_pages::HolderMapNext(seq->holder);
+		if (ps != superslm::kv_pages::PageStatus::kOk) {
+			return ps == superslm::kv_pages::PageStatus::kExhausted ? SSLM_GPU_KV_POOL_EXHAUSTED
+			                                                        : SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+		}
+		seq->table_dirty = true;
+	}
+	return SSLM_OK;
+}
 
 // T-2113 (B2): synchronous single-buffer resident upload -- UPLOAD-heap temporary -> a
 // fresh DEFAULT-heap copy, one command list, one submit, one fence wait. This is the same
@@ -685,6 +853,98 @@ Microsoft::WRL::ComPtr<ID3D12Resource> UploadResidentUavBufferSync(superslm_gpu:
                                                                     const void* data, size_t bytes) {
 	return UploadResidentBufferSyncTo(dev, data, bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
 	                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Paged-KV plan (rev 16.1) §4 item 3 (rev 15, rev 15.1), step G3: the pool's zero-fill, beside the
+// upload primitive above and in its two phases, split into two functions so the boundary between
+// them is the call, not a marker.
+// ---------------------------------------------------------------------------------------------
+
+// What phase A allocates and phase B uses: the UPLOAD staging buffer (min(bytes, 64 MiB), zeroed
+// in place) and the pool's DEFAULT buffer (created in COPY_DEST).
+struct ZeroFillBuffers {
+	Microsoft::WRL::ComPtr<ID3D12Resource> staging;
+	Microsoft::WRL::ComPtr<ID3D12Resource> resident;
+	uint64_t bytes = 0;
+};
+
+// Phase A. Records and resets nothing, so the list stays Closed whatever throws here (no rule-0
+// cause exists in it): one UPLOAD staging buffer of min(bytes, 64 MiB) -- never a full-size one,
+// and no host zero source -- mapped and zeroed in place, then the pool's DEFAULT buffer. Both
+// buffers go through Device::MakeBuffer, so through TryMakeBuffer and SSLM_GPU_HR, which logs a
+// failing HRESULT with its file and line. The caller maps every throw from here as one block.
+ZeroFillBuffers AllocateZeroFillBuffers(superslm_gpu::harness::Device& dev, uint64_t bytes) {
+	ZeroFillBuffers b;
+	b.bytes = bytes;
+	const uint64_t staging_bytes = superslm_gpu::kv_pool::ZeroFillStagingBytes(bytes);
+	b.staging = dev.MakeBuffer(staging_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+	                           D3D12_RESOURCE_STATE_GENERIC_READ);
+	void* mapped = nullptr;
+	D3D12_RANGE none{0, 0};
+	SSLM_GPU_HR(b.staging->Map(0, &none, &mapped));
+	std::memset(mapped, 0, static_cast<size_t>(staging_bytes));
+	b.staging->Unmap(0, nullptr);
+	b.resident = dev.MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+	                            D3D12_RESOURCE_STATE_COPY_DEST);
+	return b;
+}
+
+// Test builds only: marks phase B's run for the zero-fill Close seam
+// (ArmGpuPoolZeroFillCloseFaultForTest). A no-op in product builds.
+class PoolZeroFillSeamScope {
+public:
+	PoolZeroFillSeamScope() {
+#if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION)
+		superslm_gpu::harness::GpuTestSeamState& seam = superslm_gpu::harness::TestSeamState();
+		std::lock_guard<std::mutex> lock(seam.mutex);
+		seam.pool_zero_fill_scope += 1;
+#endif
+	}
+	~PoolZeroFillSeamScope() {
+#if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION)
+		superslm_gpu::harness::GpuTestSeamState& seam = superslm_gpu::harness::TestSeamState();
+		std::lock_guard<std::mutex> lock(seam.mutex);
+		seam.pool_zero_fill_scope -= 1;
+#endif
+	}
+	PoolZeroFillSeamScope(const PoolZeroFillSeamScope&) = delete;
+	PoolZeroFillSeamScope& operator=(const PoolZeroFillSeamScope&) = delete;
+};
+
+// Phase B: one reset and one submission on the per-context device, waited before it returns.
+// Records ceil(bytes / 64 MiB) CopyBufferRegion calls from the staging buffer, each chunk computed
+// in place, then one barrier to UNORDERED_ACCESS (the state a pooled submission's first bind
+// expects, as UploadResidentUavBufferSync leaves a dedicated buffer). INVARIANT (§4 item 3, rev
+// 15.1): nothing between the list's Reset and CloseListOrThrow allocates or throws -- the window
+// holds only the copies and the barrier, so a throw the caller classifies always comes from a
+// reset (list still Closed), from CloseListOrThrow (which has confirmed the list's state) or from
+// the submission tail. Throws as UploadResidentBufferSyncTo does.
+void ZeroFillResidentUavBufferSync(superslm_gpu::harness::Device& dev, const ZeroFillBuffers& b) {
+	PoolZeroFillSeamScope seam_scope;
+	// G3-ledger: BeginRecording() -- the reset below moves onto the ledger with PoolSubmitAssert.
+	SSLM_GPU_HR(dev.alloc->Reset());
+	SSLM_GPU_HR(dev.list->Reset(dev.alloc.Get(), nullptr));
+	// ---- no allocation and no throw from here to CloseListOrThrow ----
+	const uint64_t chunks = superslm_gpu::kv_pool::ZeroFillChunkCount(b.bytes);
+	for (uint64_t i = 0; i < chunks; ++i) {
+		uint64_t offset = 0, len = 0;
+		superslm_gpu::kv_pool::ZeroFillChunk(b.bytes, i, &offset, &len);
+		dev.list->CopyBufferRegion(b.resident.Get(), offset, b.staging.Get(), 0, len);
+	}
+	D3D12_RESOURCE_BARRIER barrier{};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource = b.resident.Get();
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	dev.list->ResourceBarrier(1, &barrier);
+	dev.CloseListOrThrow();
+	// ---- end of the recording window ----
+	// G3-ledger: Submit() and Wait(v) -- the execute, Signal and wait below move onto the ledger.
+	ID3D12CommandList* lists[] = {dev.list.Get()};
+	dev.queue->ExecuteCommandLists(1, lists);
+	dev.SignalAndWaitOrStrand();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1265,6 +1525,7 @@ SslmGpuStatus sslm_gpu_model_mapImpl(SslmGpuContext* ctx, const SslmModelView* b
 	h->num_attention_heads = NQH;
 	h->intermediate_size = I;
 	h->context_cap = static_cast<int64_t>(base->config.context_cap);
+	h->kv_block_size = base->config.kv_block_size;
 	h->has_qk_norm = has_qk_norm;
 	h->dispatches_per_layer = superslm_gpu::DispatchesPerLayer(has_qk_norm);
 
@@ -1314,6 +1575,11 @@ SslmGpuStatus sslm_gpu_model_unmapImpl(SslmGpuContext* ctx, SslmGpuModelHandle* 
 		return SSLM_BUSY;  // design Sec9's own Busy-precedence, D-SLM3417.
 	}
 	if (model->live_sequences > 0) {
+		return SSLM_MODEL_HAS_LIVE_SEQUENCES;
+	}
+	// Paged KV (G3): a GPU page pool of this model still lives. The plan states no status for it;
+	// a pool is where this model's pooled sequences live, so the live-sequences status is reused.
+	if (model->live_pools > 0) {
 		return SSLM_MODEL_HAS_LIVE_SEQUENCES;
 	}
 	// T-2243 (M2, design plan Sec6.1/Sec10 Phase 2 M2, D-SLM3965): an adapter handle retains a
@@ -1811,6 +2077,21 @@ SslmGpuStatus sslm_gpu_seq_releaseImpl(SslmGpuContext* ctx, SslmGpuSequenceHandl
 	if (!superslm_gpu::CallProceedsOrBusy_SeqRelease(is_submitted)) {
 		return SSLM_BUSY;
 	}
+	// Paged-KV plan §4 item 6b, step G3: a pooled sequence's release touches only its own table and
+	// reserve (its pages back to the pool, a freed dirty page poisoned in the pool's host mirror by
+	// kv_pages) and fills nothing, so no neighbour's rows change. The holder is released before any
+	// count moves, so a refusal leaves the handle as it was.
+	if (seq->pool != nullptr) {
+		if (seq->holder != nullptr) {
+			const superslm::kv_pages::PageStatus ps = superslm::kv_pages::HolderRelease(seq->holder);
+			if (ps != superslm::kv_pages::PageStatus::kOk) {
+				return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;  // a refcount underflow (cell 11.3's class)
+			}
+			seq->holder = nullptr;
+		}
+		if (seq->pool->live_refs > 0) seq->pool->live_refs -= 1;
+		seq->pool = nullptr;
+	}
 	if (seq->model && seq->model->live_sequences > 0) {
 		seq->model->live_sequences -= 1;
 	}
@@ -1827,6 +2108,186 @@ SslmGpuStatus sslm_gpu_seq_releaseImpl(SslmGpuContext* ctx, SslmGpuSequenceHandl
 	}
 	seq->destroyed = true;
 	delete seq;
+	return SSLM_OK;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Paged-KV plan (rev 16.1) §4 items 3 and 7, step G3: the GPU page pool and budgeted sequences.
+// -------------------------------------------------------------------------------------------------
+
+// §4 item 3. Refusals in order: a null out-handle; a context, model or model-of-another-context
+// mismatch; a zero page count or a model with no page geometry (SSLM_SEQUENCE_KV_BUFFER_MISMATCH,
+// the handle-mismatch status, with a null out-handle); page_count * page_bytes above 2^32
+// (SSLM_GPU_KV_POOL_TOO_LARGE, before anything is allocated); SSLM_BUSY while any sequence in the
+// process is Submitted (the create submits its zero-fill). Then phase A as one block -- the handle,
+// the host mirror, the kv_pages allocator and AllocateZeroFillBuffers -- where any exception asks
+// rule 1 first (a removed device: SSLM_DEVICE_LOST, whatever the HRESULT) and is otherwise
+// SSLM_GPU_ALLOCATION_FAILED (§4 item 3's stated choice); and phase B,
+// ZeroFillResidentUavBufferSync, under 1.8.0's classifier (ClassifyHandleFault): a list not
+// confirmed Closed or a failed Signal or wait is rule 0, SSLM_DEVICE_LOST, terminal.
+SslmGpuStatus sslm_gpu_kv_pool_createImpl(SslmGpuContext* ctx, SslmGpuModelHandle* model, uint32_t page_count,
+                                          SslmGpuKvPoolHandle** out_pool) {
+	if (!out_pool) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	*out_pool = nullptr;
+	if (!ctx || !model || model->ctx != ctx) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (page_count == 0) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	const superslm_gpu::kv_pool::GpuPageGeometry geo = superslm_gpu::kv_pool::ComputeGpuPageGeometry(
+	    model->num_hidden_layers, model->num_key_value_heads, model->head_dim, model->context_cap,
+	    model->kv_block_size);
+	if (!geo.ok) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (superslm_gpu::kv_pool::PoolBytesTooLarge(page_count, geo.page_bytes)) return SSLM_GPU_KV_POOL_TOO_LARGE;
+	// G3-ledger: EntrySubmitGuard. The create submits (its zero-fill), so it is a guarded row of
+	// §4.4's derived table: SSLM_BUSY, changing nothing, while any sequence in the process is
+	// Submitted. Written here against today's process count.
+	if (g_process_wide_submitted_sequences > 0) return SSLM_BUSY;
+	const uint64_t bytes = static_cast<uint64_t>(page_count) * static_cast<uint64_t>(geo.page_bytes);
+
+	std::unique_ptr<SslmGpuKvPoolHandle> h;
+	ZeroFillBuffers fill;
+	// Phase A, one block (§4 item 3, rev 15.1): every allocation and Map before the first reset.
+	bool phase_a_failed = false;
+	bool host_failure = false;
+	try {
+		h.reset(new SslmGpuKvPoolHandle());
+		h->host_mirror.assign(static_cast<size_t>(bytes), 0);
+		const superslm::kv_pages::PageStatus ps = superslm::kv_pages::PoolCreate(
+		    h->host_mirror.data(), page_count, geo.page_bytes, geo.page_positions, &h->pages);
+		if (ps != superslm::kv_pages::PageStatus::kOk) throw std::bad_alloc();  // kAllocationFailed
+		fill = AllocateZeroFillBuffers(ctx->device, bytes);
+	} catch (const std::bad_alloc&) {
+		phase_a_failed = true;
+		host_failure = true;
+	} catch (const std::length_error&) {
+		phase_a_failed = true;
+		host_failure = true;
+	} catch (...) {
+		phase_a_failed = true;  // a D3D12 failure, already logged by SSLM_GPU_HR with its HRESULT
+	}
+	if (phase_a_failed) {
+		if (host_failure) {
+			std::fprintf(stderr, "superslm_gpu: sslm_gpu_kv_pool_create: host allocation for %u pages (%llu bytes) failed\n",
+			             page_count, static_cast<unsigned long long>(bytes));
+		}
+		return MapDeviceReportedRemoved(ctx->device) ? SSLM_DEVICE_LOST : SSLM_GPU_ALLOCATION_FAILED;
+	}
+	// Phase B: the one reset and submission.
+	try {
+		ZeroFillResidentUavBufferSync(ctx->device, fill);
+	} catch (...) {
+		return ClassifyHandleFault(&ctx->device);
+	}
+	h->ctx = ctx;
+	h->model = model;
+	h->geo = geo;
+	h->page_count = page_count;
+	h->pool_bytes = static_cast<size_t>(bytes);
+	h->pool_buf = fill.resident;
+	h->kv_needs_resume_barrier = false;  // left in UNORDERED_ACCESS by the zero-fill's barrier
+	ctx->live_handles += 1;
+	model->live_pools += 1;
+	*out_pool = h.release();
+	return SSLM_OK;
+}
+
+// The plan leaves pool destroy with live handles unstated (§4 item 3; gpu_1p0.h's G3 note). The
+// CPU twin refuses (SSLM_POOL_HAS_LIVE_HANDLES); the GPU enum has no such status, so the closest,
+// SSLM_MODEL_HAS_LIVE_SEQUENCES, is returned while any sequence drawn from the pool lives, and the
+// pool is not destroyed. A null pool is a no-op (as every GPU destroy); a pool of another context
+// is SSLM_SEQUENCE_KV_BUFFER_MISMATCH.
+SslmGpuStatus sslm_gpu_kv_pool_destroyImpl(SslmGpuContext* ctx, SslmGpuKvPoolHandle* pool) {
+	if (!pool) return SSLM_OK;
+	if (pool->ctx != ctx) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (pool->live_refs > 0) return SSLM_MODEL_HAS_LIVE_SEQUENCES;
+	if (pool->model && pool->model->live_pools > 0) pool->model->live_pools -= 1;
+	if (pool->ctx->live_handles > 0) pool->ctx->live_handles -= 1;
+	delete pool;
+	return SSLM_OK;
+}
+
+// §4 item 7: the budgeted create, §3.4's mirror. Every refusal comes before anything is drawn:
+// a null out-handle; a context, model or pool mismatch (a model or pool of another context, a pool
+// of another model) and a budget outside [1, cap], each SSLM_SEQUENCE_KV_BUFFER_MISMATCH; then the
+// draw of R(budget) pages, SSLM_GPU_KV_POOL_EXHAUSTED with nothing drawn. The table buffer is then
+// allocated on the context's device (no submission: it is filled at the head of the sequence's
+// first submission, §4 item 5); a failure there returns the draw and is classified as every
+// handle create's (ClassifyHandleFault). Submits nothing, so it is not refused Busy.
+SslmGpuStatus sslm_gpu_seq_create_budgetedImpl(SslmGpuContext* ctx, SslmGpuModelHandle* model, SslmGpuKvPoolHandle* pool,
+                                               int32_t budget, SslmGpuSequenceHandle** out_seq) {
+	if (!out_seq) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	*out_seq = nullptr;
+	if (!ctx || !model || !pool || model->ctx != ctx || pool->ctx != ctx || pool->model != model) {
+		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	}
+	if (!superslm_gpu::kv_pool::BudgetInDomain(budget, model->context_cap)) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	const uint32_t reserve = superslm_gpu::kv_pool::ReservationPages(budget, pool->geo, model->context_cap);
+
+	std::unique_ptr<SslmGpuSequenceHandle> h(new SslmGpuSequenceHandle());
+	h->hidden_codes.assign(model->hidden_size, 0);
+	h->prefill_hidden_codes.assign(model->hidden_size, 0);
+	superslm::kv_pages::PageHolder* holder = nullptr;
+	const superslm::kv_pages::PageStatus ps =
+	    superslm::kv_pages::HolderCreate(pool->pages, pool->geo.cap_pages, reserve, &holder);
+	if (ps == superslm::kv_pages::PageStatus::kExhausted) return SSLM_GPU_KV_POOL_EXHAUSTED;
+	if (ps == superslm::kv_pages::PageStatus::kAllocationFailed) return SSLM_GPU_ALLOCATION_FAILED;
+	if (ps != superslm::kv_pages::PageStatus::kOk) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	try {
+		h->table_buf = ctx->device.MakeBuffer(static_cast<UINT64>(pool->geo.cap_pages) * sizeof(uint32_t),
+		                                      D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+		                                      D3D12_RESOURCE_STATE_COMMON);
+	} catch (...) {
+		superslm::kv_pages::HolderRelease(holder);
+		return ClassifyHandleFault(&ctx->device);
+	}
+	h->ctx = ctx;
+	h->model = model;
+	h->pool = pool;
+	h->holder = holder;
+	h->table_dirty = true;
+	h->budget = budget;
+	h->origin = 0;
+	h->limit = superslm_gpu::kv_pool::HolderLimit(0, budget, model->context_cap);
+	h->context_cap = model->context_cap;
+	h->kv_bytes = 0;  // no dedicated buffer: K/V live in the pool
+	h->kv_needs_resume_barrier = false;  // unused: a pooled sequence passes the pool's latch
+	h->prefill_hidden_valid = false;
+	h->hidden_scale = superslm::CarriedScale{};
+	h->layer_index = 0;
+	h->kv_saturation_count = 0;
+	h->context_length = 0;
+	h->bind_eligible = true;
+	h->state = superslm_gpu::SslmSequenceGpuState::Idle;
+	h->live_state.hidden_codes = h->hidden_codes.data();
+	pool->live_refs += 1;
+	model->live_sequences += 1;
+	ctx->live_handles += 1;
+	*out_seq = h.release();
+	return SSLM_OK;
+}
+
+// §4 item 9: a diagnostic no verdict reads. Read under the pool mutex (kv_pages::PoolCounts).
+SslmGpuStatus sslm_gpu_kv_pool_statsImpl(const SslmGpuKvPoolHandle* pool, SslmGpuKvPoolStats* out) {
+	if (!pool || !out || !pool->pages) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (out->struct_size != sizeof(SslmGpuKvPoolStats)) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	uint32_t free_pages = 0, shared = 0;
+	superslm::kv_pages::PoolCounts(pool->pages, &free_pages, &shared);
+	out->page_count = pool->page_count;
+	out->free_pages = free_pages;
+	out->shared_pages = shared;
+	out->page_positions = pool->geo.page_positions;
+	return SSLM_OK;
+}
+
+// §4 item 9: the GPU twin of the CPU page peek, bounds-checked against hostile arguments (the
+// offset and length checked without forming offset + len).
+SslmGpuStatus sslm_gpu_test_only_peek_pool_mirror_bytesImpl(const SslmGpuKvPoolHandle* pool, uint32_t page,
+                                                             size_t offset, size_t len, uint8_t* out) {
+	if (!pool || (!out && len != 0)) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (page >= pool->page_count) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	const size_t page_bytes = pool->geo.page_bytes;
+	if (offset > page_bytes || len > page_bytes - offset) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (len != 0) {
+		std::memcpy(out, pool->host_mirror.data() + static_cast<size_t>(page) * page_bytes + offset, len);
+	}
 	return SSLM_OK;
 }
 
@@ -2060,6 +2521,41 @@ SslmGpuStatus SubmitOneSequenceDecode(SslmGpuContext* ctx, SslmGpuSequenceHandle
 	            // identical shape `sslm_decode_step_gpu`'s own pre-B7 body already had.
 	SslmGpuModelHandle* model = seq->model;
 
+	// Paged-KV plan §3.4 / §4 item 7, step G3: a pooled holder's budget check, beside the cap
+	// check (the ladder's KvCapacityExhausted), before any state moves. It fires only below the cap
+	// (limit < cap), so a holder whose limit is the cap sees exactly the dedicated twin's status. The
+	// single call and every batch slot share it here, so the batch reports it per sequence with the
+	// cap check's batch behaviour.
+	superslm_gpu::GpuPagedKvBinding paged{};
+	const superslm_gpu::GpuPagedKvBinding* paged_ptr = nullptr;
+	if (seq->pool != nullptr) {
+		if (seq->limit < seq->context_cap && seq->context_length >= seq->limit) {
+			return SSLM_GPU_KV_BUDGET_EXCEEDED;
+		}
+		// The hot-path map (§3.6): the page this token's row lands in, from the holder's own
+		// reserve, while the handle is Idle (§4 item 5). No pool mutex, no allocation. At or past
+		// the cap nothing is mapped and the ladder's cap guard refuses as for a dedicated holder.
+		if (seq->context_length >= 0 && seq->context_length < seq->context_cap) {
+			const SslmGpuStatus map_st = MapPooledPagesThrough(seq, seq->context_length + 1);
+			if (map_st != SSLM_OK) return map_st;
+		}
+		paged.view = superslm::KvPageView{seq->pool->host_mirror.data(), seq->holder->table.get(),
+		                                  superslm::kv_pages::HolderMapped(seq->holder),
+		                                  seq->pool->geo.page_positions, seq->pool->geo.page_bytes};
+		paged.table_resident = seq->table_buf.Get();
+		paged.upload_table = seq->table_dirty;
+		// sslm_gpu_test_only_arm_view_fault: one shot, on this submission's view only.
+		switch (seq->armed_view_fault) {
+			case 1: paged.view.mapped_pages = paged.view.mapped_pages > 0 ? paged.view.mapped_pages - 1 : 0; break;
+			case 2: paged.view.page_bytes = paged.view.page_bytes > 0 ? paged.view.page_bytes - 1 : 0; break;
+			case 3: paged.view.pool_base = nullptr; break;
+			case 4: paged.view.page_positions = int64_t{1} << 61; break;
+			default: break;
+		}
+		seq->armed_view_fault = 0;
+		paged_ptr = &paged;
+	}
+
 	// Sync the handle's own canonical scalar fields into `live_state` (its own `hidden_codes`
 	// pointer was set once, at sslm_gpu_seq_create, and needs no per-call refresh).
 	seq->live_state.hidden_scale = seq->hidden_scale;
@@ -2097,31 +2593,22 @@ SslmGpuStatus SubmitOneSequenceDecode(SslmGpuContext* ctx, SslmGpuSequenceHandle
 	    model->rope_cos_elem_count, model->rope_sin_elem_count, adapter_bridge_ptr,
 	    /*q_width=*/static_cast<size_t>(model->num_attention_heads) * model->head_dim,
 	    /*out_q_codes=*/nullptr, /*out_q_codes_capacity=*/0, model_generation,
-	    model->has_qk_norm);
+	    model->has_qk_norm, paged_ptr);
+	seq->last_ladder_status = inflight ? superslm::SslmForwardStatus::Ok : submit_status;
 
 	if (!inflight) {
 		// Rejected before submission (a guard, or an exception) -- seq/host state untouched,
-		// still Idle, exactly RunLayerLoopGpu's own existing contract.
+		// still Idle, exactly RunLayerLoopGpu's own existing contract. A pooled holder keeps its
+		// table dirty, so its next submission uploads it.
 		return MapSubmitRejectionToGpuStatus(submit_status);
 	}
+	if (seq->pool != nullptr) seq->table_dirty = false;  // this submission's head uploaded it
 	seq->in_flight = inflight;
-	seq->state = superslm_gpu::SslmSequenceGpuState::Submitted;
-	// T-2113 (design Sec4.2/Sec9, D-SLM3417): model's own Busy-precedence count -- see
-	// SslmGpuModelHandle::submitted_sequences' own field comment, above.
-	model->submitted_sequences += 1;
-	// T-2243 review finding 2 (D-SLM4113): the process-global twin of the per-model count just
-	// above -- see g_process_wide_submitted_sequences' own comment.
-	g_process_wide_submitted_sequences += 1;
-	// T-2124 (D-SLM3446 P0-3): the adapter-handle analogue of the line above -- see
-	// SslmGpuAdapterHandle::submitted_sequences' own field comment. `seq->in_flight_adapter`
-	// remembers which adapter (if any) this in-flight submission bound, so sslm_gpu_ready knows
-	// which adapter's count to decrement once this sequence collapses back to Idle -- the adapter
-	// binding is a per-call argument, not state this function's own caller otherwise retains on
-	// `seq`.
-	seq->in_flight_adapter = adapter_or_null;
-	if (adapter_or_null != nullptr) {
-		adapter_or_null->submitted_sequences += 1;
-	}
+	// T-2113 (design Sec4.2/Sec9, D-SLM3417), T-2243 review finding 2 (D-SLM4113) and T-2124
+	// (D-SLM3446 P0-3): the model's, the process's and the adapter's counts, and the pooled count
+	// and the pool's holder pointer for a pooled handle, raised by the counting accessor (G3, §4.4),
+	// which also records `in_flight_adapter` for sslm_gpu_ready's lowering.
+	SetGpuSeqState(seq, superslm_gpu::SslmSequenceGpuState::Submitted, adapter_or_null);
 	return SSLM_OK;
 }
 }  // namespace
@@ -2166,6 +2653,13 @@ SslmGpuStatus sslm_decode_step_gpuImpl(SslmGpuContext* ctx, SslmGpuSequenceHandl
 	const bool is_submitted = seq->state == superslm_gpu::SslmSequenceGpuState::Submitted;
 	if (!superslm_gpu::CallProceedsOrBusy_DecodeStepGpu(is_submitted)) {
 		return SSLM_BUSY;  // design Sec4.2's own state table, unchanged policy.
+	}
+	if (seq->pool != nullptr && g_process_wide_submitted_sequences > 0) {
+		// G3-ledger: EntrySubmitGuard. Paged-KV plan §4 item 4 (rev 5: the process scope): a
+		// submitting call on a pooled holder returns SSLM_BUSY while any sequence in the process
+		// is Submitted, before any state changes, so the pool latch's precondition holds. Written
+		// against today's process count, for pooled holders only, until the ledger's guard lands.
+		return SSLM_BUSY;
 	}
 
 	SslmGpuModelHandle* model = seq->model;
@@ -2296,6 +2790,11 @@ SslmGpuStatus sslm_decode_step_batch_gpuImpl(SslmGpuContext* ctx, SslmGpuSequenc
 			out_statuses[i] = SSLM_BUSY;
 			continue;
 		}
+		if (seq->pool != nullptr && g_process_wide_submitted_sequences > 0) {
+			// G3-ledger: EntrySubmitGuard (as sslm_decode_step_gpu's pooled interim guard).
+			out_statuses[i] = SSLM_BUSY;
+			continue;
+		}
 		seq->bind_eligible = false;
 
 		// Design Sec7: "dispatch_budget is consumed by sequences strictly in the recording
@@ -2418,7 +2917,7 @@ SslmGpuStatus sslm_gpu_readyImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq
 
 	int32_t ready = 0;
 	const superslm::SslmForwardStatus decoded = superslm_gpu::RunLayerLoopGpuFinish(
-	    seq->in_flight, seq->live_state, seq->host_kv_mirror.data(), block, &ready);
+	    seq->in_flight, seq->live_state, KvHostBase(seq), block, &ready);
 	if (!ready) {
 		// T-2243 (O2, Mendeleev F-5, plan Sec10 Phase 2 O2): RunLayerLoopGpuFinish's own
 		// `!inflight` guard is now unreachable from here (checked above) -- this branch only
@@ -2441,26 +2940,12 @@ SslmGpuStatus sslm_gpu_readyImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq
 	// call, design Sec4.2's own contract, and copy the decoded result back into this
 	// handle's own canonical fields.
 	seq->in_flight = nullptr;  // RunLayerLoopGpuFinish already freed the token on this path
-	seq->state = superslm_gpu::SslmSequenceGpuState::Idle;
-	// T-2113 (design Sec4.2/Sec9, D-SLM3417): the model's own Busy-precedence count -- the
-	// symmetric twin of SubmitOneSequenceDecode's own increment, above.
-	if (seq->model && seq->model->submitted_sequences > 0) {
-		seq->model->submitted_sequences -= 1;
-	}
-	// T-2243 review finding 2 (D-SLM4113): the process-global twin of the per-model decrement
-	// just above -- see g_process_wide_submitted_sequences' own comment.
-	if (g_process_wide_submitted_sequences > 0) {
-		g_process_wide_submitted_sequences -= 1;
-	}
-	// T-2124 (D-SLM3446 P0-3): the adapter-handle analogue -- the symmetric twin of
-	// SubmitOneSequenceDecode's own `adapter_or_null->submitted_sequences += 1` above. The fence
-	// has now signaled (this is only reached once `ready` is true), so the GPU is provably done
-	// reading the adapter's own lora_ab_buf/fold_buf for this submission -- safe for
-	// sslm_gpu_adapter_unmap to proceed once this count reaches zero.
-	if (seq->in_flight_adapter && seq->in_flight_adapter->submitted_sequences > 0) {
-		seq->in_flight_adapter->submitted_sequences -= 1;
-	}
-	seq->in_flight_adapter = nullptr;
+	// T-2113 (D-SLM3417), T-2243 review finding 2 (D-SLM4113), T-2124 (D-SLM3446 P0-3): the move
+	// out of Submitted lowers exactly the counts the submission raised -- the model's, the
+	// process's, the adapter's (the fence has signaled, so the GPU is done reading the adapter's
+	// buffers) and, for a pooled handle, the pooled count and the pool's holder pointer -- through
+	// the counting accessor (G3, §4.4).
+	SetGpuSeqState(seq, superslm_gpu::SslmSequenceGpuState::Idle, nullptr);
 	seq->hidden_scale = seq->live_state.hidden_scale;
 	seq->layer_index = seq->live_state.layer_index;
 	seq->kv_saturation_count = seq->live_state.kv_saturation_count;
@@ -2487,6 +2972,9 @@ SslmGpuStatus sslm_gpu_seq_saveImpl(SslmGpuContext* ctx, const SslmGpuSequenceHa
 	if (!superslm_gpu::CallProceedsOrBusy_SeqSave(is_submitted)) {
 		return SSLM_BUSY;  // design Sec4.2's own state table, unchanged policy.
 	}
+	// Paged KV (G3): a pooled sequence saves 'SLM6' (§4 item 10), which lands at G5. Until then
+	// its save is refused, never written as an 'SLM5' blob of the whole pool's mirror.
+	if (seq->pool != nullptr) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	// T-2114 (C1): hidden_codes_size = seq->hidden_codes.size() -- the 1.0 handle owns this
 	// vector (design Sec5.3), so the residual stream now round-trips through the blob
 	// alongside the K/V workspace bytes, closing the class of loss a restored, non-zero
@@ -2762,7 +3250,19 @@ SslmGpuStatus sslm_gpu_seq_resetImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle*
 	seq->live_state.rope_q_saturation_count = 0;
 	seq->live_state.rope_k_saturation_count = 0;
 	seq->live_state.context_length = 0;
-	std::fill(seq->host_kv_mirror.begin(), seq->host_kv_mirror.end(), 0);
+	if (seq->pool != nullptr) {
+		// Paged-KV plan §4 item 6b, step G3: the mirror is the POOL's, so the dedicated fill below
+		// would erase every neighbour's rows. A pooled reset touches only its own table and reserve
+		// (its pages back to its reserve, kv_pages) and fills nothing; no read goes past a holder's
+		// live width, so stale rows are never observed. The table changed, so it is re-uploaded.
+		if (seq->holder != nullptr) {
+			const superslm::kv_pages::PageStatus ps = superslm::kv_pages::HolderUnmapAll(seq->holder);
+			if (ps != superslm::kv_pages::PageStatus::kOk) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+		}
+		seq->table_dirty = true;
+	} else {
+		std::fill(seq->host_kv_mirror.begin(), seq->host_kv_mirror.end(), 0);
+	}
 	// G5-5 (T-2132, Brunel): mirrors `sslm_seq_reset`'s own extension (design Sec5,
 	// src/sslm_abi.cpp) -- reset clears the DFA-walk-state back to the bound schema's own start
 	// state (0) but PRESERVES the schema binding itself (`bound_schema_index` untouched); a
@@ -2786,10 +3286,13 @@ SslmGpuStatus sslm_gpu_seq_resetImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle*
 // still calls them, and retiring that tool is not part of this section's own scope.
 // Every NEW caller (the B5 smoke tool, the red suite) drives the real API instead.
 ID3D12Resource* SslmGpuSeqHandleKvBufferForBench(SslmGpuSequenceHandle* seq) {
-	return seq ? seq->kv_buf.Get() : nullptr;
+	if (!seq) return nullptr;
+	return seq->pool != nullptr ? seq->pool->pool_buf.Get() : seq->kv_buf.Get();  // G3: the pool's
 }
+// G3 (§9's G3 row): the latch the handle passes -- the pool's for a pooled handle.
 bool* SslmGpuSeqHandleKvResumeFlagForBench(SslmGpuSequenceHandle* seq) {
-	return seq ? &seq->kv_needs_resume_barrier : nullptr;
+	if (!seq) return nullptr;
+	return seq->pool != nullptr ? &seq->pool->kv_needs_resume_barrier : &seq->kv_needs_resume_barrier;
 }
 int8_t* SslmGpuSeqHandleHiddenCodesForBench(SslmGpuSequenceHandle* seq) {
 	return seq ? seq->hidden_codes.data() : nullptr;
@@ -2843,7 +3346,9 @@ const SslmGpuAdapterHandle* const* SslmGpuSequenceHandleBoundAdapterForBench(Ssl
 // reasoning).
 void SslmGpuSeqForceSubmittedNoInflightForBench(SslmGpuSequenceHandle* seq) {
 	if (!seq) return;
-	seq->state = superslm_gpu::SslmSequenceGpuState::Submitted;
+	// G3 (§4.4 rev 11): through the counting accessor, so its counts are raised (and left raised:
+	// the forced state is never left, by design of the cell that uses it).
+	SetGpuSeqState(seq, superslm_gpu::SslmSequenceGpuState::Submitted, nullptr);
 	seq->in_flight = nullptr;
 }
 
@@ -3143,7 +3648,9 @@ namespace {
 // Sec5.1/Sec8, D-SLM3590/3595/3611-3613/3619-3622/3631-3634): the cause a chunk's own admission
 // count is attributable to, resolved once per call by the pre-scan below -- reused by both G5
 // bridge functions' own cause-routed return (Sec5's table).
-enum class ChunkAdmissionCause { kNone, kDfa, kEmbed, kPositionCap };
+// Paged KV (G3): kBudget is kPositionCap's twin for a pooled holder whose limit (§3.4) is below
+// the cap -- the position term stopped at the limit, not the cap (SSLM_GPU_KV_BUDGET_EXCEEDED).
+enum class ChunkAdmissionCause { kNone, kDfa, kEmbed, kPositionCap, kBudget };
 
 // Host-side sequential pre-scan (design Sec5), run to completion over the intended chunk before
 // any dispatch is recorded. `dfa_entry` is null for the prompt twin (no reachability check --
@@ -3176,13 +3683,16 @@ struct ChunkPreScanResult {
 ChunkPreScanResult RunChunkAdmissionPreScan(SslmGpuModelHandle* model, int64_t chunk_open_ctxlen,
                                              int64_t context_cap, const int32_t* tokens,
                                              int32_t chunk_len, const superslm::SchemaEntry* dfa_entry,
-                                             uint32_t dfa_walk_state_start) {
+                                             uint32_t dfa_walk_state_start, int64_t limit) {
 	ChunkPreScanResult r;
 	const uint32_t n = static_cast<uint32_t>(chunk_len);
 
 	// D-SLM3613: position_admit_count, O(1) -- position advances by exactly 1 per token, so no
-	// per-token loop is needed (design Sec5).
-	int64_t cap_room = context_cap - chunk_open_ctxlen;
+	// per-token loop is needed (design Sec5). Paged-KV plan §3.6 (G3): the holder's limit headroom
+	// beside the cap headroom -- `limit` is min(origin + budget, cap) for a pooled holder and the cap
+	// for a dedicated one, so a dedicated holder's headroom is today's exactly.
+	const bool budget_limited = limit < context_cap;
+	int64_t cap_room = (budget_limited ? limit : context_cap) - chunk_open_ctxlen;
 	if (cap_room < 0) cap_room = 0;
 	const uint32_t position_admit_count = static_cast<uint32_t>(std::min<int64_t>(n, cap_room));
 
@@ -3286,7 +3796,7 @@ ChunkPreScanResult RunChunkAdmissionPreScan(SslmGpuModelHandle* model, int64_t c
 		r.cause = ChunkAdmissionCause::kEmbed;
 		r.embed_reject_status = embed_reject_status;
 	} else {
-		r.cause = ChunkAdmissionCause::kPositionCap;
+		r.cause = budget_limited ? ChunkAdmissionCause::kBudget : ChunkAdmissionCause::kPositionCap;
 	}
 
 	r.chunk_embedding_bytes.assign(
@@ -3401,37 +3911,35 @@ void SubmitAdmittedChunkForG5Bridge(SslmGpuModelHandle* model, SslmGpuSequenceHa
 		adapter_bridge.num_hidden_layers = model->num_hidden_layers;
 		adapter_bridge_ptr = &adapter_bridge;
 	}
+	// Paged-KV plan §4 items 2, 5 and 6, step G3: a pooled holder binds its own view over the pool's
+	// host mirror, its table buffer (uploaded at the head of the chunk's first sub-chunk when its
+	// mappings changed), the pool's buffer and the pool's latch.
+	superslm_gpu::GpuPagedKvBinding paged{};
+	const superslm_gpu::GpuPagedKvBinding* paged_ptr = nullptr;
+	if (seq->pool != nullptr) {
+		paged.view = superslm::KvPageView{seq->pool->host_mirror.data(), seq->holder->table.get(),
+		                                  superslm::kv_pages::HolderMapped(seq->holder),
+		                                  seq->pool->geo.page_positions, seq->pool->geo.page_bytes};
+		paged.table_resident = seq->table_buf.Get();
+		paged.upload_table = seq->table_dirty;
+		paged_ptr = &paged;
+	}
+	ID3D12Resource* const kv_resident = seq->pool != nullptr ? seq->pool->pool_buf.Get() : seq->kv_buf.Get();
+	bool* const kv_latch = seq->pool != nullptr ? &seq->pool->kv_needs_resume_barrier : &seq->kv_needs_resume_barrier;
 	struct SubmittedWindowScopeGuard {
 		SslmGpuSequenceHandle* seq;
 		SslmGpuModelHandle* model;
 		SubmittedWindowScopeGuard(SslmGpuSequenceHandle* s, SslmGpuModelHandle* m) : seq(s), model(m) {
-			seq->state = superslm_gpu::SslmSequenceGpuState::Submitted;
-			model->submitted_sequences += 1;
-			// T-2243 review finding 2 (D-SLM4113): the process-global twin of the per-model
-			// increment just above -- see g_process_wide_submitted_sequences' own comment.
-			g_process_wide_submitted_sequences += 1;
-			// T-2243 (S2, design plan Sec6.1): the symmetric extension of this window to the
-			// bound adapter, mirroring SubmitOneSequenceDecode's own
-			// `adapter_or_null->submitted_sequences += 1`/`seq->in_flight_adapter = adapter_or_null`
-			// pair -- so a concurrent `sslm_gpu_adapter_unmap` sees the in-flight bind on this
-			// path too, not only on the per-token path.
-			if (seq->bound_adapter != nullptr) {
-				seq->bound_adapter->submitted_sequences += 1;
-				seq->in_flight_adapter = seq->bound_adapter;
-			}
+			// T-2243 review finding 2 (D-SLM4113) and T-2243 (S2, design plan Sec6.1): the model's
+			// and the process's counts and the bound adapter's (`in_flight_adapter`), so a
+			// concurrent `sslm_gpu_adapter_unmap` sees the in-flight bind on this path too -- and,
+			// for a pooled handle, the pooled count and the pool's holder pointer -- raised by the
+			// counting accessor (G3, §4.4). `model` is the handle's own.
+			(void)model;
+			SetGpuSeqState(seq, superslm_gpu::SslmSequenceGpuState::Submitted, seq->bound_adapter);
 		}
 		~SubmittedWindowScopeGuard() {
-			seq->state = superslm_gpu::SslmSequenceGpuState::Idle;
-			if (model->submitted_sequences > 0) model->submitted_sequences -= 1;
-			// T-2243 review finding 2 (D-SLM4113): the process-global twin of the per-model
-			// decrement just above -- see g_process_wide_submitted_sequences' own comment.
-			if (g_process_wide_submitted_sequences > 0) g_process_wide_submitted_sequences -= 1;
-			if (seq->in_flight_adapter != nullptr) {
-				if (seq->in_flight_adapter->submitted_sequences > 0) {
-					seq->in_flight_adapter->submitted_sequences -= 1;
-				}
-				seq->in_flight_adapter = nullptr;
-			}
+			SetGpuSeqState(seq, superslm_gpu::SslmSequenceGpuState::Idle, nullptr);
 		}
 	} submitted_window_guard(seq, model);
 	superslm_gpu::GpuLayerLoopInFlight* inflight = nullptr;
@@ -3507,13 +4015,16 @@ void SubmitAdmittedChunkForG5Bridge(SslmGpuModelHandle* model, SslmGpuSequenceHa
 		    superslm_gpu::SubmitChunkToFullDepthForG5Bridge(
 		        seq->live_state, /*layers=*/nullptr, model->num_hidden_layers, model->hidden_size,
 		        model->head_dim, model->num_key_value_heads, model->intermediate_size,
-		        seq->context_cap, kEmptyManifest, seq->host_kv_mirror.data(),
-		        seq->host_kv_mirror.size(), chunk_embedding_bytes, admit_count, seq->kv_buf.Get(),
-		        &seq->kv_needs_resume_barrier, model->weights_buf.Get(), model->rope_cos_buf.Get(),
-		        model->rope_sin_buf.Get(), model->has_rope_tables, model->rope_cos_elem_count,
-		        model->rope_sin_elem_count, adapter_bridge_ptr, &inflight,
+		        seq->context_cap, kEmptyManifest, KvHostBase(seq), KvHostBytes(seq),
+		        chunk_embedding_bytes, admit_count, kv_resident, kv_latch, model->weights_buf.Get(),
+		        model->rope_cos_buf.Get(), model->rope_sin_buf.Get(), model->has_rope_tables,
+		        model->rope_cos_elem_count, model->rope_sin_elem_count, adapter_bridge_ptr, &inflight,
 		        /*q_width=*/static_cast<size_t>(model->num_attention_heads) * model->head_dim,
-		        model_generation, model->has_qk_norm, &nonfinal_guard_rejected);
+		        model_generation, model->has_qk_norm, &nonfinal_guard_rejected, paged_ptr);
+		// A sub-chunk that reached the device uploaded the table at its head (§4 item 5).
+		if (seq->pool != nullptr && (submit_status == superslm::SslmForwardStatus::Ok || nonfinal_guard_rejected)) {
+			seq->table_dirty = false;
+		}
 		*out_guard_rejected = nonfinal_guard_rejected;
 		if (submit_status != superslm::SslmForwardStatus::Ok && !nonfinal_guard_rejected) {
 			*out_fault = submit_status;  // 1.8.0 (TE-426): kept, not discarded
@@ -3528,7 +4039,7 @@ void SubmitAdmittedChunkForG5Bridge(SslmGpuModelHandle* model, SslmGpuSequenceHa
 			seq->in_flight = inflight;
 			int32_t ready = 0;
 			const superslm::SslmForwardStatus final_finish_status = superslm_gpu::RunLayerLoopGpuFinish(
-			    inflight, seq->live_state, seq->host_kv_mirror.data(), /*block=*/1, &ready);
+			    inflight, seq->live_state, KvHostBase(seq), /*block=*/1, &ready);
 			seq->in_flight = nullptr;
 			// The final sub-chunk's finish: `GpuDeviceRemoved`/`GpuAllocationFailed`/
 			// `GpuOperationFailed` come only from its catch or a null token; any other non-`Ok`
@@ -3727,6 +4238,9 @@ SslmGpuStatus SslmGpuSeqPrefillPromptForG5BridgeImpl(SslmGpuContext* ctx, SslmGp
 		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	}
 	if (seq->state != superslm_gpu::SslmSequenceGpuState::Idle) return SSLM_BUSY;
+	if (seq->pool != nullptr && g_process_wide_submitted_sequences > 0) {
+		return SSLM_BUSY;  // G3-ledger: EntrySubmitGuard (the pooled interim guard, §4 item 4)
+	}
 	seq->bind_eligible = false; // D-SLM7625 generation entry: gpu prompt prefill
 	if (count == 0) return SSLM_OK;  // matches the shipped per-token loop's own vacuous-loop exit
 
@@ -3747,8 +4261,13 @@ SslmGpuStatus SslmGpuSeqPrefillPromptForG5BridgeImpl(SslmGpuContext* ctx, SslmGp
 	seq->prefill_hidden_valid = false;
 	const ChunkPreScanResult scan = RunChunkAdmissionPreScan(
 	    model, chunk_open_ctxlen, seq->context_cap, tokens, count, /*dfa_entry=*/nullptr,
-	    /*dfa_walk_state_start=*/0);
+	    /*dfa_walk_state_start=*/0, seq->pool != nullptr ? seq->limit : seq->context_cap);
 
+	// Paged KV (G3, §3.6): the pages the admitted rows land in, before any state moves.
+	if (scan.admit_count > 0) {
+		const SslmGpuStatus map_st = MapPooledPagesThrough(seq, chunk_open_ctxlen + scan.admit_count);
+		if (map_st != SSLM_OK) return map_st;
+	}
 	int64_t derived_count = 0;
 	bool guard_rejected = false;
 	superslm::SslmForwardStatus chunk_fault = superslm::SslmForwardStatus::Ok;
@@ -3788,6 +4307,13 @@ SslmGpuStatus SslmGpuSeqPrefillPromptForG5BridgeImpl(SslmGpuContext* ctx, SslmGp
 			// host-side embed side effect is reproduced (never a dispatch for it).
 			ReproducePositionCapBoundaryEmbedSideEffect(model, seq, tokens, scan.admit_count);
 			return SSLM_DEVICE_LOST;
+		case ChunkAdmissionCause::kBudget:
+			// Paged KV (G3, §3.6, the CPU twin's rule): the admitted tokens landed and the call is
+			// refused SSLM_GPU_KV_BUDGET_EXCEEDED; ready_for_logits is set iff any landed, so the
+			// holder's one ready token (1 + (limit - c), §3.4) can be taken. No embed side effect:
+			// nothing past the limit is embedded.
+			if (scan.admit_count > 0) seq->ready_for_logits = true;
+			return SSLM_GPU_KV_BUDGET_EXCEEDED;
 		case ChunkAdmissionCause::kDfa:
 			// Unreachable for the prompt twin (no DFA pre-scan is run for it) -- defensive only.
 			return SSLM_SEQUENCE_REJECTED;
@@ -3851,6 +4377,9 @@ SslmGpuStatus SslmGpuSeqPrefillSchemaContentForG5BridgeImpl(SslmGpuContext* ctx,
 		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	}
 	if (seq->state == superslm_gpu::SslmSequenceGpuState::Submitted) return SSLM_BUSY;
+	if (seq->pool != nullptr && g_process_wide_submitted_sequences > 0) {
+		return SSLM_BUSY;  // G3-ledger: EntrySubmitGuard (the pooled interim guard, §4 item 4)
+	}
 	seq->bind_eligible = false;
 	if (seq->bound_schema_index < 0) {
 		return SSLM_SEQUENCE_REJECTED;  // the GPU twin of SSLM_SCHEMA_SPAN_UNBOUND.
@@ -3892,10 +4421,15 @@ SslmGpuStatus SslmGpuSeqPrefillSchemaContentForG5BridgeImpl(SslmGpuContext* ctx,
 	// Prefill snapshot writer: invalid from here until this call's kNone exit (the prompt twin's
 	// identical rule). The kDfa exit sets ready_for_logits but never the snapshot.
 	seq->prefill_hidden_valid = false;
-	const ChunkPreScanResult scan = RunChunkAdmissionPreScan(model, chunk_open_ctxlen,
-	                                                          seq->context_cap, tokens, count, entry,
-	                                                          seq->dfa_walk_state);
+	const ChunkPreScanResult scan = RunChunkAdmissionPreScan(
+	    model, chunk_open_ctxlen, seq->context_cap, tokens, count, entry, seq->dfa_walk_state,
+	    seq->pool != nullptr ? seq->limit : seq->context_cap);
 
+	// Paged KV (G3, §3.6): the pages the admitted rows land in, before any state moves.
+	if (scan.admit_count > 0) {
+		const SslmGpuStatus map_st = MapPooledPagesThrough(seq, chunk_open_ctxlen + scan.admit_count);
+		if (map_st != SSLM_OK) return map_st;
+	}
 	int64_t derived_count = 0;
 	// The schema twin does not classify its device override (plan te266 Sec3.3, TE266-Q5): a guard
 	// refusal here stays SSLM_DEVICE_LOST below, because this twin's SSLM_SEQUENCE_REJECTED already
@@ -3941,6 +4475,11 @@ SslmGpuStatus SslmGpuSeqPrefillSchemaContentForG5BridgeImpl(SslmGpuContext* ctx,
 		case ChunkAdmissionCause::kEmbed:
 			// S3's own disposition: ready_for_logits left untouched.
 			return scan.embed_reject_status;
+		case ChunkAdmissionCause::kBudget:
+			// Paged KV (G3, §3.6): the prompt twin's kBudget row -- `*consumed` counts the landed
+			// tokens, the walk advanced over them, ready_for_logits set iff any landed.
+			if (*consumed > 0) seq->ready_for_logits = true;
+			return SSLM_GPU_KV_BUDGET_EXCEEDED;
 		case ChunkAdmissionCause::kPositionCap:
 			// D-SLM3619: refuses the whole call with the shipped path's exact observables --
 			// S4(a)'s own disposition, ready_for_logits left untouched, and the next-rejected
@@ -4236,6 +4775,56 @@ SslmGpuStatus sslm_gpu_seq_read_prefill_final_hidden(SslmGpuContext* ctx, SslmGp
 }
 
 // -------------------------------------------------------------------------------------------------
+// Paged KV (1.13.0), step G3: the pool, the budgeted create and the two diagnostics/seams of
+// gpu_1p0.h's page-pool block, each through the boundary and with its out-handle cleared first.
+// -------------------------------------------------------------------------------------------------
+SslmGpuStatus sslm_gpu_kv_pool_create(SslmGpuContext* ctx, SslmGpuModelHandle* model, uint32_t page_count,
+                                      SslmGpuKvPoolHandle** out_pool) noexcept {
+	ClearOutputHandle(out_pool);
+	return InvokeGpuApiBoundary(__func__, [&] { return sslm_gpu_kv_pool_createImpl(ctx, model, page_count, out_pool); });
+}
+SslmGpuStatus sslm_gpu_kv_pool_destroy(SslmGpuContext* ctx, SslmGpuKvPoolHandle* pool) noexcept {
+	return InvokeGpuApiBoundary(__func__, [&] { return sslm_gpu_kv_pool_destroyImpl(ctx, pool); });
+}
+SslmGpuStatus sslm_gpu_seq_create_budgeted(SslmGpuContext* ctx, SslmGpuModelHandle* model, SslmGpuKvPoolHandle* pool,
+                                           int32_t budget, SslmGpuSequenceHandle** out_seq) noexcept {
+	ClearOutputHandle(out_seq);
+	return InvokeGpuApiBoundary(
+	    __func__, [&] { return sslm_gpu_seq_create_budgetedImpl(ctx, model, pool, budget, out_seq); });
+}
+SslmGpuStatus sslm_gpu_kv_pool_stats(const SslmGpuKvPoolHandle* pool, SslmGpuKvPoolStats* out) noexcept {
+	return InvokeGpuApiBoundary(__func__, [&] { return sslm_gpu_kv_pool_statsImpl(pool, out); });
+}
+SslmGpuStatus sslm_gpu_test_only_peek_pool_mirror_bytes(const SslmGpuKvPoolHandle* pool, uint32_t page,
+                                                        size_t offset, size_t len, uint8_t* out) noexcept {
+	return InvokeGpuApiBoundary(
+	    __func__, [&] { return sslm_gpu_test_only_peek_pool_mirror_bytesImpl(pool, page, offset, len, out); });
+}
+
+// G3 test seams the GPU red suite names (gpu_1p0_bench_bridge.h). Host-only reads and one flag;
+// none submits, allocates or throws.
+SslmGpuStatus sslm_gpu_test_only_seq_table_entry(const SslmGpuSequenceHandle* seq, uint32_t i, uint32_t* out_page,
+                                                 uint32_t* out_mapped) noexcept {
+	if (!seq || !out_page || seq->pool == nullptr || seq->holder == nullptr) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	const uint32_t mapped = superslm::kv_pages::HolderMapped(seq->holder);
+	if (out_mapped) *out_mapped = mapped;
+	if (i >= mapped) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	*out_page = seq->holder->table[i];
+	return SSLM_OK;
+}
+SslmGpuStatus sslm_gpu_test_only_arm_view_fault(SslmGpuSequenceHandle* seq, uint32_t fault) noexcept {
+	if (!seq || seq->pool == nullptr || fault > 4) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	seq->armed_view_fault = fault;
+	return SSLM_OK;
+}
+SslmGpuStatus sslm_gpu_test_only_last_ladder_status(const SslmGpuSequenceHandle* seq,
+                                                    int32_t* out_forward_status) noexcept {
+	if (!seq || !out_forward_status) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	*out_forward_status = static_cast<int32_t>(seq->last_ladder_status);
+	return SSLM_OK;
+}
+
+// -------------------------------------------------------------------------------------------------
 // T-2851 test-build seams (SUPERSLM_GPU_ALLOC_FAULT_INJECTION only; design Sec4.6 items 2 and 4,
 // Sec4.9). Global scope and C++ linkage, matching the red suite's own local declarations
 // (tests/t2956-token-finish-red-suite/) and gpu_port.h's declarations. None is in a product build.
@@ -4247,6 +4836,25 @@ void SslmGpuAllocCounterResetForTest() noexcept {
 	std::lock_guard<std::mutex> lock(seam.mutex);
 	seam.alloc_count = 0;
 	seam.alloc_in_bundle.clear();
+	seam.alloc_bytes.clear();
+	seam.alloc_heap.clear();
+}
+
+// Paged KV (G3, cell 11.4): the k-th counted allocation's size and heap.
+bool SslmGpuAllocRecordForTest(uint32_t k, uint64_t* out_bytes, uint32_t* out_heap_type) noexcept {
+	superslm_gpu::harness::GpuTestSeamState& seam = superslm_gpu::harness::TestSeamState();
+	std::lock_guard<std::mutex> lock(seam.mutex);
+	if (k < 1 || k > seam.alloc_bytes.size()) return false;
+	if (out_bytes) *out_bytes = seam.alloc_bytes[k - 1];
+	if (out_heap_type) *out_heap_type = seam.alloc_heap[k - 1];
+	return true;
+}
+
+// Paged KV (G3, cell 11.4 leg 3): Close faults inside the pool create's zero-fill.
+void ArmGpuPoolZeroFillCloseFaultForTest(uint32_t consecutive_failures) noexcept {
+	superslm_gpu::harness::GpuTestSeamState& seam = superslm_gpu::harness::TestSeamState();
+	std::lock_guard<std::mutex> lock(seam.mutex);
+	seam.pool_zero_fill_close_failures = consecutive_failures;  // 0 disarms
 }
 
 uint32_t SslmGpuAllocCountForTest() noexcept {

@@ -229,6 +229,20 @@ struct GpuAdapterBridge {
 	uint32_t num_hidden_layers = 0;
 };
 
+// Paged-KV plan (rev 16.1) §4 items 2, 5 and 6, step G3: what a POOLED holder's submission binds in
+// place of the one-page view of its workspace. `view` addresses the pool's host mirror (`pool_base`)
+// through the holder's own table (`page_table`, its `mapped_pages` entries); `table_resident` is the
+// holder's per-sequence DEFAULT-heap table buffer the shaders read as KvPageTable; `upload_table`
+// says the holder's mappings changed since its last submission, so this submission copies the
+// view's entries into `table_resident` at its head. The workspace the caller passes alongside it is
+// the same host mirror (`view.pool_base`, all of the pool's bytes), and the external K/V resource is
+// the pool's DEFAULT buffer. Null (every legacy caller) keeps the one-page view.
+struct GpuPagedKvBinding {
+	superslm::KvPageView view{};
+	ID3D12Resource* table_resident = nullptr;
+	bool upload_table = false;
+};
+
 superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
     superslm::SequenceLayerState& seq, const superslm::LayerWeights* layers,
     uint32_t num_hidden_layers, uint32_t layer_budget, size_t hidden_size, size_t head_dim,
@@ -259,7 +273,10 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
     // see that declaration's own header comment for the full contract. Defaults to `0` so every
     // existing caller (~40 sites) is unaffected.
     uint64_t model_generation = 0,
-    bool model_has_qk_norm = false);
+    bool model_has_qk_norm = false,
+    // Paged-KV plan §4 items 5-6, step G3: a pooled holder's binding (above); null keeps the
+    // one-page view of `workspace`, so every existing caller is unaffected.
+    const GpuPagedKvBinding* paged_kv = nullptr);
 
 // FINISH: `block == 0` and the fence has not yet signaled: `*out_ready = 0`, returns
 // `superslm::SslmForwardStatus::Ok` (design Sec4.2: "the call itself succeeded; nothing
@@ -322,7 +339,11 @@ superslm::SslmForwardStatus SubmitChunkToFullDepthForG5Bridge(
     // every other return, including a submission failure in any sub-chunk. The final sub-chunk's
     // finish is the caller's, so its classification is the caller's too. Defaults to null so
     // every caller that does not classify is unaffected.
-    bool* out_readback_guard_rejected = nullptr);
+    bool* out_readback_guard_rejected = nullptr,
+    // Paged-KV plan §4 items 5-6, step G3: as `RunLayerLoopGpuSubmit`'s own trailing parameter.
+    // The table upload rides the first sub-chunk; the chunk-wide coverage twin checks every row
+    // from each sub-chunk's open to the chunk's end against the holder's mapped pages.
+    const GpuPagedKvBinding* paged_kv = nullptr);
 
 // T-2169 (Rung 2, design Sec5, D-SLM3596/D-SLM3641): the measured, driver-stability-bounded
 // maximum sub-chunk size, in tokens -- see its own definition (src/gpu/superslm_gpu.cpp) for the
@@ -1021,6 +1042,14 @@ void ArmGpuDeviceLogitsReadbackOverride(int32_t row, int64_t value) noexcept;
 // call returns SSLM_DEVICE_LOST and the context stays usable. 2: both attempts fail and the
 // context is left in the documented terminal state. 0 disarms.
 void ArmGpuDeviceLogitsCloseFaultForTest(uint32_t consecutive_failures) noexcept;
+// Paged-KV plan §4 item 3, step G3 (cell 11.4's seam legs): the k-th TryMakeBuffer call counted
+// since the last SslmGpuAllocCounterResetForTest (1-based) -- its requested byte size and its
+// D3D12_HEAP_TYPE. False when no such call was recorded.
+bool SslmGpuAllocRecordForTest(uint32_t k, uint64_t* out_bytes, uint32_t* out_heap_type) noexcept;
+// The next `consecutive_failures` Close attempts made inside the pool create's
+// ZeroFillResidentUavBufferSync fail without closing the list (2: the retry fails too, so the list
+// is not confirmed Closed and the create returns SSLM_DEVICE_LOST, the context terminal). 0 disarms.
+void ArmGpuPoolZeroFillCloseFaultForTest(uint32_t consecutive_failures) noexcept;
 // The model handle's host lm_head copy, in bytes: 0 for a tied head or a device-resident head,
 // vocab_size x hidden_size for an untied head mapped without the flag.
 size_t SslmGpuHeadWeightCopySizeForTest(const SslmGpuModelHandle* model) noexcept;
