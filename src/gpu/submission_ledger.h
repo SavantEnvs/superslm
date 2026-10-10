@@ -133,6 +133,26 @@ class GpuSubmission;
 template <class Record>
 class BasicGpuInFlightToken;  // gpu_inflight_token.h
 
+// What a stranded submission keeps alive (review-g23 F1). Once a wait or a Signal cannot be
+// confirmed, the GPU may still be executing the submission, so nothing it reads or writes may be
+// freed: the owner hands it to the device's stranded graveyard (SubmissionDevice::KeepAliveStranded)
+// instead of destroying it. GpuInFlightPayload (gpu_inflight_token.h) derives from it, so a token
+// whose drain strands moves its payload there. The graveyard is an intrusive list, so keeping
+// something alive never allocates and never throws.
+class StrandedKeepAlive {
+public:
+	virtual ~StrandedKeepAlive() = default;
+
+protected:
+	StrandedKeepAlive() noexcept = default;
+	StrandedKeepAlive(const StrandedKeepAlive&) = delete;
+	StrandedKeepAlive& operator=(const StrandedKeepAlive&) = delete;
+
+private:
+	friend class SubmissionDevice;
+	StrandedKeepAlive* next_stranded_ = nullptr;
+};
+
 // The device's submission surface. harness::Device derives from it and implements the six
 // primitives privately on its queue, allocator and fence; nothing else in the library reaches
 // them. Every reset goes through BeginRecording() and every submission through Submit().
@@ -180,9 +200,41 @@ public:
 
 	const SubmissionLedger& ledger() const noexcept { return ledger_; }
 
+	// The stranded graveyard (review-g23 F1): takes ownership of `keep` and never destroys it while
+	// this device lives. The device is lost by contract once a submission strands (rule 0), so what
+	// the GPU may still touch stays allocated rather than be freed under it. Thread-safe (a token can
+	// drain from another thread's walk); never allocates.
+	void KeepAliveStranded(StrandedKeepAlive* keep) noexcept {
+		if (keep == nullptr) return;
+		StrandedKeepAlive* head = graveyard_.load(std::memory_order_relaxed);
+		do {
+			keep->next_stranded_ = head;
+		} while (!graveyard_.compare_exchange_weak(head, keep, std::memory_order_release, std::memory_order_relaxed));
+		stranded_keep_alives_.fetch_add(1, std::memory_order_relaxed);
+	}
+	// How many things this device has been handed to keep alive for a stranded submission (the
+	// graveyard's entries and any deliberate keep-alive a derived device counts with
+	// NoteStrandedKeepAlive). Test reading.
+	uint64_t stranded_keep_alive_count() const noexcept { return stranded_keep_alives_.load(); }
+
 protected:
 	SubmissionDevice() noexcept = default;
-	virtual ~SubmissionDevice() = default;
+	// The graveyard is released only here, at the device's destruction. A device whose queue may
+	// still be executing at its destruction (harness::Device) abandons it first, a deliberate leak.
+	virtual ~SubmissionDevice() { ReleaseStrandedKeepAlives(); }
+	// Destroys the graveyard's entries now: only once nothing the stranded work uses can still run.
+	void ReleaseStrandedKeepAlives() noexcept {
+		StrandedKeepAlive* p = graveyard_.exchange(nullptr);
+		while (p != nullptr) {
+			StrandedKeepAlive* next = p->next_stranded_;
+			delete p;
+			p = next;
+		}
+	}
+	// Leaves the graveyard's entries allocated for ever (the device is lost by contract).
+	void AbandonStrandedKeepAlives() noexcept { graveyard_.store(nullptr); }
+	// Counts a keep-alive a derived device makes without the graveyard (a deliberate reference leak).
+	void NoteStrandedKeepAlive() noexcept { stranded_keep_alives_.fetch_add(1, std::memory_order_relaxed); }
 
 	// The primitives (harness::Device: alloc->Reset() then list->Reset(alloc, nullptr);
 	// [the queue gate's wait, fault-injection builds]; ExecuteCommandLists; queue->Signal(fence, v);
@@ -223,6 +275,8 @@ private:
 
 	SubmissionLedger ledger_;
 	uint64_t fence_val_ = 0;
+	std::atomic<StrandedKeepAlive*> graveyard_{nullptr};
+	std::atomic<uint64_t> stranded_keep_alives_{0};
 };
 
 // The draining token Submit() returns: move-only, holding the submission's record (its device and
@@ -260,10 +314,14 @@ public:
 
 	// The throwing wait: observes the value, frees the record and empties the token; on a wait
 	// that cannot be confirmed the ledger is stranded (lost_), the record is freed, and
-	// GpuSubmissionStrandedError is thrown.
+	// GpuSubmissionStrandedError is thrown. The record holds no GPU resource, so freeing it is safe
+	// either way; what the submission's work reads and writes is its owner's to keep alive on a
+	// stranded wait (SubmissionDevice::KeepAliveStranded).
 	void Wait() {
 		if (rec_ && !DrainNoThrow()) throw GpuSubmissionStrandedError("D3D12 fence wait could not be confirmed");
 	}
+	// The device this submission was made on; null when empty.
+	SubmissionDevice* device() const noexcept { return rec_ ? rec_->device() : nullptr; }
 	// The non-throwing drain: false when the wait strands (lost_ set). Frees the record and empties
 	// the token either way.
 	bool DrainNoThrow() noexcept {
