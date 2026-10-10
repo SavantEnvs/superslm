@@ -775,17 +775,37 @@ public:
 	// root signature carries, the same "subset usage" already proven by every GEMM-only
 	// dispatch shader that skips t3-t6 (ModelConstants/SiluLut/RopeCosTable/RopeSinTable)
 	// while sharing this identical signature.
-	static constexpr UINT kComposedResourceBindingCount = 14;  // 10 SRV + 4 UAV
+	// Paged-KV plan (rev 16.1) §4 item 1, step G2: 14 -> 15 (11 SRV + 4 UAV). The new SRV, t10
+	// KvPageTable, is the K/V page table site_common.hlsli's KvRowAddrGpu reads (one uint physical page
+	// per logical page); only the six K/V shaders declare it.
+	static constexpr UINT kComposedResourceBindingCount = 15;  // 11 SRV + 4 UAV
+	// The two root-constant blocks: b0 (28 values, below) and, from G2, b1 (g_page_positions,
+	// g_page_bytes), its own block so that no shader's b0 layout moves.
+	static constexpr UINT kComposedRootConstantCount = 28;
+	static constexpr UINT kComposedPageConstantCount = 2;
+	// The root parameter indices of the two G2 bindings (after b0 at 0 and the 14 pre-G2 descriptors
+	// at 1-14).
+	static constexpr UINT kComposedRootParamKvPageTable = 15;     // t10 KvPageTable (root SRV)
+	static constexpr UINT kComposedRootParamKvPageConstants = 16;  // b1 KvPageConstants (2 constants)
+	// The composed root signature's size in DWORDs (paged-KV plan §4 item 1 and §2 G34; recorded at G2):
+	// one DWORD per root constant and two per root descriptor -- 28 + 2 + 15 * 2 = 60 of D3D12's 64
+	// (56 before G2: 28 + 14 * 2). Four DWORDs of headroom remain; if a later arc needs more before
+	// this one lands, the two page constants move into the ModelConstants SRV, which costs none.
+	static constexpr UINT kComposedRootSignatureDwords =
+	    kComposedRootConstantCount + kComposedPageConstantCount + 2u * kComposedResourceBindingCount;
+	static_assert(kComposedRootSignatureDwords == 60,
+	              "paged-KV plan §4 item 1 records the composed root signature at 60 DWORDs");
+	static_assert(kComposedRootSignatureDwords <= 64, "D3D12 caps a root signature at 64 DWORDs");
 
 	ComPtr<ID3D12RootSignature> MakeRootSigComposed() {
-		D3D12_ROOT_PARAMETER ps[1 + kComposedResourceBindingCount]{};
+		D3D12_ROOT_PARAMETER ps[1 + kComposedResourceBindingCount + 1]{};
 		ps[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		// T-2432 (Track A step 9): grown 27 -> 28. The 28th value (index 27) carries Q_WIDTH
 		// (num_attention_heads * head_dim) for q_proj_gemm_site.hlsl/o_proj_gemm_site.hlsl
 		// (plain `bind_and_dispatch`, at index 11 of ITS OWN 12-value block) and
 		// q_proj_site.hlsl (tail `bind_and_dispatch_tail`, at index 27) -- see
 		// superslm_gpu.cpp's own bind_and_dispatch/bind_and_dispatch_tail lambdas.
-		ps[0].Constants.Num32BitValues = 28;  // 10th: num_hidden_layers (commit_site.hlsl only);
+		ps[0].Constants.Num32BitValues = kComposedRootConstantCount;  // 28. 10th: num_hidden_layers (commit_site.hlsl only);
 		                                      // 11th: T-2113 (B4) GEMM lanes (the six
 		                                      // <site>_gemm_site.hlsl dispatches only);
 		                                      // 12th-19th/20th-27th: T-2113 (B10 lever 1b) two
@@ -835,9 +855,19 @@ public:
 		ps[13].Descriptor.ShaderRegister = 8;  // t8 LoraAB (adapter lora_A+lora_B bytes)
 		ps[14].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
 		ps[14].Descriptor.ShaderRegister = 9;  // t9 Fold (adapter DeltaFoldScales+UFoldScales)
+		// Paged-KV plan §4 item 1 (G2): the K/V page table and the two page constants.
+		ps[kComposedRootParamKvPageTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		ps[kComposedRootParamKvPageTable].Descriptor.ShaderRegister = 10;  // t10 KvPageTable
+		ps[kComposedRootParamKvPageConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		ps[kComposedRootParamKvPageConstants].Constants.Num32BitValues = kComposedPageConstantCount;
+		ps[kComposedRootParamKvPageConstants].Constants.ShaderRegister = 1;  // b1 KvPageConstants
+		ps[kComposedRootParamKvPageConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		static_assert(kComposedRootParamKvPageTable == 1 + kComposedResourceBindingCount - 1 &&
+		                  kComposedRootParamKvPageConstants == 1 + kComposedResourceBindingCount,
+		              "the G2 parameters follow the 14 pre-G2 descriptors, in this order");
 
 		D3D12_ROOT_SIGNATURE_DESC rs{};
-		rs.NumParameters = 1 + kComposedResourceBindingCount;
+		rs.NumParameters = 1 + kComposedResourceBindingCount + 1;
 		rs.pParameters = ps;
 		ComPtr<ID3DBlob> blob, err;
 		HRESULT hr = D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);

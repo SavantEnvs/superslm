@@ -709,6 +709,22 @@ const int8_t* ValueRowGpu(const uint8_t* workspace, uint32_t layer, int64_t cont
                            size_t num_kv_heads, size_t head_dim, size_t kv_head,
                            int64_t position);
 
+// Paged-KV plan (rev 16.1) §4 item 6, step G2: the same two rows through a K/V page view over the
+// host mirror, by the formula the shaders' KvRowAddrGpu uses (site_common.hlsli; its C++
+// transliteration is src/gpu/shaders/kv_page_addr_model.h). The flat overloads above are the
+// one-page view of `workspace` (table {0}, B = context_cap), whose addresses are unchanged.
+const int8_t* KeyRowGpu(const superslm::KvPageView& view, uint32_t layer, size_t num_kv_heads, size_t head_dim,
+                         size_t kv_head, int64_t position);
+const int8_t* ValueRowGpu(const superslm::KvPageView& view, uint32_t layer, size_t num_kv_heads, size_t head_dim,
+                           size_t kv_head, int64_t position);
+
+// Paged-KV plan §4 item 2, step G2: the one-page view a legacy dedicated sequence (and every flat
+// `workspace` caller of the layer loop) binds -- `pool_base = workspace`, the one constant table entry
+// {0} shared by every such caller, one mapped page of `B = context_cap` positions, `page_bytes =
+// workspace_size`. Through it the shaders' and the host's addresses are the pre-G2 flat ones (§3.1's
+// one-page identity), so legacy output is byte-identical on the one shader path. Allocates nothing.
+superslm::KvPageView GpuOnePageView(uint8_t* workspace, size_t workspace_size, int64_t context_cap);
+
 // --- B7 (Sec5.8, Sec11 B7): the dispatch_budget contract, whole-
 // layer quanta. This is the ARITHMETIC/policy half of `sslm_decode_step_gpu`'s own
 // contract -- how many layers a call at a given budget will record, and what status

@@ -39,7 +39,7 @@ constexpr U min(U a, U b) {
 template <typename U>
 constexpr U KvInPageRowOffsetGpu(U layer, U half, U num_kv_heads, U head_dim, U kv_head, U page_positions,
                                  U pos_in_page) {
-	return ((layer * num_kv_heads + kv_head) * 2u + half) * page_positions * head_dim + pos_in_page * head_dim;  // SSLM-KV-ADDR:in-page
+	return ((layer * 2u + half) * num_kv_heads + kv_head) * page_positions * head_dim + pos_in_page * head_dim;  // SSLM-KV-ADDR:in-page
 }
 
 // site_common.hlsli KvPageRowAddrGpu: the row's byte address, given the physical page its logical
