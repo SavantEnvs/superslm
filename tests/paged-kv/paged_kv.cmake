@@ -20,10 +20,10 @@ set(PKV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests/paged-kv)
 #     and tests/paged-kv/pkv_common.h's in-page formula is rotated unconditionally. Its text was: every test-side in-page
 #     address (pkv_common.h, PageRunOffset) becomes §3.1's rotated slot (r + j) mod runs, and the C2 engine view
 #     carries the run count.
-#   SUPERSLM_PKV_T2_FALLBACK_RETIRED (D-SLM8448): ON in the T2 commit that removes the one-page fallback. The eight
-#     C4, C5 and R0 cells' pkv_odd fallback assertions retire (plan §26.5's table), and Fixture::B() reads the rule's
-#     256 for pkv_odd.
-option(SUPERSLM_PKV_T2_FALLBACK_RETIRED "Paged-KV tests retire pkv_odd's one-page fallback cells (R9 T2, D-SLM8448)" ON)
+#   SUPERSLM_PKV_T2_FALLBACK_RETIRED (D-SLM8448): RETIRED with the fallback (T-3189 §13). Its eight C4, C5 and R0
+#     pkv_odd fallback assertions (plan §26.5's table) are deleted, and Fixture::B() reads the rule's 256 for pkv_odd.
+# Neither option exists any more; a build directory whose cache still holds either value builds the same tests (CMake
+# ignores a cache entry nothing reads).
 
 function(superslm_pkv_target name)
 	cmake_parse_arguments(PKV "" "LIBRARY" "SOURCES" ${ARGN})
@@ -34,9 +34,6 @@ function(superslm_pkv_target name)
 	target_link_libraries(${name} PRIVATE ${PKV_LIBRARY})
 	target_include_directories(${name} PRIVATE ${PKV_DIR} include src tests)
 	target_compile_definitions(${name} PRIVATE PKV_REFERENCE_DIR="${PKV_DIR}/reference")
-	if(SUPERSLM_PKV_T2_FALLBACK_RETIRED)
-		target_compile_definitions(${name} PRIVATE PKV_T2_FALLBACK_RETIRED=1)
-	endif()
 	if(MSVC)
 		target_compile_options(${name} PRIVATE /W4 /fp:precise)
 	else()

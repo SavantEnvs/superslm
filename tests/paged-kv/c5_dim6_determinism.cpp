@@ -97,11 +97,8 @@ void Cell61Budget() {
 	// kills: per-page attention that mis-chains a run at a page boundary (W = B-1, B, B+1, 2B);
 	// a guard or map that stops one short of the limit (W = cap - 1 and cap are the last writes)
 	ExpectMatchesReference("v1.11.0", fx, "widths", BudgetWidths(fx), Compare::kTokensAndRows);
-	// The B = cap fallback runs the same widths at one page per holder (§3.1).
-#if !defined(PKV_T2_FALLBACK_RETIRED)  // D-SLM8448: retires at T2 with the one-page fallback (PKV_T2_FALLBACK_RETIRED, SUPERSLM_PKV_T2_FALLBACK_RETIRED); 4.4/T2's budget member carries it
-	const Fixture& odd = GetFixture("pkv_odd");
-	if (odd.ok) ExpectMatchesReference("v1.11.0", odd, "widths", BudgetWidths(odd), Compare::kTokensAndRows);
-#endif
+	// (pkv_odd's widths at one page per holder asserted the B = cap fallback and retired with it, D-SLM8448; 4.4/T2's
+	// budget member carries pkv_odd.)
 	// 4.2: budget prefix x budget share adopt at every prefix length.
 	// kills: share adopt that maps the tail page instead of copying it (1,000), or copies a tail an
 	// aligned prefix does not have (1,008, 16); an empty prefix adopted as a one-row prefix (0)

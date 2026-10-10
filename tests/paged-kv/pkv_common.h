@@ -211,16 +211,14 @@ struct Fixture {
 	// - The C6 suite (PKV_FIXTURE_B_FROM_RULE, D-SLM8447): §3.1's rule, PageRuleB, never a pinned 16. Its cloud twins
 	//   run the box cells' own code at the B the box runs, so they are red on 2ebe5e3 (B = 16) and green from T1.
 	// - Otherwise, the C2 to C5 cells: 16 on the generated fixtures, which the loader pins in the C4 and C5 suites (rev
-	//   16.23, D-SLM8439), and on pkv_odd the cap (the one-page fallback) until the T2 switch, then the rule's 256
-	//   (D-SLM8448: PKV_T2_FALLBACK_RETIRED, the CMake option SUPERSLM_PKV_T2_FALLBACK_RETIRED).
+	//   16.23, D-SLM8439), and on pkv_odd the rule's 256. Until T2, pkv_odd read the cap (the one-page fallback) behind
+	//   the switch SUPERSLM_PKV_T2_FALLBACK_RETIRED (D-SLM8448), retired with the fallback (T-3189 §13).
 	int64_t B() const {
 		if (pinned > 0) return pinned;
 #if defined(PKV_FIXTURE_B_FROM_RULE)
 		return PageRuleB(geo.head_dim, static_cast<uint64_t>(geo.context_cap), 1);
-#elif defined(PKV_T2_FALLBACK_RETIRED)
-		return geo.context_cap % 16 == 0 ? 16 : PageRuleB(geo.head_dim, static_cast<uint64_t>(geo.context_cap), 1);
 #else
-		return geo.context_cap % 16 == 0 ? 16 : geo.context_cap;
+		return geo.context_cap % 16 == 0 ? 16 : PageRuleB(geo.head_dim, static_cast<uint64_t>(geo.context_cap), 1);
 #endif
 	}
 	int64_t CapPages() const { return (geo.context_cap + B() - 1) / B(); }
