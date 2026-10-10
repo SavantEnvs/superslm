@@ -377,6 +377,11 @@ foreach(_sslm_tier SSE2 AVX2 AVX512)
 	# Decode-threading plan §3.9 / §8 4.5: the forced full suites run the D1 cells too, so each
 	# forced library carries the same seams superslm_test_injection has (above).
 	target_compile_definitions(superslm_${_sslm_tier_lower}_forced PUBLIC SUPERSLM_ENABLE_MATVEC_TEST_SEAMS)
+	# Paged-KV plan §3.1 (R9 step T1, D-SLM8439): the forced paged-KV legs (superslm_pkv_c5_<tier>_forced,
+	# superslm_pkv_r9_<tier>_forced) pin their fixtures through the test-only pin and read the geometry seam,
+	# which, with the page module's seams, are compiled only under this macro; superslm_test_injection's own
+	# PUBLIC definition (above) is the precedent.
+	target_compile_definitions(superslm_${_sslm_tier_lower}_forced PUBLIC SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS)
 	# Both the bad-alloc-injection seam above (src/bad_alloc_wrap.h) and the dispatch-
 	# instrument seam below (src/matmul.cpp) #include "support/*.h" headers that resolve
 	# against a "tests" search directory -- the same PRIVATE include superslm_test_injection

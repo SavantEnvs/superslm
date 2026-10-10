@@ -22,7 +22,7 @@ set(PKV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests/paged-kv)
 #   SUPERSLM_PKV_T2_FALLBACK_RETIRED (D-SLM8448): ON in the T2 commit that removes the one-page fallback. The eight
 #     C4, C5 and R0 cells' pkv_odd fallback assertions retire (plan §26.5's table), and Fixture::B() reads the rule's
 #     256 for pkv_odd.
-option(SUPERSLM_PKV_T1_ROTATED_LAYOUT "Paged-KV tests address pages rotated (R9 T1, D-SLM8449)" OFF)
+option(SUPERSLM_PKV_T1_ROTATED_LAYOUT "Paged-KV tests address pages rotated (R9 T1, D-SLM8449)" ON)
 option(SUPERSLM_PKV_T2_FALLBACK_RETIRED "Paged-KV tests retire pkv_odd's one-page fallback cells (R9 T2, D-SLM8448)" OFF)
 
 function(superslm_pkv_target name)
@@ -147,7 +147,7 @@ endif()
 # OFF in the commit that defines the real symbol; a stub left ON beside a real definition fails the
 # link with a duplicate symbol, so the two cannot coexist.
 option(SUPERSLM_PKV_R9_STUB_CONTIGUOUS "T0 stubs for sslm_kv_pool_contiguous_size and sslm_kv_pool_create_contiguous" ON)
-option(SUPERSLM_PKV_R9_STUB_PIN "T0 stub for the test-only pin KvPagesTestPinPagePositions" ON)
+option(SUPERSLM_PKV_R9_STUB_PIN "T0 stub for the test-only pin KvPagesTestPinPagePositions" OFF)
 file(GLOB PKV_R9_SOURCES CONFIGURE_DEPENDS ${PKV_DIR}/r9_*.cpp)
 file(GLOB PKV_R9_BOX_SOURCES CONFIGURE_DEPENDS ${PKV_DIR}/r9box_*.cpp)
 foreach(r9 superslm_pkv_r9 superslm_pkv_r9_box)
