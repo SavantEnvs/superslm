@@ -116,6 +116,9 @@ class RowRule(unittest.TestCase):
         self.assertEqual(rows.row_verdict([0.04, 0.04, 0.04, 0.06, 0.06]), "NO RESULT")
         # the median > 0.05: FAIL, whatever the smallest
         self.assertEqual(rows.row_verdict([0.06, 0.06, 0.06, 0.00, 0.00]), "FAIL")
+        # the median exactly at the bar with a larger maximum: neither PASS (the max is above) nor FAIL (the median is
+        # not above). Kills "FAIL uses median >= 0.05" (T-3198 §15's survivor; T-3189 §11)
+        self.assertEqual(rows.row_verdict([0.05, 0.05, 0.05, 0.06, 0.06]), "NO RESULT")
         with self.assertRaises(rows.Refusal):
             rows.row_verdict([0.0] * 4)
 

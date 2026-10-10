@@ -32,7 +32,10 @@ class RefusalCells(unittest.TestCase):
         self.check_refusal(71, "geometry mismatch", FIXTURE_LARGE="pkv_qk")
 
     def test_74_6_wrong_cap(self):
-        self.check_refusal(72, "wrong cap", FIXTURE_LARGE="pkv_odd")
+        # pkv_def as the large side: the same geometry, so it passes 71; pinnable to 16 (16 divides 4,096), so it passes
+        # the pin; and its cap is 4,096, not 32,768, so it reaches 72. pkv_odd (cap 4,100) is refused at the pin (71)
+        # since T1, before the cap check (T-3198 §15).
+        self.check_refusal(72, "wrong cap", FIXTURE_LARGE="pkv_def")
 
     def test_74_7_cpuid_and_pin_refusals(self):
         result = self.call(binary="superslm_pkv_74_no_tsc.exe")
