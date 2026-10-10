@@ -30,6 +30,8 @@ typedef struct SslmGpuContext        SslmGpuContext;
 typedef struct SslmGpuModelHandle    SslmGpuModelHandle;
 typedef struct SslmGpuAdapterHandle  SslmGpuAdapterHandle;
 typedef struct SslmGpuSequenceHandle SslmGpuSequenceHandle;
+typedef struct SslmGpuKvPoolHandle   SslmGpuKvPoolHandle;    /* paged KV, 1.13.0 */
+typedef struct SslmGpuPrefixHandle   SslmGpuPrefixHandle;    /* paged KV, 1.13.0 */
 
 /* Same namespace-collision fix the suite's own header carries:
  * SslmModelView must be THE real superslm::SslmModelView, not a second
@@ -267,7 +269,33 @@ enum class SslmGpuStatus : uint32_t {
     SSLM_GPU_PARALLEL_FOR_INCOMPLETE,
     /* sslm_gpu_model_map: GpuResidencyConfig::flags carries a bit this release does not define.
      * No handle is created. Appended LAST. */
-    SSLM_GPU_RESIDENCY_FLAGS_INVALID
+    SSLM_GPU_RESIDENCY_FLAGS_INVALID,
+    /* Paged KV (1.13.0): the six statuses below are appended LAST, in this order, and no existing
+     * ordinal moves (24..29). See the page-pool block at the end of this header.
+     * A budgeted sequence or prefix would write at or past its limit, origin + budget, while that
+     * limit is below the context cap. At the cap, today's cap behaviour applies unchanged, so a
+     * dedicated sequence never sees this status. */
+    SSLM_GPU_KV_BUDGET_EXCEEDED,
+    /* A page draw found the pool short: a budgeted create, prefix begin, begin_from or
+     * restore into pool. Nothing is drawn; a restore's first draw is rolled back. */
+    SSLM_GPU_KV_POOL_EXHAUSTED,
+    /* sslm_gpu_kv_pool_create: page_count * page_bytes exceeds 2^32, the reach of the shaders'
+     * 32-bit byte offsets. No pool is created. */
+    SSLM_GPU_KV_POOL_TOO_LARGE,
+    /* A pooled and a dedicated holder were mixed: adopt or begin_from of a pooled prefix onto a
+     * dedicated sequence, sslm_gpu_seq_restore given an 'SLM6' blob, or
+     * sslm_gpu_seq_restore_into_pool given anything that is not an 'SLM6' budget blob. Nothing
+     * changes and nothing is allocated. */
+    SSLM_GPU_HOLDER_MODE_MISMATCH,
+    /* A prefix verb refused on the prefix's state: a prefix or parent that is not frozen, an adopt
+     * across pools, a prefix prefill after freeze, or sslm_gpu_prefix_set_schema when the
+     * prefix's internal sequence cannot bind (after content, or once its bind permission is
+     * revoked). Nothing changes. */
+    SSLM_GPU_PREFIX_REJECTED,
+    /* sslm_gpu_seq_adopt_prefix: the sequence's schema binding does not match the prefix's (the
+     * CPU's SSLM_PREFIX_SCHEMA_MISMATCH rule). Every check runs before any state change, so the
+     * sequence keeps its binding and its bind eligibility. */
+    SSLM_GPU_PREFIX_SCHEMA_MISMATCH
 };
 
 /* Output handles: sslm_gpu_context_create, sslm_gpu_model_map, sslm_gpu_adapter_map,
@@ -725,5 +753,123 @@ SslmGpuStatus sslm_gpu_seq_read_prefill_final_hidden(SslmGpuContext* ctx, SslmGp
                                                      int8_t* out_codes, size_t out_capacity,
                                                      size_t* out_required,
                                                      int64_t* out_scale_m, int64_t* out_scale_e) noexcept;
+
+/* ============================================================================
+ * Paged KV (1.13.0): the GPU page pool, budgeted sequences, shared prefixes and restore into a
+ * pool. DECLARED for the GPU red suite; defined from G3 (pool, budgeted create, stats, peek,
+ * wait seam), G4 (prefixes, adopt, begin_from) and G5 (restore into pool).
+ * ============================================================================
+ *
+ * A pool is one device buffer of `page_count` pages of the model's page geometry (B positions per
+ * page, as the CPU's sslm_kv_page_positions), with a host mirror of the same size. A budgeted
+ * sequence or prefix declares 1 <= budget <= context cap positions and reserves R(budget) pages
+ * from the pool when it is created, exactly as the CPU's sslm_seq_create_budgeted; it writes up
+ * to its limit, min(origin + budget, cap), and SSLM_GPU_KV_BUDGET_EXCEEDED below the cap. There
+ * is no legacy mode on a GPU pool: sslm_gpu_seq_create keeps its own dedicated buffer, unchanged.
+ *
+ * Handles of another context or model -- a model, pool, prefix or parent whose context is not
+ * `ctx`, or a pool or prefix of another model -- and a budget outside [1, cap] return
+ * SSLM_SEQUENCE_KV_BUFFER_MISMATCH with a null out-handle, as every GPU verb refuses
+ * `model->ctx != ctx` today. Every out-handle below is set to nullptr on every status other than
+ * SSLM_OK.
+ *
+ * Thread-safety. As the rest of this header, calls on distinct handles may run concurrently, and
+ * two threads driving the same handle is a caller error. sslm_gpu_kv_pool_create,
+ * sslm_gpu_prefix_prefill, sslm_gpu_prefix_begin_from, sslm_gpu_seq_adopt_prefix and
+ * sslm_gpu_seq_restore_into_pool submit GPU work, so they join the calls that must be externally
+ * serialized (the decode calls' thread-safety note above), and each returns SSLM_BUSY, changing
+ * nothing, while any sequence in the process is Submitted. Every other verb below submits nothing
+ * and changes host state under the pool's mutex only, so it is not refused Busy.
+ * G3: the header change of plan §4.4 (P1's precondition, the promise, the status precedence, the
+ * scope conditions, the stranded status) is the builder's, and lands here at G3. */
+
+/* A pool of `page_count` pages for `model`, zero-filled before it returns.
+ * page_count * page_bytes above 2^32 returns SSLM_GPU_KV_POOL_TOO_LARGE. A pool the device or the host cannot allocate returns
+ * SSLM_GPU_ALLOCATION_FAILED on a device that is not removed (SSLM_DEVICE_LOST on a removed one),
+ * and a smaller pool may be tried at once. */
+SslmGpuStatus sslm_gpu_kv_pool_create(SslmGpuContext* ctx, SslmGpuModelHandle* model,
+                                      uint32_t page_count, SslmGpuKvPoolHandle** out_pool) noexcept;
+/* Destroys an empty pool. G3: the refusal while handles drawn from it live is the builder's to
+ * state (plan §4.3 leaves it open; the CPU twin refuses with a live-handles status). */
+SslmGpuStatus sslm_gpu_kv_pool_destroy(SslmGpuContext* ctx, SslmGpuKvPoolHandle* pool) noexcept;
+
+/* A budgeted GPU sequence over `pool`: R(budget) pages drawn, SSLM_GPU_KV_POOL_EXHAUSTED with
+ * nothing drawn when the pool has fewer. Its reset and release touch only its own table and
+ * reserve, never a neighbour's rows. It saves 'SLM6' (sslm_gpu_seq_save); a dedicated sequence
+ * keeps saving 'SLM5'. */
+SslmGpuStatus sslm_gpu_seq_create_budgeted(SslmGpuContext* ctx, SslmGpuModelHandle* model,
+                                           SslmGpuKvPoolHandle* pool, int32_t budget,
+                                           SslmGpuSequenceHandle** out_seq) noexcept;
+
+/* A budgeted GPU prefix over `pool` (origin 0), as the budgeted create. */
+SslmGpuStatus sslm_gpu_prefix_begin(SslmGpuContext* ctx, SslmGpuModelHandle* model,
+                                    SslmGpuKvPoolHandle* pool, int32_t budget,
+                                    SslmGpuPrefixHandle** out_prefix) noexcept;
+/* A budgeted prefix continuing the frozen `parent`, drawing R(budget) from the parent's pool (it
+ * takes no pool, so it cannot cross pools): the parent's full pages shared, its partial page
+ * copied, its state copied; origin = the parent's length. A parent that is not frozen returns
+ * SSLM_GPU_PREFIX_REJECTED. */
+SslmGpuStatus sslm_gpu_prefix_begin_from(SslmGpuContext* ctx, SslmGpuPrefixHandle* parent,
+                                         int32_t budget, SslmGpuPrefixHandle** out_prefix) noexcept;
+/* Binds `schema_index` (SslmGpuSeqSetSchemaForG5Bridge's argument) through the prefix's internal
+ * sequence. SSLM_GPU_PREFIX_REJECTED whenever that sequence cannot bind: after content, or after
+ * a call that revoked its bind permission. */
+SslmGpuStatus sslm_gpu_prefix_set_schema(SslmGpuContext* ctx, SslmGpuPrefixHandle* prefix,
+                                         int32_t schema_index) noexcept;
+/* Prefills `count` tokens into the prefix through the prompt (`kind` 0, SSLM_SPAN_PROMPT's value)
+ * or schema-content (`kind` 1, SSLM_SPAN_SCHEMA_CONTENT's value) prefill bridge, adapter unbound:
+ * prefixes are base-only. `*consumed` counts the admitted tokens, as the bridges' partial
+ * consumption. After freeze: SSLM_GPU_PREFIX_REJECTED. */
+SslmGpuStatus sslm_gpu_prefix_prefill(SslmGpuContext* ctx, SslmGpuPrefixHandle* prefix,
+                                      const int32_t* tokens, int32_t count, int32_t kind,
+                                      uint32_t dispatch_budget, int32_t* consumed) noexcept;
+SslmGpuStatus sslm_gpu_prefix_freeze(SslmGpuContext* ctx, SslmGpuPrefixHandle* prefix) noexcept;
+SslmGpuStatus sslm_gpu_prefix_release(SslmGpuContext* ctx, SslmGpuPrefixHandle* prefix) noexcept;
+
+/* Adopts the frozen `prefix` onto the pooled sequence `seq`, with the CPU adopt's field and schema
+ * rules: its full pages mapped shared, its tail rows copied through the host mirror and uploaded.
+ * Every check runs before any state change. A prefix that is not frozen, or of another pool:
+ * SSLM_GPU_PREFIX_REJECTED. A dedicated `seq` (sslm_gpu_seq_create): SSLM_GPU_HOLDER_MODE_MISMATCH.
+ * A schema mismatch: SSLM_GPU_PREFIX_SCHEMA_MISMATCH. A Submitted `seq`: SSLM_BUSY. */
+SslmGpuStatus sslm_gpu_seq_adopt_prefix(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq,
+                                        SslmGpuPrefixHandle* prefix) noexcept;
+
+/* Restores an 'SLM6' budget blob into a fresh pooled sequence, keeping its budget and origin.
+ * `prefix_or_null` is a sharing hint, never a requirement: a null prefix, or one that does not
+ * match (another context or model included), gives a private restore with
+ * `*out_shared_pages` = 0. `out_shared_pages` may be null. Checked in order, each refusal
+ * changing nothing: (1) null or mismatched handles and arguments; (2) SSLM_BUSY while any
+ * sequence is Submitted; (3) a blob that is not 'SLM6' ('SLM5', 'SLM4'):
+ * SSLM_GPU_HOLDER_MODE_MISMATCH; (4) the body, with sslm_gpu_seq_restore's statuses;
+ * (5) SSLM_GPU_KV_POOL_EXHAUSTED from either draw, the first rolled back.
+ * sslm_gpu_seq_restore is unchanged, except that it refuses an 'SLM6' blob with
+ * SSLM_GPU_HOLDER_MODE_MISMATCH and allocates nothing. */
+SslmGpuStatus sslm_gpu_seq_restore_into_pool(SslmGpuContext* ctx, SslmGpuModelHandle* model,
+                                             SslmGpuKvPoolHandle* pool,
+                                             const void* blob, size_t blob_size,
+                                             SslmGpuPrefixHandle* prefix_or_null,
+                                             SslmGpuSequenceHandle** out_seq,
+                                             uint32_t* out_shared_pages) noexcept;
+
+/* sslm_gpu_kv_pool_stats' output, the CPU's sslm_kv_pool_stats_out field for field. The caller
+ * sets struct_size = sizeof(SslmGpuKvPoolStats). */
+typedef struct SslmGpuKvPoolStats {
+    uint32_t struct_size;
+    uint32_t page_count;
+    uint32_t free_pages;
+    uint32_t shared_pages;   /* distinct pages at least one live holder maps as shared */
+    int64_t page_positions;  /* B */
+} SslmGpuKvPoolStats;
+/* A diagnostic: the pool's page counts, read under the pool's mutex. No verdict reads it; a cell
+ * counts pages through the fill probe. */
+SslmGpuStatus sslm_gpu_kv_pool_stats(const SslmGpuKvPoolHandle* pool, SslmGpuKvPoolStats* out) noexcept;
+
+/* TEST ONLY. Copies `len` bytes of the pool's host mirror, page `page` at byte `offset` within it,
+ * into `out`: the GPU twin of the CPU page peek. Bounds-checked against hostile arguments. */
+SslmGpuStatus sslm_gpu_test_only_peek_pool_mirror_bytes(const SslmGpuKvPoolHandle* pool, uint32_t page,
+                                                        size_t offset, size_t len, uint8_t* out) noexcept;
+/* TEST ONLY. Waits on `seq`'s in-flight fence without finishing it: `seq` stays Submitted, with
+ * its counts raised, and nothing is left executing. Submits nothing. */
+SslmGpuStatus sslm_gpu_test_only_wait_in_flight(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq) noexcept;
 
 #endif /* SSLM_GPU_1P0_H */
