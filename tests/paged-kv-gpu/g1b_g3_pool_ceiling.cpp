@@ -252,9 +252,41 @@ void Cell114G3ZeroFill() {
 #endif
 }
 
+// review-g23 F2 (11.3's class at the GPU pooled release): HolderRelease consumes the holder whatever
+// it returns, so a release that meets a refcount underflow must still finish -- the handle freed,
+// the pool's live count dropped -- and report the underflow, as the CPU twin (ReleaseHolder) does.
+// The seam zeroes the sequence's first reserve page's refcount; the release then reads
+// SSLM_SEQUENCE_KV_BUFFER_MISMATCH, and the pool, with no sequence left, destroys SSLM_OK. Red before
+// the fix: the release returned before dropping live_refs, so the destroy read
+// SSLM_MODEL_HAS_LIVE_SEQUENCES for ever (and the handle kept a dangling holder).
+void Cell113G3Release() {
+#if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION)
+	Env& e = GetEnv();
+	if (!e.ok) return;
+	SslmGpuKvPoolHandle* pool = nullptr;
+	G1B_CHECK_STATUS(sslm_gpu_kv_pool_create(e.ctx1, e.m1, 16, &pool), S::SSLM_OK, "11.3/G3 release: pool create");
+	if (!pool) return;
+	SslmGpuSequenceHandle* seq = nullptr;
+	G1B_CHECK_STATUS(sslm_gpu_seq_create_budgeted(e.ctx1, e.m1, pool, 64, &seq), S::SSLM_OK,
+	                 "11.3/G3 release: budgeted create");
+	if (!seq) {
+		sslm_gpu_kv_pool_destroy(e.ctx1, pool);
+		return;
+	}
+	G1B_CHECK_MSG(ZeroGpuPooledSeqReservePageRefcountForTest(seq), "11.3/G3 release: the seam found no reserve page");
+	G1B_CHECK_STATUS(sslm_gpu_seq_release(e.ctx1, seq), S::SSLM_SEQUENCE_KV_BUFFER_MISMATCH,
+	                 "11.3/G3 release: the release meeting a refcount underflow");
+	G1B_CHECK_STATUS(sslm_gpu_kv_pool_destroy(e.ctx1, pool), S::SSLM_OK,
+	                 "11.3/G3 release: the pool's destroy after the underflowed release (the release finished)");
+#else
+	G1B_CHECK_MSG(false, "11.3/G3 release: built without SUPERSLM_GPU_ALLOC_FAULT_INJECTION");
+#endif
+}
+
 }  // namespace
 
 G1B_CELL("11.4/G3", "G3", Cell114G3);
 G1B_CELL("11.4/G3:zerofill", "G3", Cell114G3ZeroFill);
+G1B_CELL("11.3/G3:release", "G3", Cell113G3Release);
 
 }  // namespace g1b

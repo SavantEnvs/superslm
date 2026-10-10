@@ -1655,6 +1655,24 @@ struct GpuLayerLoopInFlight final : public GpuInFlightPayload {
 	Microsoft::WRL::ComPtr<ID3D12Resource> work_scratch_uav;
 	Microsoft::WRL::ComPtr<ID3D12Resource> lw_upload_keep_alive;
 	std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> upload_keep_alive;
+	// review-g23 F1: the caller-owned buffers the work binds (the K/V buffer, the model's weights and
+	// rope tables, the adapter's buffers, a pooled holder's table buffer). A handle is never released
+	// while Submitted, so these add nothing on a confirmed finish; when the record's wait strands, the
+	// record goes to the device's graveyard and these stay alive with it, whatever the handles do
+	// next. A fixed array, so filling it never allocates or throws.
+	Microsoft::WRL::ComPtr<ID3D12Resource> external_keep_alive[7];
+	void KeepExternalsAlive(ID3D12Resource* kv, ID3D12Resource* weights, ID3D12Resource* rope_cos,
+	                        ID3D12Resource* rope_sin, const GpuAdapterBridge* adapter,
+	                        const GpuPagedKvBinding* paged_kv) noexcept {
+		ID3D12Resource* const bufs[7] = {kv,
+		                                 weights,
+		                                 rope_cos,
+		                                 rope_sin,
+		                                 adapter ? adapter->lora_ab_resident : nullptr,
+		                                 adapter ? adapter->fold_resident : nullptr,
+		                                 paged_kv ? paged_kv->table_resident : nullptr};
+		for (int i = 0; i < 7; ++i) external_keep_alive[i] = bufs[i];
+	}
 
 private:
 	friend class harness::BasicGpuInFlightToken<GpuLayerLoopInFlight>;
@@ -3011,6 +3029,14 @@ namespace {
 // file-scope statics `g_resident_weights`/`g_resident_kv`/`g_last_weight_upload_was_skipped`
 // already declared above), so this needed no parameters.
 void InvalidateResidencyCachesOnThrow() {
+	// review-g23 F1: on a stranded process device the executed work may still read the resident
+	// buffers, so the cache's references are leaked rather than released (the device is lost by
+	// contract, rule 0).
+	if (const harness::SubmissionLedger* ledger = harness::SingletonLedgerIfConstructed();
+	    ledger != nullptr && ledger->Stranded()) {
+		harness::Device& dev = harness::GetDevice();
+		dev.KeepResourcesAliveStranded(g_resident_weights.lw_buf, g_resident_kv.kv_buf);
+	}
 	g_resident_weights.lw_buf.Reset();
 	g_resident_weights.valid = false;
 	g_resident_kv.kv_buf.Reset();
@@ -3024,6 +3050,47 @@ void InvalidateResidencyCachesOnThrow() {
 	g_last_rope_upload_was_skipped = false;
 	g_last_kv_upload_was_skipped = false;
 }
+
+// review-g23 F1: a submitter's per-call resources, kept alive when the call executed work and left
+// the ledger stranded. Declared after the resources it names, so its destructor runs first on
+// every exit: once a Signal or a wait cannot be confirmed the GPU may still read and write them,
+// and the device is lost by contract (rule 0), so they are leaked rather than released. A call that
+// executed nothing, or whose submission is confirmed, keeps nothing.
+class StrandedTailKeepAlive {
+public:
+	using Local = const Microsoft::WRL::ComPtr<ID3D12Resource>*;
+	// `externals`: the caller-owned buffers the work binds (the model's weights and rope tables, the
+	// adapter's buffers, a pooled holder's table buffer), each null when not bound; a handle's
+	// teardown would otherwise release them under the stranded work.
+	StrandedTailKeepAlive(harness::Device& dev, uint64_t counter_before, const GpuLayerLoopChunkOpenState& state,
+	                      Local a, Local b, Local c, ID3D12Resource* weights, ID3D12Resource* rope_cos,
+	                      ID3D12Resource* rope_sin, const GpuAdapterBridge* adapter,
+	                      const GpuPagedKvBinding* paged_kv) noexcept
+	    : dev_(dev),
+	      counter_before_(counter_before),
+	      state_(state),
+	      locals_{a, b, c},
+	      externals_{weights, rope_cos, rope_sin, adapter ? adapter->lora_ab_resident : nullptr,
+	                 adapter ? adapter->fold_resident : nullptr, paged_kv ? paged_kv->table_resident : nullptr} {}
+	StrandedTailKeepAlive(const StrandedTailKeepAlive&) = delete;
+	StrandedTailKeepAlive& operator=(const StrandedTailKeepAlive&) = delete;
+	~StrandedTailKeepAlive() {
+		if (!dev_.StrandedSince(counter_before_)) return;
+		dev_.KeepResourcesAliveStranded(state_.seq_uav, state_.kv_uav, state_.scratch_uav, state_.work_scratch_uav,
+		                                state_.layout_buf, state_.rope_buf, state_.model_const_buf,
+		                                state_.silu_lut_buf, state_.scratch_layout_buf, state_.lw_upload_keep_alive);
+		for (const auto& buf : state_.upload_keep_alive) dev_.KeepResourcesAliveStranded(buf);
+		for (Local buf : locals_) dev_.KeepResourcesAliveStranded(*buf);
+		for (ID3D12Resource* buf : externals_) dev_.KeepOneResourceAliveStranded(buf);
+	}
+
+private:
+	harness::Device& dev_;
+	const uint64_t counter_before_;
+	const GpuLayerLoopChunkOpenState& state_;
+	const Local locals_[3];
+	ID3D12Resource* const externals_[6];
+};
 
 // The one cleanup every recording-window catch clause runs, whatever it caught: invalidate the
 // residency caches, then close the process's command list if this call opened it
@@ -3488,6 +3555,12 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 	// From G3: whether ExecuteCommandLists ran is read off the ledger's submission counter, which
 	// Submit() advances only after its execute (each catch below compares it).
 	const uint64_t tail_counter_before = dev.submission_counter();
+	// std::addressof, never `&`: ComPtr's operator& releases what it holds.
+	const StrandedTailKeepAlive stranded_keep_alive(dev, tail_counter_before, state, std::addressof(seq_readback),
+	                                                std::addressof(kv_readback),
+	                                                std::addressof(q_codes_readback), external_weights_resident,
+	                                                external_rope_cos_resident, external_rope_sin_resident,
+	                                                adapter_bridge, paged_kv);  // review-g23 F1
 	// Decision 80: this call's own timing, carried by its record and published by the finish
 	// tail, or published here on a catch path as far as the call got.
 	GpuCallTiming call_timing{};
@@ -3551,6 +3624,8 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 		inflight->work_scratch_uav = state.work_scratch_uav;
 		inflight->lw_upload_keep_alive = state.lw_upload_keep_alive;
 		inflight->upload_keep_alive = state.upload_keep_alive;
+		inflight->KeepExternalsAlive(state.kv_uav.Get(), external_weights_resident, external_rope_cos_resident,
+		                             external_rope_sin_resident, adapter_bridge, paged_kv);  // review-g23 F1
 		if (out_inflight) *out_inflight = std::move(token);
 		return superslm::SslmForwardStatus::Ok;
 	} catch (const std::bad_alloc&) {
@@ -3937,6 +4012,11 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 	// execute.
 	bool tail_close_attempted = false;
 	const uint64_t tail_counter_before = dev.submission_counter();
+	const StrandedTailKeepAlive stranded_keep_alive(dev, tail_counter_before, state, std::addressof(seq_readback),
+	                                                std::addressof(kv_readback),
+	                                                std::addressof(chunk_embed_upload), external_weights_resident,
+	                                                external_rope_cos_resident, external_rope_sin_resident,
+	                                                adapter_bridge, paged_kv);  // review-g23 F1
 	GpuCallTiming call_timing{};  // decision 80 (RunLayerLoopGpuSubmit's tail, above)
 	try {
 		// The pin seam fires here, throwing exactly the type `SSLM_GPU_HR` would on a real
@@ -3983,6 +4063,8 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 		inflight->work_scratch_uav = state.work_scratch_uav;
 		inflight->lw_upload_keep_alive = state.lw_upload_keep_alive;
 		inflight->upload_keep_alive = state.upload_keep_alive;
+		inflight->KeepExternalsAlive(state.kv_uav.Get(), external_weights_resident, external_rope_cos_resident,
+		                             external_rope_sin_resident, adapter_bridge, paged_kv);  // review-g23 F1
 		if (out_inflight) *out_inflight = std::move(token);
 		return superslm::SslmForwardStatus::Ok;
 	} catch (const std::bad_alloc&) {
@@ -4400,7 +4482,9 @@ superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuInFlightToken&& inflight,
 		// E_OUTOFMEMORY, is rule 2, `GpuAllocationFailed`; a `Map` failing with any other
 		// HRESULT is rule 3, `GpuOperationFailed`. `owned` (declared BEFORE this try, above)
 		// frees `inflight` via its own destructor during stack unwinding, regardless of where
-		// inside the try the throw happened -- nothing here frees it a second time.
+		// inside the try the throw happened -- nothing here frees it a second time. A wait that
+		// stranded has instead handed the record to the device's stranded graveyard (review-g23
+		// F1), so `rec` stays valid here and is never freed while the device lives.
 		if (out_ready) *out_ready = 1;  // a terminal status, not a "still pending" one
 		PublishCallTimingNoThrow(rec->timing, std::move(rec->per_dispatch_ms));  // as far as it got
 		return ClassifyForwardFault(dev, /*stranded=*/false);
@@ -4954,7 +5038,8 @@ bool RestoreGpuSequenceState(const void* blob, size_t blob_size, superslm::Seque
 		// caller's classifier (sslm_gpu_seq_restore, gpu_1p0.cpp) reads. From G3 the submission and
 		// the wait are the ledger's: Submit(no retry), then the submission's own Wait().
 		dev.CloseListOrThrow();
-		dev.Submit(/*retry=*/false).Wait();
+		// review-g23 F1: the three buffers are kept alive if the submission strands.
+		dev.SubmitAndWaitKeepingAlive(/*retry=*/false, upload_buf, device_buf, readback_buf);
 		void* p = nullptr;
 		D3D12_RANGE range{0, static_cast<SIZE_T>(workspace_size)};
 		SSLM_GPU_HR(readback_buf->Map(0, &range, &p));
@@ -5103,7 +5188,16 @@ bool RunDescriptorTableBind(const int8_t* const* array_pointers, const size_t* a
 	dev.list->ResourceBarrier(1, &b);
 	dev.list->CopyResource(readback.Get(), out_uav.Get());
 	dev.CloseListOrThrow();
-	dev.Submit(/*retry=*/false).Wait();
+	{
+		// review-g23 F1: every buffer the work reads is kept alive if the submission strands.
+		const uint64_t counter_before = dev.submission_counter();
+		const harness::OnScopeExit keep_array_bufs{[&]() noexcept {
+			if (dev.StrandedSince(counter_before)) {
+				for (const auto& buf : array_bufs) dev.KeepResourcesAliveStranded(buf);
+			}
+		}};
+		dev.SubmitAndWaitKeepingAlive(/*retry=*/false, counts_buf, offsets_buf, out_uav, readback, heap);
+	}
 
 	out_widened->resize(total_elements);
 	void* p = nullptr;

@@ -1084,6 +1084,7 @@ void ReleaseQueueGateForTest();
 #if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION)
 struct SslmGpuContext;
 struct SslmGpuModelHandle;
+struct SslmGpuSequenceHandle;
 enum class SslmGpuStatus : uint32_t;
 
 // Occurrence-indexed allocation faults. Every device allocation passes through one counted
@@ -1119,6 +1120,10 @@ bool SslmGpuAllocRecordForTest(uint32_t k, uint64_t* out_bytes, uint32_t* out_he
 // ZeroFillResidentUavBufferSync fail without closing the list (2: the retry fails too, so the list
 // is not confirmed Closed and the create returns SSLM_DEVICE_LOST, the context terminal). 0 disarms.
 void ArmGpuPoolZeroFillCloseFaultForTest(uint32_t consecutive_failures) noexcept;
+// review-g23 F2's pin: sets the refcount of a pooled sequence's first reserve page to 0 under the
+// pool mutex, so that sequence's release meets a refcount underflow (cell 11.3's class). False when
+// `seq` is not pooled or its holder has no reserve page.
+bool ZeroGpuPooledSeqReservePageRefcountForTest(SslmGpuSequenceHandle* seq) noexcept;
 // The model handle's host lm_head copy, in bytes: 0 for a tied head or a device-resident head,
 // vocab_size x hidden_size for an untied head mapped without the flag.
 size_t SslmGpuHeadWeightCopySizeForTest(const SslmGpuModelHandle* model) noexcept;

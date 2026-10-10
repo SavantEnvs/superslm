@@ -74,6 +74,16 @@ class Mutant:
 # Each mutant: the production defect it plants, the file and the exact text it replaces (which must
 # land exactly once), the flavour and the cells that grade it.
 MUTANTS = [
+    Mutant("stranded-drain-frees", "review-g23 F1: a token's drain frees its payload even when the drain strands",
+           "gpu_inflight_token.h",
+           "\t\tif (p->submission_.DrainNoThrow()) {\n\t\t\tdelete p;\n\t\t} else {\n\t\t\tdev->KeepAliveStranded(p);\n\t\t}\n",
+           "\t\t(void)dev;\n\t\tp->submission_.DrainNoThrow();\n\t\tdelete p;\n",
+           "plain", ["G3/token/stranded-keeps-payload"]),
+    Mutant("stranded-wait-frees", "review-g23 F1: the throwing wait leaves the payload on the token, to be freed",
+           "gpu_inflight_token.h",
+           "\t\tif (!payload_->submission_.DrainNoThrow()) {\n\t\t\tGpuInFlightPayload* const p = payload_;\n\t\t\tpayload_ = nullptr;\n\t\t\tdev->KeepAliveStranded(p);\n",
+           "\t\tif (!payload_->submission_.DrainNoThrow()) {\n\t\t\t(void)dev;\n",
+           "plain", ["G3/token/stranded-keeps-payload"]),
     Mutant("ledger-plain-store", "3.6h's first named mutant: observed_ stored plainly, not by a CAS maximum",
            "submission_ledger.h",
            "\t\twhile (v > cur && !observed_.compare_exchange_weak(cur, v)) {\n\t\t}\n",
@@ -173,9 +183,11 @@ MUTANTS = [
            "plain", ["G3/submission/early-return"]),
     Mutant("token-dtor-no-drain", "a token destroyed while holding work frees it unobserved",
            "gpu_inflight_token.h",
-           "\t\tpayload_ = nullptr;\n\t\tp->submission_.DrainNoThrow();\n\t\tdelete p;",
-           "\t\tpayload_ = nullptr;\n\t\tif (p->submission_.rec_) {\n\t\t\tinflight::Unlink(p->submission_.rec_);\n"
-           "\t\t\tdelete p->submission_.rec_;\n\t\t\tp->submission_.rec_ = nullptr;\n\t\t}\n\t\tdelete p;",
+           # re-anchored at review-g23 F1 (the drain now frees only a confirmed payload); the same defect
+           "\t\tSubmissionDevice* const dev = p->submission_.device();\n\t\tif (p->submission_.DrainNoThrow()) {\n"
+           "\t\t\tdelete p;\n\t\t} else {\n\t\t\tdev->KeepAliveStranded(p);\n\t\t}\n",
+           "\t\tif (p->submission_.rec_) {\n\t\t\tinflight::Unlink(p->submission_.rec_);\n"
+           "\t\t\tdelete p->submission_.rec_;\n\t\t\tp->submission_.rec_ = nullptr;\n\t\t}\n\t\tdelete p;\n",
            "plain", ["G3/token/drain-on-destruction"]),
     Mutant("token-move-assign-no-drain", "a move-assignment over a live token overwrites it",
            "gpu_inflight_token.h",

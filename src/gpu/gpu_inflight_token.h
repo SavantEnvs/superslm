@@ -10,7 +10,8 @@
 //     carries, with the new token as its holder);
 //   - drains on destruction: a token destroyed while it still holds work waits on the owning
 //     device's fence through the non-throwing drain and frees the record, without a readback; a
-//     drain that strands leaves the ledger stranded (lost_) and the destructor returns;
+//     drain that strands leaves the ledger stranded (lost_), hands the payload to the device's
+//     stranded graveyard (never freed while the device lives; review-g23 F1) and returns;
 //   - drains on move-assignment: assigning over a token that still holds a record drains and frees
 //     that record first;
 //   - carries the record only it can construct: the layer-loop record (GpuLayerLoopInFlight, in
@@ -37,10 +38,12 @@
 
 namespace superslm_gpu {
 
-// The base of every record a token carries: the submission it is the work of.
-class GpuInFlightPayload {
+// The base of every record a token carries: the submission it is the work of. A StrandedKeepAlive,
+// so a token whose drain strands hands the payload (and every resource its work reads and writes)
+// to the device's graveyard instead of freeing it (review-g23 F1).
+class GpuInFlightPayload : public harness::StrandedKeepAlive {
 public:
-	virtual ~GpuInFlightPayload() = default;
+	~GpuInFlightPayload() override = default;
 	GpuInFlightPayload(const GpuInFlightPayload&) = delete;
 	GpuInFlightPayload& operator=(const GpuInFlightPayload&) = delete;
 	const harness::GpuSubmission& submission() const noexcept { return submission_; }
@@ -109,9 +112,18 @@ public:
 	bool ReadyNoWait() const noexcept { return payload_ == nullptr || payload_->submission_.ReadyNoWait(); }
 	// The throwing wait (blocking finish): observes the value and frees the submission's record,
 	// keeping the payload (its readback buffers) for the caller; the token then carries no
-	// in-flight work. Throws GpuSubmissionStrandedError when the wait cannot be confirmed.
+	// in-flight work. Throws GpuSubmissionStrandedError when the wait cannot be confirmed; the
+	// payload then goes to the device's stranded graveyard, never freed while the device lives, and
+	// the token is left empty (review-g23 F1: the GPU may still be using what it holds).
 	void Wait() {
-		if (payload_) payload_->submission_.Wait();
+		if (payload_ == nullptr || !payload_->submission_.holds()) return;
+		SubmissionDevice* const dev = payload_->submission_.device();
+		if (!payload_->submission_.DrainNoThrow()) {
+			GpuInFlightPayload* const p = payload_;
+			payload_ = nullptr;
+			dev->KeepAliveStranded(p);
+			throw GpuSubmissionStrandedError("D3D12 fence wait could not be confirmed");
+		}
 	}
 	// The wait seam's wait (sslm_gpu_test_only_wait_in_flight): waits on the device's fence at the
 	// token's value through the ledger's Wait(v), which observes it, and keeps the record and the
@@ -132,11 +144,18 @@ private:
 	void Adopt() noexcept {
 		if (payload_ && payload_->submission_.rec_) inflight::Reregister(payload_->submission_.rec_, this);
 	}
+	// Frees the payload only once its submission is confirmed complete (or was already waited). A
+	// drain that strands hands it to the device's graveyard instead (review-g23 F1): the GPU may
+	// still read or write what it holds, and the device is lost by contract.
 	void DrainAndFreeNoThrow() noexcept {
 		GpuInFlightPayload* p = payload_;
 		payload_ = nullptr;
-		p->submission_.DrainNoThrow();
-		delete p;
+		SubmissionDevice* const dev = p->submission_.device();
+		if (p->submission_.DrainNoThrow()) {
+			delete p;
+		} else {
+			dev->KeepAliveStranded(p);
+		}
 	}
 	void DrainFromWalk() noexcept override {
 		if (payload_) DrainAndFreeNoThrow();

@@ -56,6 +56,8 @@ const Job kJobs[] = {
     // Allocation-fault engine: 11.4/G3, and its zero-fill leg alone in a fresh process (terminal context).
     {"11.4/G3", 3, 0, "pkvg_alloc_g3.exe", PKVG_COMMON " 11.4/G3", "fx"},
     {"11.4/G3:zerofill", 3, 0, "pkvg_alloc_g3.exe", "--pkv-fixtures={fx} =11.4/G3:zerofill", "fx"},
+    // review-g23 F2: the pooled release that meets a refcount underflow still finishes.
+    {"11.3/G3:release", 3, 0, "pkvg_alloc_g3.exe", "--pkv-fixtures={fx} =11.3/G3:release", "fx"},
     // Bench engine: 3.6d's bench prefill and its count==0 precedence.
     {"3.6d/G3:bench", 3, 0, "pkvg_bench_g3.exe", "--pkv-fixtures={fx}", "fx"},
     // Allocation-fault engine + te425 hooks: 3.6d's first touch, alone in a fresh process.

@@ -140,6 +140,71 @@ void CellTokenDestructorStrands() {
 }
 G3_CELL("G3/token/destructor-strands", CellTokenDestructorStrands);
 
+// review-g23 F1: a drain that strands must not free what the submission's work may still use. The
+// payload (a stand-in for the layer-loop record's buffers) counts its destruction: a token dropped
+// while its drain strands, a throwing Wait() that strands, and a move-assignment over a token whose
+// drain strands each hand the payload to the device's graveyard, never destroying it; a confirmed
+// drain still frees at once; the graveyard is released only when the device is destroyed.
+std::atomic<int> g_kept_payload_destroyed{0};
+struct KeptRecord final : GpuInFlightPayload {
+	~KeptRecord() override { g_kept_payload_destroyed.fetch_add(1); }
+
+private:
+	friend class superslm_gpu::harness::BasicGpuInFlightToken<KeptRecord>;
+	explicit KeptRecord(GpuSubmission&& s) : GpuInFlightPayload(std::move(s)) {}
+};
+using KeptToken = BasicGpuInFlightToken<KeptRecord>;
+
+void CellTokenStrandedKeepsPayload() {
+	g_kept_payload_destroyed.store(0);
+	const int64_t live0 = inflight::LiveRecordsForTest();
+	{
+		FakeDevice dev(/*auto_complete=*/false, /*complete_on_arm=*/false);
+		// Control: a confirmed drain frees the payload at once.
+		{
+			KeptToken t = KeptToken::Make(dev.Submit());
+			dev.Complete(1);
+		}
+		G3_CHECK_EQ(g_kept_payload_destroyed.load(), 1);
+		G3_CHECK_EQ(dev.stranded_keep_alive_count(), 0u);
+		dev.FailArms(true);
+		// (a) dropped while its drain strands.
+		{
+			KeptToken t = KeptToken::Make(dev.Submit());
+		}
+		G3_CHECK(dev.ledger().lost());
+		G3_CHECK_EQ(g_kept_payload_destroyed.load(), 1);
+		G3_CHECK_EQ(dev.stranded_keep_alive_count(), 1u);
+		// (b) the throwing wait strands: the token is emptied, the payload kept, the error thrown.
+		{
+			KeptToken t = KeptToken::Make(dev.Submit());
+			KeptRecord* const rec = t.get();
+			bool stranded = false;
+			try {
+				t.Wait();
+			} catch (const GpuSubmissionStrandedError&) {
+				stranded = true;
+			}
+			G3_CHECK(stranded);
+			G3_CHECK(!t.holds());
+			G3_CHECK(rec != nullptr);
+		}
+		G3_CHECK_EQ(g_kept_payload_destroyed.load(), 1);
+		G3_CHECK_EQ(dev.stranded_keep_alive_count(), 2u);
+		// (c) a move-assignment over a token whose drain strands.
+		{
+			KeptToken t = KeptToken::Make(dev.Submit());
+			t = KeptToken{};
+			G3_CHECK(!t.holds());
+		}
+		G3_CHECK_EQ(g_kept_payload_destroyed.load(), 1);
+		G3_CHECK_EQ(dev.stranded_keep_alive_count(), 3u);
+		G3_CHECK_EQ(inflight::LiveRecordsForTest(), live0);  // the records themselves hold nothing and are freed
+	}  // the device goes: its graveyard is released here, and only here
+	G3_CHECK_EQ(g_kept_payload_destroyed.load(), 4);
+}
+G3_CELL("G3/token/stranded-keeps-payload", CellTokenStrandedKeepsPayload);
+
 // The walk follows the record wherever a move put it, and the accessor's lowering re-registers it.
 TestToken g_file_scope_token;               // made at start-up, assigned into later
 std::unique_ptr<TestToken> g_heap_token;    // a heap token
