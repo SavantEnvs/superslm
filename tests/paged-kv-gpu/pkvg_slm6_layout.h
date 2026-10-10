@@ -4,7 +4,9 @@
 //
 // Plan §4 item 10: "SLM5 fields, plus kv_mode, budget, origin and the canonical [0, L') K/V gather of
 // §3.7". §3.7's K/V section: "kv_positions (u64) = L' = context_length + (layer_index > 0 ? 1 : 0), then
-// the rows of positions [0, L') in canonical layout" ([layer][K|V][head][pos < L'][d]). The plan fixes
+// the rows of positions [0, L') in canonical layout" ([layer][K|V][head][pos < L'][d]). On the GPU (G5
+// review ruling) L' = context_length + (0 < layer_index < num_hidden_layers ? 1 : 0): the GPU's rest at
+// layer_index == num_hidden_layers is a completed token, as the CPU's rest at 0 is. The plan fixes
 // the fields, not the offsets: these offsets are the suite's reading, and G5's builder re-anchors them
 // HERE, once, if the writer differs. Every cell that saves an SLM6 self-checks the layout against a state
 // it built (g1b Slm6LayoutMatches, g1e Slm6SelfCheck), so a stale pin turns cells red, never green.
