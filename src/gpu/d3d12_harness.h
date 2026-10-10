@@ -149,13 +149,60 @@ inline GpuFaultRule ClassifyGpuFault(bool stranded, bool device_removed, bool al
 // Other for every other cause (final).
 enum class SetupFailure { None, Allocation, Other };
 
+// Runs `f` when the scope ends, however it ends (review-g23 F1's keep-alive guards). `f` must not throw.
+template <class F>
+struct OnScopeExit {
+	F f;
+	explicit OnScopeExit(F fn) noexcept : f(std::move(fn)) {}
+	OnScopeExit(const OnScopeExit&) = delete;
+	OnScopeExit& operator=(const OnScopeExit&) = delete;
+	~OnScopeExit() { f(); }
+};
+template <class F>
+OnScopeExit(F) -> OnScopeExit<F>;
+
 // From G3 (plan §4.4, *The submission ledger*) a Device is a SubmissionDevice: its queue, command
 // allocator, fence and fence event are private, and the only ways to reset, submit and wait are
 // the base's BeginRecording(), Submit(), Wait(v), Poll(v) and Drain(), which keep the ledger. The
 // command list stays public: recording into it is not a submission.
 struct Device final : public SubmissionDevice {
 	Device() noexcept = default;
-	~Device() override = default;
+	// review-g23 F1: a stranded submission's graveyard is abandoned, never freed. The queue may
+	// still be executing that submission when the device goes (nothing confirmed its fence), and the
+	// device is lost by contract, so its keep-alives are a deliberate leak. (Releasing them after a
+	// last confirmed fence value was tried: on the software GPU it made the process crash at exit
+	// more often, not less, while vkd3d-proton still counted the stranded list as pending.)
+	~Device() override { AbandonStrandedKeepAlives(); }
+
+	// review-g23 F1: keeps `keep...` alive for ever, a deliberate reference leak, because a stranded
+	// submission's work may still read or write them (the device is lost by contract, rule 0).
+	template <class... T>
+	void KeepResourcesAliveStranded(const ComPtr<T>&... keep) noexcept {
+		(KeepOneResourceAliveStranded(keep.Get()), ...);
+	}
+	// True when work was executed since `counter_before` (a submission_counter() reading) and the
+	// ledger is now stranded: that work may still be running, so what it uses must stay alive.
+	bool StrandedSince(uint64_t counter_before) const noexcept {
+		return fence_value_counter() != counter_before && ledger().Stranded();
+	}
+	// A synchronous site's submission and wait (Submit(retry), then the submission's Wait()), with the
+	// site's per-call resources kept alive when either strands: once the Signal or the wait cannot be
+	// confirmed, the GPU may still use them, so they are not released on the way out (review-g23 F1).
+	// Throws what Submit() or Wait() throws. (A scope guard, not a catch: the library's outermost try
+	// blocks all end in catch (...), and this is not one.)
+	template <class... T>
+	void SubmitAndWaitKeepingAlive(bool retry, const ComPtr<T>&... keep) {
+		const uint64_t counter_before = submission_counter();
+		const OnScopeExit keep_on_strand{[&]() noexcept {
+			if (StrandedSince(counter_before)) KeepResourcesAliveStranded(keep...);
+		}};
+		Submit(retry).Wait();
+	}
+	void KeepOneResourceAliveStranded(IUnknown* p) noexcept {
+		if (p == nullptr) return;
+		p->AddRef();  // never Released: see KeepResourcesAliveStranded
+		NoteStrandedKeepAlive();
+	}
 
 	ComPtr<IDXGIAdapter1> adapter;
 	ComPtr<ID3D12Device> dev;
@@ -965,7 +1012,7 @@ public:
 		list->ResourceBarrier(1, &b);
 		list->CopyResource(readback.Get(), uav.Get());
 		CloseListOrThrow();
-		Submit(/*retry=*/false).Wait();
+		SubmitAndWaitKeepingAlive(/*retry=*/false, in_buf, uav, readback);
 		std::vector<uint8_t> out(out_bytes);
 		void* p = nullptr;
 		D3D12_RANGE range{0, (SIZE_T)out_bytes};
