@@ -8,6 +8,7 @@
 #error A C6 production pair must not carry a seam or injection definition.
 #endif
 #include "pkv_budget_c_helpers.h"
+#include "pkv_scatter_reserve.h"
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -129,9 +130,13 @@ void Pairs(int argc,char** argv,bool shared){
 // one "PAIR <paged_ns> <contiguous_ns> <paged_token> <contiguous_token>" line per timed pair (W untimed warm-up tokens
 // per arm first; each pair's order drawn at random from SEED + K; each token one sslm_decode_step, timed alone); then
 // "IDS ..." with the paged holder's mapped page ids in logical order (the scatter guard's input). The driver grades
-// tokens and pair counts; this executable reports them. The paged arm's reserve is the pool's fresh order: the
-// scattered-reserve construction cell 7.9 needs is the test author's (plan §20.2), so until it lands the guard reads
-// ascending ids and the driver records the row NO RESULT.
+// tokens and pair counts; this executable reports them. The paged arm's reserve is scattered before the restore by the
+// test author's construction (tests/paged-kv/pkv_scatter_reserve.h, ScatterReserve at kScatterReserveSeed; plan cell
+// 7.9, §20.2; T-3189 §11.1): P - 1 one-page budget-1 prefixes, one token prefilled and frozen each, released in a
+// fixed shuffled order, so the holder draws a permutation of single pages the guard grades. The seed is fixed, so all
+// five processes read equal ids; the cost is P - 1 one-token prefills per process, untimed, reported on stderr. The
+// contiguous arm is one page per block and needs no reserve order. 7.9-MR-OPT's pair is this source, so it scatters at
+// its own B = 16.
 void Row79(int argc,char** argv){
 	Require(argc==17,"row79 argument count");
 	const char *blob_path=nullptr,*model_path=nullptr;int process=-1,pairs=-1,warmup=-1;
@@ -151,6 +156,10 @@ void Row79(int argc,char** argv){
 	const uint32_t seed=Seed(argv[6]);
 	const std::vector<uint8_t> blob=Blob(blob_path);Require(IsMagic(blob,"SSB5"),"row blob is not a legacy SSB5");
 	LegacyPool page(fx.model,1);Require(page.status==SSLM_OK,"page pool failed");
+	{const int64_t B=sslm_kv_page_positions(fx.model);Require(B>0,"no page size");
+		const uint32_t pages=static_cast<uint32_t>((static_cast<int64_t>(fx.geo.context_cap)+B-1)/B);uint32_t singles=0;
+		Require(ScatterReserve(fx.model,&page.pool,kScatterReserveSeed,&singles)==SSLM_OK&&singles+1==pages,"scattered reserve");
+		std::cerr<<"row79: scattered reserve of "<<pages<<" pages at B = "<<B<<": "<<singles<<" one-token prefills\n";}
 	ContiguousPool contig(fx.model,1);Require(contig.status==SSLM_OK,"contiguous pool failed");
 	sslm_seq paged=nullptr,contiguous=nullptr;
 	Require(sslm_seq_restore(fx.model,&page.pool,blob.data(),blob.size(),&paged)==SSLM_OK,"paged restore failed");
