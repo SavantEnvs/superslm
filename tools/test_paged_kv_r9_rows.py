@@ -19,6 +19,13 @@ Cells (cell 7.9's text; the 79-series rows of the instrument table):
           standing, a missing pair executable; F-12 a refused run supersedes an existing record, the rerun limit too;
           F-2 a crash after a seam identity is rerun, a transient crash is rerun; F-11 the RESERVE line recorded; F-9 an
           OS-lock holder mid-recovery refuses a second runner
+  T7      (T-3203 remedies, SuperSLM 371dc34; class T7Remedies) N-1 (D-SLM8463) the --construction label in the
+          process and row records, a construction at another page size refused before any run, the aggregate slot
+          record (R79A from MA-1 R2b/R4a/R4b and MA-2 R4a; R79MR from 7.9-MR-OPT R2b/R4a/R4b) STANDING only when every
+          run stands, each of its refusals, a REFUSED run making it REFUSED, its argument errors, and the superseding
+          record's construction and page positions; N-8 a malformed PAIR line exits 64, a malformed IDS or RESERVE line
+          70, an unexpected driver fault 70 (never a raw crash), each superseding an existing record and writing none
+          on a fresh path; D-SLM8465 (class R3Slot) the 7.9b record names slot R3 and an unslotted record is rerun
   loop    (T-3196 F-6) 79-6 to 79-9 through the driver's process loop, as a process: five processes against a
           stand-in pair executable, each refusal injected into process 3 (a blob changed after process 2, a seam
           identity line, a token mismatch at pair 57, 103 pairs); the exit status is EXIT_CODES[kind], the refused
@@ -27,7 +34,8 @@ Cells (cell 7.9's text; the 79-series rows of the instrument table):
           a healthy row exits 0 with five process records and a graded row record
 
 PKV_ROWS_DRIVER, when set, names the driver file under test instead of tools/run_paged_kv_rows.py (the test author's
-scratch reference and its mutants run through it); unset, the shipped driver is what every cell grades.
+scratch reference and its mutants run through it); unset, the shipped driver is what every cell grades. PKV_PAIRS_RUNNER
+does the same for tools/run_paged_kv_pairs.py (class R3Slot).
 """
 import collections
 import importlib.util
@@ -322,7 +330,14 @@ print("PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE" if kind in ("seam", "c
 if os.environ.get("PKV_STANDIN_RESERVE"):
     print(os.environ["PKV_STANDIN_RESERVE"])
 for i in range(a.pairs - 1 if kind == "pairs" and mine else a.pairs):
+    if kind == "badpair" and mine and i == 40:
+        print("PAIR 1010000 1.0e6x 7 7")
+        continue
     print(f"PAIR 1010000 1000000 7 {8 if kind == 'token' and mine and i == 57 else 7}")
+if kind == "undecodable" and mine:
+    sys.stdout.flush()
+    sys.stdout.buffer.write(bytes([78, 79, 84, 69, 32, 0x81, 0x8d, 10]))
+    sys.stdout.buffer.flush()
 print("IDS " + " ".join(str(i) for i in json.loads(os.environ["PKV_STANDIN_IDS"])))
 if kind == "blob" and a.process == at - 1:
     Path(a.blob).write_bytes(Path(a.blob).read_bytes() + b"changed")
@@ -518,6 +533,325 @@ class T6Remedies(unittest.TestCase):
         with self.assertRaises(rows.Refusal):
             with rows.timing_lock(self.root / "b.json", lock_path=lock):
                 pass
+
+
+# ---- T-3203 (confirmation review) remedies, SuperSLM 371dc34: one pin cell per landed remedy. Each fails with that
+# remedy reverted (the test author's record, T-3189 §14, runs each revert) and passes on the built driver.
+POSITIONS = {"production": 64, "MA-1": 64, "MA-2": 64, "7.9-MR-OPT": 16}
+R79A_RUNS = (("MA-1", "R2b"), ("MA-1", "R4a"), ("MA-1", "R4b"), ("MA-2", "R4a"))
+R79MR_RUNS = (("7.9-MR-OPT", "R2b"), ("7.9-MR-OPT", "R4a"), ("7.9-MR-OPT", "R4b"))
+
+
+def ids_for(slot, positions):
+    """An id list of the n the row reads (in any order: an ascending list reads NO RESULT, which still stands)."""
+    n = (PRODUCTION if positions == 64 else MR_OPT)[slot][0]
+    return list(range(n))
+
+
+class T7Remedies(unittest.TestCase):
+    built = None  # the healthy row records the aggregate cells start from, written once by the driver itself
+
+    @classmethod
+    def setUpClass(cls):
+        cls.shared = tempfile.TemporaryDirectory(prefix="t3189-r9-t7-")
+        root = Path(cls.shared.name)
+        cls.model, cls.manifest, _ = row_inputs(root)
+        cls.standin = root / "standin_pair.py"
+        cls.standin.write_text(STANDIN)
+        cls.built = {}
+        for construction, row in R79A_RUNS + R79MR_RUNS + (("production", "R2b"),):
+            result = root / "runs" / f"{construction}-{row}.json"
+            done = cls.drive(root, row, result, construction)
+            if done.returncode != 0:
+                cls.shared.cleanup()
+                raise AssertionError(f"{construction} {row}: exit {done.returncode}\n{done.stderr[-2000:]}")
+            cls.built[(construction, row)] = json.loads(result.read_text(encoding="utf-8"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.shared.cleanup()
+
+    @classmethod
+    def drive(cls, root, row, result, construction="production", positions=None, inject="", ids=None, reserve="",
+              drop=(), log=None, extra=()):
+        positions = POSITIONS[construction] if positions is None else positions
+        env = dict(os.environ, PKV_STANDIN_INJECT=inject, PKV_STANDIN_LOG=str(log or root / "standin.log"),
+                   PKV_STANDIN_IDS=json.dumps(ids if ids is not None else ids_for(row, POSITIONS[construction])),
+                   PKV_STANDIN_RESERVE=reserve)
+        flags = {"--pair-cmd": json.dumps([sys.executable, "-I", str(cls.standin)]), "--manifest": str(cls.manifest),
+                 "--model": str(cls.model), "--restore": "1200", "--slot": row, "--result": str(result),
+                 "--lock": str(root / "pkv-c6-timing.lock"), "--page-positions": str(positions),
+                 "--construction": construction}
+        cmd = [sys.executable, "-I", str(SCRIPT)]
+        for flag, value in flags.items():
+            if flag not in drop:
+                cmd += [flag, value]
+        cmd += list(extra)
+        Path(result).parent.mkdir(parents=True, exist_ok=True)
+        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="t3189-r9-t7case-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.log = self.root / "standin.log"
+        self.result = self.root / "row.json"
+
+    def ran(self):
+        return [int(x) for x in self.log.read_text().split()] if self.log.exists() else []
+
+    def record(self, path=None):
+        return json.loads(Path(path or self.result).read_text(encoding="utf-8"))
+
+    def runs(self, keys, edit=None):
+        """Copies of the built row records for `keys` in this case's directory; `edit` maps a key to a change (None:
+        no file; a string: the file's raw text)."""
+        paths = []
+        for i, key in enumerate(keys):
+            record = dict(self.built[key])
+            if edit and key in edit:
+                record = edit[key](record)
+            path = self.root / "runs" / f"{i}-{key[0]}-{key[1]}.json"
+            path.parent.mkdir(exist_ok=True)
+            if isinstance(record, str):
+                path.write_text(record, encoding="utf-8")
+            elif record is not None:
+                path.write_text(json.dumps(record), encoding="utf-8")
+            paths.append(path)
+        return paths
+
+    def aggregate(self, slot, runs, result=None, flag=True):
+        cmd = [sys.executable, "-I", str(SCRIPT)] + (["--aggregate"] if flag else []) + [
+            "--slot", slot, "--result", str(result or self.result)]
+        if runs is not None:
+            cmd += ["--runs"] + [str(r) for r in runs]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+    # N-1 (D-SLM8463): --construction is recorded in every process record and in the row record, with its page size
+    def test_n1_construction_is_recorded(self):
+        for (construction, row), rec in self.built.items():
+            with self.subTest(construction=construction, row=row):
+                self.assertEqual((rec.get("construction"), rec.get("page_positions"), rec.get("status")),
+                                 (construction, POSITIONS[construction], "STANDING"))
+        for key in (("MA-2", "R4a"), ("7.9-MR-OPT", "R4b")):
+            for name in self.built[key]["processes"]:
+                proc = self.record(Path(self.shared.name) / "runs" / name)
+                self.assertEqual((proc.get("construction"), proc.get("page_positions")), (key[0], POSITIONS[key[0]]),
+                                 name)
+        done = self.drive(self.root, "R2a", self.result, drop=("--construction",), log=self.log)
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertEqual(self.record().get("construction"), "production")
+
+    # N-1: a construction at another page size refuses (70) before any process runs, writing nothing
+    def test_n1_construction_at_another_page_size_refused(self):
+        for construction, positions, row in (("7.9-MR-OPT", 64, "R2b"), ("MA-1", 16, "R2b"), ("production", 16, "R4a"),
+                                             ("MA-2", 16, "R4b")):
+            with self.subTest(construction=construction, positions=positions):
+                self.log.unlink(missing_ok=True)
+                done = self.drive(self.root, row, self.result, construction, positions, log=self.log)
+                self.assertEqual(done.returncode, 70, done.stderr[-2000:])
+                self.assertEqual(self.ran(), [])
+                self.assertEqual(sorted(p.name for p in self.root.iterdir()), [])
+
+    # N-1: R79A's slot record from its four runs, R79MR's from its three; STANDING (exit 0) when every run stands
+    def test_n1_aggregate_standing(self):
+        for slot, keys in (("R79A", R79A_RUNS), ("R79MR", R79MR_RUNS)):
+            with self.subTest(slot=slot):
+                result = self.root / f"{slot}.json"
+                done = self.aggregate(slot, self.runs(keys), result)
+                self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+                rec = self.record(result)
+                self.assertEqual((rec.get("slot"), rec.get("aggregate"), rec.get("status")), (slot, True, "STANDING"))
+                self.assertEqual(sorted((r["construction"], r["row"]) for r in rec["runs"]), sorted(keys))
+                self.assertTrue(all(r["status"] == "STANDING" for r in rec["runs"]))
+                self.assertEqual(rec.get("exe_sha256"), sha(Path(sys.executable).resolve()))
+
+    # N-1: each refusal of the aggregate exits 70; on a fresh path it writes nothing, and over an existing record it
+    # supersedes it with a REFUSED record
+    def test_n1_aggregate_refusals(self):
+        A = R79A_RUNS
+        cases = {
+            "missing run": (A, {A[1]: lambda r: None}, "missing or torn"),
+            "torn run": (A, {A[1]: lambda r: '{"slot": "R4a", "stat'}, "missing or torn"),
+            "status not STANDING or REFUSED": (A, {A[2]: lambda r: {**r, "status": "QUARANTINED"}}, "status"),
+            "status absent": (A, {A[2]: lambda r: {k: v for k, v in r.items() if k != "status"}}, "status"),
+            "page positions not the construction's": (A, {A[0]: lambda r: {**r, "page_positions": 16}},
+                                                      "page positions"),
+            "a run short": (A[:3], None, "owed"),
+            "a run duplicated": (A[:3] + (A[1],), None, "owed"),
+            "an extra run": (A + (("production", "R2b"),), None, "owed"),
+            "another slot's runs": (R79MR_RUNS, None, "owed"),
+            "a row relabelled": (A, {A[3]: lambda r: {**r, "slot": "R4b"}}, "owed"),
+            "a construction relabelled": (A, {A[3]: lambda r: {**r, "construction": "MA-1"}}, "owed"),
+            "exe_sha256 differs": (A, {A[2]: lambda r: {**r, "exe_sha256": "0" * 64}}, "differ"),
+            "exe_sha256 missing on one": (A, {A[2]: lambda r: {**r, "exe_sha256": None}}, "differ"),
+            "exe_sha256 missing on all": (A, {k: (lambda r: {**r, "exe_sha256": None}) for k in A}, "differ"),
+        }
+        for name, (keys, edit, why) in cases.items():
+            with self.subTest(case=name):
+                for f in self.root.glob("runs/*"):
+                    f.unlink()
+                runs = self.runs(keys, edit)
+                fresh = self.root / "fresh.json"
+                fresh.unlink(missing_ok=True)  # each case starts on a fresh path
+                done = self.aggregate("R79A", runs, fresh)
+                self.assertEqual(done.returncode, 70, f"{name}: exit {done.returncode}\n{done.stderr[-1500:]}")
+                self.assertIn(why, done.stderr)
+                self.assertFalse(fresh.exists(), f"{name}: a refused aggregate wrote a record on a fresh path")
+                standing = self.root / "standing.json"
+                standing.write_text(json.dumps({"slot": "R79A", "aggregate": True, "status": "STANDING", "runs": []}))
+                done = self.aggregate("R79A", runs, standing)
+                self.assertEqual(done.returncode, 70)
+                rec = self.record(standing)
+                self.assertEqual((rec.get("status"), rec.get("exit_code"), rec.get("verdict")), ("REFUSED", 70, None),
+                                 f"{name}: the earlier aggregate record still stands")
+                self.assertIn("superseded", rec)
+
+    # N-1: a run the driver refused (its record superseded REFUSED) makes the aggregate REFUSED, exit 70; the
+    # superseding record carries its construction and page positions
+    def test_n1_refused_run_makes_the_aggregate_refused(self):
+        for slot, keys, refused in (("R79A", R79A_RUNS, ("MA-2", "R4a")),
+                                    ("R79MR", R79MR_RUNS, ("7.9-MR-OPT", "R4b"))):
+            with self.subTest(slot=slot):
+                runs = self.runs(keys)
+                target = runs[keys.index(refused)]
+                done = self.drive(self.root, refused[1], target, refused[0], inject="seam@2", log=self.log)
+                self.assertEqual(done.returncode, 62, done.stderr[-2000:])
+                sup = self.record(target)
+                self.assertEqual((sup.get("status"), sup.get("construction"), sup.get("page_positions")),
+                                 ("REFUSED", refused[0], POSITIONS[refused[0]]))
+                result = self.root / f"{slot}.json"
+                done = self.aggregate(slot, runs, result)
+                self.assertEqual(done.returncode, 70, done.stderr[-2000:])
+                rec = self.record(result)
+                self.assertEqual((rec.get("aggregate"), rec.get("status")), (True, "REFUSED"))
+                self.assertEqual([r["status"] for r in rec["runs"]].count("REFUSED"), 1)
+
+    # N-1: the argument errors exit 70 and write nothing; a row run missing an input never starts a process
+    def test_n1_argument_errors(self):
+        runs = self.runs(R79A_RUNS)
+        for slot in ("R2b", "R4a", "R3", "R79"):
+            with self.subTest(aggregate_slot=slot):
+                self.assertEqual(self.aggregate(slot, runs).returncode, 70)
+                self.assertFalse(self.result.exists())
+        with self.subTest(case="--aggregate without --runs"):
+            self.assertEqual(self.aggregate("R79A", None).returncode, 70)
+            self.assertFalse(self.result.exists())
+        with self.subTest(case="--runs without --aggregate"):
+            # a complete row run otherwise: only --runs makes it an argument error
+            self.log.unlink(missing_ok=True)
+            done = self.drive(self.root, "R2a", self.result, log=self.log, extra=["--runs"] + [str(r) for r in runs])
+            self.assertEqual(done.returncode, 70, done.stderr[-2000:])
+            self.assertEqual(self.ran(), [])
+            self.assertFalse(self.result.exists())
+        for flag in ("--pair-cmd", "--manifest", "--model", "--restore"):
+            with self.subTest(missing=flag):
+                self.log.unlink(missing_ok=True)
+                self.result.unlink(missing_ok=True)
+                done = self.drive(self.root, "R2a", self.result, drop=(flag,), log=self.log)
+                self.assertEqual(done.returncode, 70, done.stderr[-2000:])
+                # the argument check's own refusal, before the lock and the executable's hash (not the catch-all's)
+                self.assertIn("a row run needs " + flag, done.stderr)
+                self.assertEqual(self.ran(), [])
+                self.assertFalse(self.result.exists())
+
+    def standing_row(self):
+        done = self.drive(self.root, "R2a", self.result, log=self.log)
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertEqual(self.record().get("status"), "STANDING")
+        self.log.unlink()
+
+    def refusal(self, code, **kw):
+        """The same refusal on a fresh path (no record) and over a standing record (superseded REFUSED)."""
+        fresh = self.root / "fresh.json"
+        done = self.drive(self.root, "R2a", fresh, log=self.log, **kw)
+        self.assertEqual(done.returncode, code, done.stderr[-2000:])
+        self.assertIn("REFUSED", done.stderr)
+        self.assertFalse(fresh.exists())
+        self.log.unlink(missing_ok=True)
+        self.standing_row()
+        done = self.drive(self.root, "R2a", self.result, log=self.log, **kw)
+        self.assertEqual(done.returncode, code, done.stderr[-2000:])
+        rec = self.record()
+        self.assertEqual((rec.get("status"), rec.get("exit_code"), rec.get("verdict")), ("REFUSED", code, None))
+        self.assertIn("superseded", rec)
+        return done, rec
+
+    # N-8: a PAIR line that does not parse refuses as the pairs kind, 64
+    def test_n8_malformed_pair_line_exits_64(self):
+        _, rec = self.refusal(64, inject="badpair@2")
+        self.assertIn("malformed pair line", rec.get("reason", ""))
+
+    # N-8: an IDS line that does not parse refuses as infrastructure, 70
+    def test_n8_malformed_ids_line_exits_70(self):
+        _, rec = self.refusal(70, ids=["7", "x9"] + list(range(19)))
+        self.assertIn("malformed IDS line", rec.get("reason", ""))  # its own refusal, not the catch-all's
+
+    # N-8: a RESERVE line whose seed or singles is not an integer refuses as infrastructure, 70
+    def test_n8_malformed_reserve_line_exits_70(self):
+        for line in ("RESERVE seed=x1 singles=63 source=h", "RESERVE seed=1 singles=6.3 source=h"):
+            with self.subTest(line=line):
+                self.setUp()
+                _, rec = self.refusal(70, reserve=line)
+                self.assertIn("malformed RESERVE line", rec.get("reason", ""))  # its own refusal, not the catch-all's
+
+    # N-8: a fault the driver did not anticipate (here, process output that does not decode) refuses through the
+    # driver's own code: 70, never Python's 1, and the earlier record is superseded
+    def test_n8_driver_fault_exits_70_not_1(self):
+        done, rec = self.refusal(70, inject="undecodable@1")
+        self.assertIn("driver fault", rec.get("reason", ""))
+
+
+class R3Slot(unittest.TestCase):
+    """D-SLM8465: the 7.9b leg's record names its run-list slot, R3, and a record without it is rerun, not reused."""
+
+    def setUp(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        self.temp = tempfile.TemporaryDirectory(prefix="t3189-r9-r3-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        path = Path(os.environ.get("PKV_PAIRS_RUNNER") or Path(__file__).with_name("run_paged_kv_pairs.py"))
+        spec = importlib.util.spec_from_file_location("paged_kv_pairs_r3", path)
+        self.pair = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.pair)
+        model = self.root / "model.sslm"
+        model.write_bytes(b"model")
+        self.args = SimpleNamespace(exe=self.root / "superslm_pkv_pair.exe", kind="79b", model_a=model, model_b=None,
+                                    manifest_a=None, manifest_b=None, result=self.root / "r3.json", cap_a=4096,
+                                    cap_b=None, layers=2, heads=2, dim=48, width=1712, pairs=508, seed=7904,
+                                    cap_seconds=10, mechanism=False)
+        self.calls = 0
+
+        def fake_run(command, log, cap, env):
+            self.calls += 1
+            Path(command[-1]).write_text("".join(f"{i},A,100,101,12,12\n" for i in range(508)))
+            return 0
+        for name, kw in (("BOX_LOCK", {"new": self.root / "global.lock"}),
+                         ("production_library", {"return_value": ("exe", "lib")}),
+                         ("box_observation", {"return_value": {"cpu_percent": 1}}),
+                         ("run_logged", {"side_effect": fake_run})):
+            patcher = mock.patch.object(self.pair, name, **kw)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_r3_record_names_its_slot(self):
+        record = self.pair.run(self.args)
+        self.assertEqual(record.get("slot"), "R3")
+        self.assertEqual(json.loads(self.args.result.read_text(encoding="utf-8")).get("slot"), "R3")
+
+    def test_r3_slotted_record_is_reused_and_unslotted_record_is_rerun(self):
+        self.pair.run(self.args)
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(self.pair.run(self.args).get("slot"), "R3")
+        self.assertEqual(self.calls, 1, "a slotted record was not reused")
+        on_disk = json.loads(self.args.result.read_text(encoding="utf-8"))
+        del on_disk["slot"]
+        self.args.result.write_text(json.dumps(on_disk), encoding="utf-8")
+        record = self.pair.run(self.args)
+        self.assertEqual(self.calls, 2, "a record without its slot was reused")
+        self.assertEqual(record.get("slot"), "R3")
+        self.assertEqual(json.loads(self.args.result.read_text(encoding="utf-8")).get("slot"), "R3")
 
 
 class Process(unittest.TestCase):

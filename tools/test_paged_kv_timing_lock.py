@@ -1,0 +1,281 @@
+"""Cells for the box timing lock's one format and protocol across its three programs (T-3203 N-2, D-SLM8464; SuperSLM
+371dc34; the test author's record T-3189 §14). Every holder and every contender is its own process, so each program
+meets the others' real pids:
+
+  driver   tools/run_paged_kv_rows.py's timing_lock (the 7.9 driver)
+  pidlock  tools/run_paged_kv_pairs.py's PidLock (the 7.9b and legacy pair legs)
+  ps1      tools/paged_kv_c6_provenance.ps1's Enter-PkvTimingLock / Exit-PkvTimingLock (7.4 and lifecycle)
+
+  live     a live holder of any program is refused by every program, and the file holds the holder's bare pid
+  reader   a release while another process holds the file open leaves the releaser's pid (never an empty file); once
+           both have exited, every program recovers it, and its own release removes the file
+  killed   a holder killed hard is recovered by every program
+  empty    an empty lock file is stale: every program acquires it
+  oslock   another process holding the OS byte (offset 1 MiB) over a dead pid: every program refuses
+  race     four concurrent contenders of one program over a dead owner's file: exactly one holds
+  ownpid   the driver refuses a lock that names its own live pid (it is not stale)
+  release  a release unlinks only a file that still holds the releaser's pid
+  publish  (the two Python programs, by audit hook) a fresh acquire never opens the lock path itself: the path's first
+           and only event is the move (rename, or link) of the temporary file holding the pid into place, so the lock
+           is never visible empty. The PowerShell acquire is not observable this way (record T-3189 §14).
+
+PKV_ROWS_DRIVER, PKV_PAIRS_RUNNER and PKV_PROVENANCE_PS1 name the programs under test (default: this checkout's); the
+test author runs the remedy reverted through them.
+"""
+import importlib.util
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import unittest
+
+TOOLS = Path(__file__).resolve().parent
+DRIVER = Path(os.environ.get("PKV_ROWS_DRIVER") or TOOLS / "run_paged_kv_rows.py")
+PAIRS = Path(os.environ.get("PKV_PAIRS_RUNNER") or TOOLS / "run_paged_kv_pairs.py")
+PS1 = Path(os.environ.get("PKV_PROVENANCE_PS1") or TOOLS / "paged_kv_c6_provenance.ps1")
+PROGRAMS = ("driver", "pidlock", "ps1")
+
+PY_AGENT = textwrap.dedent(r'''
+    import importlib.util, sys
+    from pathlib import Path
+    program, path, lock, action = sys.argv[1], sys.argv[2], Path(sys.argv[3]), sys.argv[4]
+    spec = importlib.util.spec_from_file_location("leg", path)
+    leg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(leg)
+    events = []
+    if action == "audit":
+        target = str(lock)
+        def hook(event, args):
+            # open: (path, mode, flags); os.rename / os.link / os.replace: (src, dst, ...)
+            if event == "open" and str(args[0]) == target:
+                events.append(["open", str(args[0]), str(args[1]), str(args[2])])
+            elif event in ("os.rename", "os.link", "os.replace") and target in (str(args[0]), str(args[1])):
+                events.append([event, str(args[0]), str(args[1])])
+        sys.addaudithook(hook)
+    try:
+        if program == "driver":
+            ctx = leg.timing_lock(lock.with_name("result.json"), lock_path=lock)
+        else:
+            ctx = leg.PidLock(lock)
+        ctx.__enter__()
+    except leg.Refusal as refusal:
+        print("REFUSED", refusal, flush=True)
+        sys.exit(3)
+    if action == "audit":
+        import json
+        print("HELD " + json.dumps(events), flush=True)
+    else:
+        print("HELD", flush=True)
+    if action == "hold":
+        sys.stdin.readline()
+    ctx.__exit__(None, None, None)
+    print("RELEASED", flush=True)
+''')
+
+PS_AGENT = textwrap.dedent(r'''
+    param([string]$Script, [string]$Lock, [string]$Action)
+    $ErrorActionPreference = 'Stop'
+    . $Script
+    try { $null = Enter-PkvTimingLock -Path $Lock } catch { [Console]::Out.WriteLine("REFUSED $($_.Exception.Message)"); [Console]::Out.Flush(); exit 3 }
+    [Console]::Out.WriteLine("HELD"); [Console]::Out.Flush()
+    if ($Action -eq 'hold') { $null = [Console]::In.ReadLine() }
+    Exit-PkvTimingLock -Path $Lock
+    [Console]::Out.WriteLine("RELEASED"); [Console]::Out.Flush()
+''')
+
+
+class TimingLock(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="t3189-lock-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.lock = self.root / "pkv-c6-timing.lock"
+        (self.root / "agent.py").write_text(PY_AGENT)
+        (self.root / "agent.ps1").write_text(PS_AGENT)
+        self.procs = []
+        self.addCleanup(self.cleanup)
+
+    def cleanup(self):
+        for p in self.procs:
+            if p.poll() is None:
+                p.kill()
+            p.wait()
+            for s in (p.stdin, p.stdout):
+                if s:
+                    s.close()
+
+    def command(self, program, action):
+        if program == "ps1":
+            return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(self.root / "agent.ps1"),
+                    "-Script", str(PS1), "-Lock", str(self.lock), "-Action", action]
+        return [sys.executable, "-I", str(self.root / "agent.py"), program, str(DRIVER if program == "driver" else PAIRS),
+                str(self.lock), action]
+
+    def start(self, program, action="hold"):
+        p = subprocess.Popen(self.command(program, action), stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.procs.append(p)
+        return p
+
+    def first_line(self, p):
+        return (p.stdout.readline() or "").strip()
+
+    def hold(self, program):
+        """A holder process: returns it once it reports HELD."""
+        p = self.start(program)
+        line = self.first_line(p)
+        self.assertEqual(line, "HELD", f"{program} could not take a fresh lock: {line}")
+        return p
+
+    def release(self, p):
+        p.stdin.write("release\n")
+        p.stdin.flush()
+        self.assertEqual(self.first_line(p), "RELEASED")
+        p.wait(timeout=60)
+
+    def attempt(self, program, action="once"):
+        """One acquire-and-release attempt in its own process: 'HELD' or 'REFUSED ...'."""
+        done = subprocess.run(self.command(program, action), capture_output=True, text=True, timeout=120)
+        return (done.stdout.strip().splitlines() or [""])[0]
+
+    def dead_pid(self):
+        p = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
+        p.wait()
+        return p.pid
+
+    def content(self):
+        return self.lock.read_bytes().decode("ascii", "replace") if self.lock.exists() else None
+
+    # live: every program refuses every program's live holder; the file holds the bare pid
+    def test_live_holder_is_refused_by_every_program(self):
+        for holder in PROGRAMS:
+            h = self.hold(holder)
+            self.assertEqual(self.content(), str(h.pid), f"{holder}'s lock file is not its bare pid")
+            for contender in PROGRAMS:
+                with self.subTest(holder=holder, contender=contender):
+                    self.assertTrue(self.attempt(contender).startswith("REFUSED"), f"{contender} took {holder}'s lock")
+            self.release(h)
+            self.assertFalse(self.lock.exists(), f"{holder}'s release left the file")
+
+    # reader: a release with the file held open by a reader leaves the releaser's pid; once both exit, every program
+    # recovers it and its own release removes the file
+    def test_release_with_a_reader_leaves_the_pid_then_recovers(self):
+        for holder in PROGRAMS:
+            for contender in PROGRAMS:
+                with self.subTest(holder=holder, contender=contender):
+                    h = self.hold(holder)
+                    reader = subprocess.Popen([sys.executable, "-I", "-c",
+                                               "import sys,time; f=open(sys.argv[1],'rb'); print('open', flush=True); "
+                                               "sys.stdin.readline()", str(self.lock)],
+                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                    self.procs.append(reader)
+                    self.assertEqual(self.first_line(reader), "open")
+                    self.release(h)
+                    self.assertEqual(self.content(), str(h.pid), "the release left no pid, or an empty file")
+                    reader.stdin.write("done\n")
+                    reader.stdin.flush()
+                    reader.wait(timeout=30)
+                    self.assertEqual(self.attempt(contender), "HELD", f"{contender} did not recover {holder}'s pid")
+                    self.assertFalse(self.lock.exists(), f"{contender}'s release did not remove the file")
+
+    # killed: a holder killed hard is recovered by every program
+    def test_killed_holder_is_recovered(self):
+        for holder in PROGRAMS:
+            for contender in PROGRAMS:
+                with self.subTest(holder=holder, contender=contender):
+                    h = self.hold(holder)
+                    h.kill()
+                    h.wait()
+                    self.assertEqual(self.attempt(contender), "HELD")
+                    self.assertFalse(self.lock.exists())
+
+    # empty: an empty lock file is stale
+    def test_empty_file_is_stale(self):
+        for contender in PROGRAMS:
+            with self.subTest(contender=contender):
+                self.lock.write_bytes(b"")
+                self.assertEqual(self.attempt(contender), "HELD")
+                self.assertFalse(self.lock.exists())
+
+    # oslock: another process holding the OS byte over a dead pid makes every program refuse
+    def test_os_byte_held_over_a_dead_pid_refuses(self):
+        self.lock.write_text(str(self.dead_pid()))
+        byte = subprocess.Popen([sys.executable, "-I", "-c", textwrap.dedent('''
+            import msvcrt, os, sys
+            fd = os.open(sys.argv[1], os.O_RDWR | os.O_BINARY)
+            os.lseek(fd, 1 << 20, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            print("byte", flush=True)
+            sys.stdin.readline()
+            ''') if os.name == "nt" else textwrap.dedent('''
+            import fcntl, os, sys
+            fd = os.open(sys.argv[1], os.O_RDWR)
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 1 << 20)
+            print("byte", flush=True)
+            sys.stdin.readline()
+            '''), str(self.lock)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.procs.append(byte)
+        self.assertEqual(self.first_line(byte), "byte")
+        for contender in PROGRAMS:
+            with self.subTest(contender=contender):
+                self.assertTrue(self.attempt(contender).startswith("REFUSED"))
+
+    # race: four concurrent contenders of one program over a dead owner's file: exactly one holds
+    def test_concurrent_recoverers_yield_one_holder(self):
+        for program in PROGRAMS:
+            with self.subTest(program=program):
+                self.lock.write_text(str(self.dead_pid()))
+                contenders = [self.start(program) for _ in range(4)]
+                lines = [self.first_line(p) for p in contenders]
+                holders = [p for p, line in zip(contenders, lines) if line == "HELD"]
+                self.assertEqual(len(holders), 1, f"{program}: {lines}")
+                for p in holders:
+                    self.release(p)
+                for p in contenders:
+                    p.wait(timeout=60)
+
+    # ownpid: the driver does not treat its own live pid as recoverable
+    def test_driver_refuses_a_lock_naming_its_own_pid(self):
+        spec = importlib.util.spec_from_file_location("rows_driver", DRIVER)
+        rows = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rows)
+        self.lock.write_text(str(os.getpid()))
+        with self.assertRaises(rows.Refusal):
+            with rows.timing_lock(self.root / "r.json", lock_path=self.lock):
+                pass
+        self.assertEqual(self.content(), str(os.getpid()))
+
+    # release: a release unlinks only a file that still holds the releaser's pid
+    def test_release_unlinks_only_its_own_pid(self):
+        for holder in PROGRAMS:
+            with self.subTest(holder=holder):
+                h = self.hold(holder)
+                other = str(self.dead_pid())
+                self.lock.write_text(other)  # the file now names another pid
+                self.release(h)
+                self.assertEqual(self.content(), other, f"{holder}'s release removed or changed another pid's lock")
+                self.lock.unlink()
+
+    # publish: a fresh acquire moves the pid into place; it never opens the lock path to create or write it
+    def test_fresh_acquire_moves_the_pid_into_place(self):
+        import json
+        for program in ("driver", "pidlock"):
+            with self.subTest(program=program):
+                line = self.attempt(program, "audit")
+                self.assertTrue(line.startswith("HELD "), line)
+                events = json.loads(line[5:])
+                self.assertTrue(events, f"{program}: no event touched the lock path")
+                first = events[0]
+                self.assertIn(first[0], ("os.rename", "os.link", "os.replace"), f"{program} opened the lock: {events}")
+                self.assertEqual(first[2], str(self.lock), f"{program}: the move's target is not the lock: {first}")
+                self.assertNotEqual(first[0], "os.replace", f"{program}: the move replaces an existing lock")
+                # after the move, only the release's read of the pid touches the path
+                self.assertFalse([e for e in events[1:] if e[0] != "open" or e[2] not in ("r", "rb")],
+                                 f"{program} wrote the lock after moving it into place: {events}")
+                self.assertFalse(self.lock.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
