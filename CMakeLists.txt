@@ -168,6 +168,19 @@ else()
 	target_compile_options(gpu_kv_page_addr_tests PRIVATE -Wall -Wextra -ffp-contract=off)
 endif()
 add_test(NAME gpu_kv_page_addr_tests COMMAND gpu_kv_page_addr_tests)
+
+# Paged-KV plan (rev 16.1) step G3: the GPU page pool's host-only arithmetic (src/gpu/
+# gpu_kv_pool_geometry.h: page geometry, the 2^32 size refusal, R(budget), the zero-fill's staging
+# chunks, the chunk-wide coverage twin) and §4 item 6b on the kv_pages module the pool reuses.
+add_executable(gpu_kv_pool_geometry_tests tests/gpu_kv_pool_geometry_tests.cpp)
+target_link_libraries(gpu_kv_pool_geometry_tests PRIVATE superslm)
+target_include_directories(gpu_kv_pool_geometry_tests PRIVATE src)
+if(MSVC)
+	target_compile_options(gpu_kv_pool_geometry_tests PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(gpu_kv_pool_geometry_tests PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+add_test(NAME gpu_kv_pool_geometry_tests COMMAND gpu_kv_pool_geometry_tests)
 endif()
 
 # The §13 item 7 independent converter verifier (S-HARDEN-3, F13): loads a

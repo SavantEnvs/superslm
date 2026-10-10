@@ -10,6 +10,8 @@
 # Re-listed by the test author at the TE-435 fix round (91779ad): 64 catch clauses and 23 status sites; every
 # outermost try now ends in catch (...) (tools/ci/check_gpu_catch_totality.py), so each of the ten new clauses
 # joins its function's ... row: T1, T2, T3, T4, T5, T7, T8, T9, T10, T16.
+# Re-listed by the G3 pool builder (paged KV, 1.13.0): the pool create's phase A and phase B clauses and the
+# budgeted create's table-buffer clause, authored with --emit and dispositioned from plan §4 items 3 and 7.
 # A site the fix adds, removes or rewrites is re-listed here with its disposition in the same change.
 # Tab-separated: kind file function count block disposition token
 catch	src/gpu/d3d12_harness.h	ClassifyInFlightException	1	E-2	classifier input: kind Other, every other type standard or not; rule 3 unless rule 0 or 1	...
@@ -40,6 +42,10 @@ catch	src/gpu/gpu_1p0.cpp	sslm_gpu_adapter_mapImpl	1	T5	classifier; UploadReside
 catch	src/gpu/gpu_1p0.cpp	sslm_gpu_model_mapImpl	2	T3,T4	TE-435 final clauses: T3 ClassifyHandleFault(nullptr), host step; T4 ClassifyHandleFault(&ctx->device); a non-std type is SSLM_DEVICE_LOST at both	...
 catch	src/gpu/gpu_1p0.cpp	sslm_gpu_model_mapImpl	2	T3,T4	T3 PackLayerWeightsBytes: rule 2 for length_error, rule 3 for the layer-weights contract error; T4 uploads: classifier, Close via CloseListConfirmed, unretried Signal rule 0	std::bad_alloc
 catch	src/gpu/gpu_1p0.cpp	sslm_gpu_model_mapImpl	2	T3,T4	T3 PackLayerWeightsBytes: rule 2 for length_error, rule 3 for the layer-weights contract error; T4 uploads: classifier, Close via CloseListConfirmed, unretried Signal rule 0	std::exception
+catch	src/gpu/gpu_1p0.cpp	sslm_gpu_kv_pool_createImpl	2	G3	paged-KV §4 item 3 (rev 15.1): phase A's final clause (a D3D12 allocation or Map, already logged by SSLM_GPU_HR) -> rule 1 asked first (removed: SSLM_DEVICE_LOST), else SSLM_GPU_ALLOCATION_FAILED, the block mapping; phase B's sole clause (ZeroFillResidentUavBufferSync) -> ClassifyHandleFault(&ctx->device), rules 0-3 as T4	...
+catch	src/gpu/gpu_1p0.cpp	sslm_gpu_kv_pool_createImpl	1	G3	paged-KV §4 item 3: phase A, host allocation (handle, mirror, kv_pages arrays) -> logged, then rule 1 asked first, else SSLM_GPU_ALLOCATION_FAILED	std::bad_alloc
+catch	src/gpu/gpu_1p0.cpp	sslm_gpu_kv_pool_createImpl	1	G3	paged-KV §4 item 3: phase A, the host mirror's size -> as std::bad_alloc	std::length_error
+catch	src/gpu/gpu_1p0.cpp	sslm_gpu_seq_create_budgetedImpl	1	G3	paged-KV §4 item 7: the table buffer's MakeBuffer (no list touched) -> draw returned, ClassifyHandleFault(&ctx->device) as T7	...
 catch	src/gpu/gpu_1p0.cpp	sslm_gpu_seq_createImpl	1	T7	TE-435 final clause: ClassifyHandleFault(&ctx->device) as T4; a non-std type is SSLM_DEVICE_LOST	...
 catch	src/gpu/gpu_1p0.cpp	sslm_gpu_seq_createImpl	1	T7	classifier as T4	std::bad_alloc
 catch	src/gpu/gpu_1p0.cpp	sslm_gpu_seq_createImpl	1	T7	classifier as T4	std::exception

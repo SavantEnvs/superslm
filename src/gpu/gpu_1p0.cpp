@@ -2587,8 +2587,10 @@ SslmGpuStatus SubmitOneSequenceDecode(SslmGpuContext* ctx, SslmGpuSequenceHandle
 	const superslm::SslmForwardStatus submit_status = superslm_gpu::RunLayerLoopGpuSubmit(
 	    seq->live_state, /*layers=*/nullptr, model->num_hidden_layers, layers_to_issue,
 	    model->hidden_size, model->head_dim, model->num_key_value_heads, model->intermediate_size,
-	    seq->context_cap, kEmptyManifest, seq->host_kv_mirror.data(), seq->host_kv_mirror.size(),
-	    seq->kv_buf.Get(), &seq->kv_needs_resume_barrier, &inflight, model->weights_buf.Get(),
+	    seq->context_cap, kEmptyManifest, KvHostBase(seq), KvHostBytes(seq),
+	    seq->pool != nullptr ? seq->pool->pool_buf.Get() : seq->kv_buf.Get(),
+	    seq->pool != nullptr ? &seq->pool->kv_needs_resume_barrier : &seq->kv_needs_resume_barrier,
+	    &inflight, model->weights_buf.Get(),
 	    model->rope_cos_buf.Get(), model->rope_sin_buf.Get(), model->has_rope_tables,
 	    model->rope_cos_elem_count, model->rope_sin_elem_count, adapter_bridge_ptr,
 	    /*q_width=*/static_cast<size_t>(model->num_attention_heads) * model->head_dim,
