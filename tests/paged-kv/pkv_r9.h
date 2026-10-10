@@ -439,21 +439,17 @@ struct BlockPoolOf {
 	}
 };
 
-// The test's contiguous-pool size (§21.2): block_count * cap * bytes_per_position + 8 * block_count
-// + 32, in 128 bits so the cells can name an overflowing count. *fits is false past SIZE_MAX.
+// The test's contiguous-pool size (§21.2): block_count * (cap * bytes_per_position + 8) + 32, with
+// exact overflow tests, so the cells can name an overflowing count. *fits is false past 2^64 - 1.
 inline uint64_t ContiguousSize(const Lay& y, uint64_t block_count, bool* fits) {
-	const uint64_t per = static_cast<uint64_t>(y.contiguous_block_bytes);
-	// 128-bit by halves: (hi, lo) = block_count * (per + 8) + 32.
-	const uint64_t m = per + 8;
-	const uint64_t a_lo = (block_count & 0xFFFFFFFFull) * m;
-	const uint64_t hi_part = (block_count >> 32) * m;  // contributes << 32
-	const uint64_t lo_add = hi_part << 32;
-	uint64_t lo = a_lo + lo_add;
-	bool overflow = (hi_part >> 32) != 0 || lo < a_lo;
-	const uint64_t lo2 = lo + 32;
-	overflow = overflow || lo2 < lo;
-	*fits = !overflow;
-	return lo2;
+	const uint64_t m = static_cast<uint64_t>(y.contiguous_block_bytes) + 8;
+	if (m != 0 && block_count > UINT64_MAX / m) {
+		*fits = false;  // the product overflows
+		return 0;
+	}
+	const uint64_t p = block_count * m;
+	*fits = p <= UINT64_MAX - 32;  // the sum with the fixed 32
+	return p + 32;
 }
 
 struct ContigPoolOf {
