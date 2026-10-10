@@ -32,6 +32,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -206,39 +207,107 @@ def _lock_owner(lock_path):
     return int(value)
 
 
+# The OS lock that makes recovery atomic (T-3202 F-9): one byte far past any content, so a reader of the pid content
+# (run_paged_kv_pairs.py's PidLock, the 7.4 and lifecycle legs) is never blocked by it.
+_LOCK_BYTE = 1 << 20
+
+
+def _os_lock(fd):
+    """Take the exclusive, non-blocking OS byte lock on `fd`; False when another process holds it. The OS releases it
+    when the holder exits, however it exits."""
+    os.lseek(fd, _LOCK_BYTE, os.SEEK_SET)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, _LOCK_BYTE)
+        return True
+    except OSError:
+        return False
+
+
+def _os_unlock(fd):
+    os.lseek(fd, _LOCK_BYTE, os.SEEK_SET)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.lockf(fd, fcntl.LOCK_UN, 1, _LOCK_BYTE)
+    except OSError:
+        pass
+
+
+def _read_owner(fd):
+    """The pid the lock's content names, None when the content is empty (a fresh or released file); raises ValueError
+    on content that is neither a pid nor a {"pid": ...} object."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    text = b"".join(chunks).decode("utf-8").strip()
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = text
+    if isinstance(value, dict):
+        value = value.get("pid")
+    return int(value)
+
+
 @contextlib.contextmanager
 def timing_lock(result_path, lock_path=LOCK_PATH):
     """Context manager: the box-global C6 timing pid lock, independent of the result path. A live owner refuses a
-    second runner whatever its result path (79-10); a dead owner's lock is recovered, and the recovery recorded."""
+    second runner whatever its result path (79-10); a dead owner's lock is recovered, and the recovery recorded.
+
+    Recovery is atomic (T-3202 F-9): every runner opens the lock file and takes an exclusive OS byte lock on it before
+    it reads the owner, so of two runners that both find the same dead owner, exactly one holds the OS lock; the other
+    is refused. Only the OS-lock holder may judge the recorded owner dead and overwrite it. The pid content stays for
+    the legs that lock by exclusive create (run_paged_kv_pairs.py's PidLock): they see the file and its live pid."""
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    recovered = None
-    while True:
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+    if not _os_lock(fd):
+        os.close(fd)
+        raise Refusal(f"79-10: the C6 timing lock {lock_path} is held by a live runner; second runner "
+                      f"(result {result_path}) refused")
+    try:
         try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            try:
-                owner = _lock_owner(lock_path)
-            except (OSError, ValueError, TypeError):
-                raise Refusal(f"torn timing lock: {lock_path}") from None
-            if pid_live(owner):
-                raise Refusal(f"79-10: the C6 timing lock {lock_path} is held by live pid {owner}; second runner "
-                              f"(result {result_path}) refused")
-            recovered = owner
-            lock_path.unlink(missing_ok=True)
-            continue
-        with os.fdopen(fd, "w", encoding="utf-8") as out:
-            out.write(json.dumps({"pid": os.getpid(), "result": str(result_path), "recovered_from": recovered,
-                                  "acquired": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}))
-        break
+            owner = _read_owner(fd)
+        except (OSError, ValueError, TypeError, UnicodeDecodeError):
+            raise Refusal(f"torn timing lock: {lock_path}") from None
+        if owner is not None and owner != os.getpid() and pid_live(owner):
+            raise Refusal(f"79-10: the C6 timing lock {lock_path} is held by live pid {owner}; second runner "
+                          f"(result {result_path}) refused")
+        recovered = owner if owner is not None and owner != os.getpid() else None
+        content = json.dumps({"pid": os.getpid(), "result": str(result_path), "recovered_from": recovered,
+                              "acquired": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}).encode("utf-8")
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, content)
+    except BaseException:
+        _os_unlock(fd)
+        os.close(fd)
+        raise
     try:
         yield {"recovered_from": recovered}
     finally:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        _os_unlock(fd)
+        os.close(fd)
         try:
-            if _lock_owner(lock_path) == os.getpid():
-                lock_path.unlink(missing_ok=True)
-        except (OSError, ValueError, TypeError):
-            pass
+            lock_path.unlink()
+        except OSError:
+            pass  # another runner has it open; its content is empty or its own
 
 
 # ---- records -----------------------------------------------------------------------------------------------------
@@ -346,7 +415,9 @@ def grade_row(processes):
 
 
 def parse_process_output(text):
-    """The pair executable's stdout: the identity line, then PAIR lines, then IDS. Returns (identity, pairs, ids)."""
+    """The pair executable's stdout: the identity line, then PAIR lines, then IDS, and optionally a RESERVE line (the
+    paged arm's scatter-reserve construction: `RESERVE seed=<s> singles=<n> source=<header>`). Returns (identity,
+    pairs, ids). The RESERVE fields are read by parse_reserve."""
     lines = text.splitlines()
     identity = lines[0] if lines else ""
     check_build_identity(identity)  # 79-7, before any pair is read
@@ -362,6 +433,32 @@ def parse_process_output(text):
         elif fields[0] == "IDS":
             ids = [int(x) for x in fields[1:]]
     return identity, pairs, ids
+
+
+def parse_reserve(text):
+    """The RESERVE line's fields ({"seed", "singles", "source"}), or None when the pair executable reports none
+    (T-3202 F-11: every 7.9 verdict is measured over one reserve permutation, and the records name it)."""
+    for line in text.splitlines():
+        fields = line.split()
+        if fields and fields[0] == "RESERVE":
+            out = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
+            if "seed" in out:
+                out["seed"] = int(out["seed"])
+            if "singles" in out:
+                out["singles"] = int(out["singles"])
+            return out
+    return None
+
+
+def pair_executable(pair_cmd):
+    """The pair executable a --pair-cmd runs: its first element, resolved on PATH when it is not a path."""
+    first = Path(pair_cmd[0])
+    if first.is_file():
+        return first.resolve()
+    found = shutil.which(pair_cmd[0])
+    if not found:
+        raise Refusal(f"the pair executable {pair_cmd[0]!r} does not exist")
+    return Path(found).resolve()
 
 
 def main(argv=None):
@@ -390,16 +487,19 @@ def main(argv=None):
         return EXIT_INFRASTRUCTURE
     stem = result.with_suffix("")
     process_path = lambda k: stem.with_name(f"{stem.name}.p{k}.json")  # noqa: E731
+    exe_path, exe_sha = None, None
     try:
+        # D-SLM8461: the pair executable's SHA-256, taken by the driver before the first process starts
+        exe_path = pair_executable(pair_cmd)
+        exe_sha = sha(exe_path)
         with timing_lock(result, args.lock) as lock:
-            processes, id_lists = [], []
+            processes, id_lists, reserves = [], [], []
             for k in range(1, PROCESSES_PER_ROW + 1):
                 attempts = 0
                 while True:
                     attempts += 1
                     if attempts > RERUN_LIMIT:
-                        print(f"INFRASTRUCTURE: process {k} failed {RERUN_LIMIT} times", file=sys.stderr)
-                        return EXIT_INFRASTRUCTURE
+                        raise Refusal(f"INFRASTRUCTURE: process {k} failed {RERUN_LIMIT} times")
                     boot_before = last_boot()
                     blob, manifest_sha = check_row_blob(args.manifest, args.model, args.restore)  # 79-6, per process
                     command = pair_cmd + ["--blob", str(blob), "--model", str(args.model), "--process", str(k),
@@ -409,11 +509,14 @@ def main(argv=None):
                     except subprocess.TimeoutExpired:
                         print(f"process {k}: over {PROCESS_CAP_SECONDS} s; rerun whole", file=sys.stderr)
                         continue
-                    identity, pairs, ids = parse_process_output(done.stdout)  # 79-7 first
+                    # T-3202 F-2: the exit status first. A pair process that crashed (any non-zero exit, before or
+                    # after its identity line) is rerun whole; only a clean exit's identity is graded (79-7).
                     if done.returncode != 0:
                         print(f"process {k}: the pair executable exited {done.returncode}; rerun whole\n"
                               f"{done.stderr[-2000:]}", file=sys.stderr)
                         continue
+                    identity, pairs, ids = parse_process_output(done.stdout)  # 79-7
+                    reserve = parse_reserve(done.stdout)
                     median = process_statistic(pairs)  # 79-9, 79-8
                     boot_after = last_boot()
                     if not same_boot(boot_before, boot_after):
@@ -425,14 +528,21 @@ def main(argv=None):
                           "pairs": [list(p) for p in pairs], "ids": ids, "identity": identity, "boot": boot_before,
                           "blob_sha256": sha(blob), "manifest_sha256": manifest_sha,
                           "model_sha256": sha(args.model), "restore": args.restore, "attempts": attempts,
-                          "page_positions": args.page_positions}
+                          "page_positions": args.page_positions, "exe": str(exe_path), "exe_sha256": exe_sha,
+                          "reserve": reserve}
                 write_record(process_path(k), record)
                 processes.append({"status": "ok", "median": median})
                 id_lists.append(ids or [])
+                reserves.append(reserve)
             graded = grade_row(processes)
+            # D-SLM8461: STANDING exactly when the driver finished the row and wrote a verdict (PASS, FAIL or NO
+            # RESULT); the verdict stays its own field. T-3202 F-11: the reserve the ids were read over, with its seed
+            # and source, as the pair executable reported it (null where it reports none).
             row = {"slot": args.slot, "restore": args.restore, "page_positions": args.page_positions,
                    "processes": [process_path(k).name for k in range(1, PROCESSES_PER_ROW + 1)],
-                   "lock_recovered_from": lock["recovered_from"], "rule_verdict": graded["verdict"]}
+                   "lock_recovered_from": lock["recovered_from"], "rule_verdict": graded["verdict"],
+                   "status": "STANDING", "exe": str(exe_path), "exe_sha256": exe_sha,
+                   "reserve": reserves[0] if all(r == reserves[0] for r in reserves) else reserves}
             row.update(graded["record"] or {})
             if not id_lists_agree(id_lists):
                 row.update(verdict="NO RESULT", reason="the five measured-holder id lists differ (construction defect)")
@@ -448,7 +558,20 @@ def main(argv=None):
             return 0
     except Refusal as refusal:
         print(f"REFUSED: {refusal}", file=sys.stderr)
-        return EXIT_CODES.get(refusal.kind, EXIT_INFRASTRUCTURE)
+        code = EXIT_CODES.get(refusal.kind, EXIT_INFRASTRUCTURE)
+        supersede_refused(result, args.slot, code, str(refusal), exe_path, exe_sha)
+        return code
+
+
+def supersede_refused(result, slot, code, reason, exe_path, exe_sha):
+    """T-3202 F-12 with D-SLM8461: a refused run never leaves an earlier run's row record standing at its path. Where a
+    record exists at `result`, it is replaced by a REFUSED record carrying the exit code and no verdict; where none
+    exists, none is written (a refused row has no row record, cell 7.9's per-process rule)."""
+    if not Path(result).exists():
+        return
+    write_record(result, {"slot": slot, "status": "REFUSED", "exit_code": code, "reason": reason, "verdict": None,
+                          "exe": str(exe_path) if exe_path else None, "exe_sha256": exe_sha,
+                          "superseded": "the previous row record at this path"})
 
 
 if __name__ == "__main__":

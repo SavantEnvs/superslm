@@ -89,7 +89,9 @@ endif()
 # C6 driver (tools/run_paged_kv_rows.py --page-positions 16) as production's pair does. Box-owed; EXCLUDE_FROM_ALL.
 add_library(superslm_mr_opt STATIC EXCLUDE_FROM_ALL ${SUPERSLM_CORE_SOURCES})
 target_include_directories(superslm_mr_opt PUBLIC include)
-target_compile_definitions(superslm_mr_opt PRIVATE SUPERSLM_MUTANT_PKV_MR_OPT)
+# SUPERSLM_MUTANT_PKV_MR_OPT_TARGET acknowledges the mutant: the sources #error on the mutant definition without it
+# (T-3202 F-4), so a mutant definition that leaks to any other compile is refused.
+target_compile_definitions(superslm_mr_opt PRIVATE SUPERSLM_MUTANT_PKV_MR_OPT SUPERSLM_MUTANT_PKV_MR_OPT_TARGET)
 add_executable(superslm_pkv_pair_mr_opt EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_pair.cpp)
 target_link_libraries(superslm_pkv_pair_mr_opt PRIVATE superslm_mr_opt)
 target_include_directories(superslm_pkv_pair_mr_opt PRIVATE ${PKV_DIR} include src tests)

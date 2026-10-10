@@ -1126,3 +1126,26 @@ install(FILES
 	"${CMAKE_CURRENT_BINARY_DIR}/superslmConfigVersion.cmake"
 	DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/superslm
 )
+
+# Paged-KV cell 7.9's must-reject mutant (SUPERSLM_MUTANT_PKV_MR_OPT: B = 16, unrotated) builds only as the
+# superslm_mr_opt target (tests/paged-kv/paged_kv.cmake). The production library refuses it here, at configure time,
+# wherever CMake can see a definition reach it: the superslm target's definitions and options, the directory's
+# definitions, and every configuration's C and C++ flags (T-3202 F-4). A definition CMake cannot see (the CL
+# environment variable) is refused at compile time by the #error in src/sslm_abi.cpp and include/superslm/forward_sites.h.
+get_target_property(_sslm_prod_defs superslm COMPILE_DEFINITIONS)
+get_target_property(_sslm_prod_opts superslm COMPILE_OPTIONS)
+get_directory_property(_sslm_dir_defs COMPILE_DEFINITIONS)
+set(_sslm_flags "${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS}")
+foreach(_sslm_cfg IN ITEMS DEBUG RELEASE RELWITHDEBINFO MINSIZEREL ${CMAKE_CONFIGURATION_TYPES} ${CMAKE_BUILD_TYPE})
+	string(TOUPPER "${_sslm_cfg}" _sslm_cfg)
+	string(APPEND _sslm_flags " ${CMAKE_C_FLAGS_${_sslm_cfg}} ${CMAKE_CXX_FLAGS_${_sslm_cfg}}")
+endforeach()
+if("${_sslm_prod_defs};${_sslm_prod_opts};${_sslm_dir_defs};${_sslm_flags}" MATCHES "SUPERSLM_MUTANT")
+	message(FATAL_ERROR "a SUPERSLM_MUTANT_* definition reaches the production superslm library; only the "
+		"superslm_mr_opt target may build 7.9-MR-OPT")
+endif()
+unset(_sslm_prod_defs)
+unset(_sslm_prod_opts)
+unset(_sslm_dir_defs)
+unset(_sslm_flags)
+unset(_sslm_cfg)

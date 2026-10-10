@@ -156,8 +156,9 @@ void Row79(int argc,char** argv){
 	const uint32_t seed=Seed(argv[6]);
 	const std::vector<uint8_t> blob=Blob(blob_path);Require(IsMagic(blob,"SSB5"),"row blob is not a legacy SSB5");
 	LegacyPool page(fx.model,1);Require(page.status==SSLM_OK,"page pool failed");
+	uint32_t singles=0;
 	{const int64_t B=sslm_kv_page_positions(fx.model);Require(B>0,"no page size");
-		const uint32_t pages=static_cast<uint32_t>((static_cast<int64_t>(fx.geo.context_cap)+B-1)/B);uint32_t singles=0;
+		const uint32_t pages=static_cast<uint32_t>((static_cast<int64_t>(fx.geo.context_cap)+B-1)/B);
 		Require(ScatterReserve(fx.model,&page.pool,kScatterReserveSeed,&singles)==SSLM_OK&&singles+1==pages,"scattered reserve");
 		std::cerr<<"row79: scattered reserve of "<<pages<<" pages at B = "<<B<<": "<<singles<<" one-token prefills\n";}
 	ContiguousPool contig(fx.model,1);Require(contig.status==SSLM_OK,"contiguous pool failed");
@@ -175,6 +176,8 @@ void Row79(int argc,char** argv){
 #else
 	std::cout<<"PKV_PAIR_PRODUCTION_V2 defs=none\n";
 #endif
+	// the reserve the paged holder's ids are drawn over (T-3202 F-11): the driver records it in every process and row
+	std::cout<<"RESERVE seed="<<kScatterReserveSeed<<" singles="<<singles<<" source=tests/paged-kv/pkv_scatter_reserve.h\n";
 	for(int i=0;i<warmup;++i){one(paged);one(contiguous);}
 	std::mt19937 random(seed+static_cast<uint32_t>(process));
 	for(int i=0;i<pairs;++i){std::pair<double,int32_t> x,y;

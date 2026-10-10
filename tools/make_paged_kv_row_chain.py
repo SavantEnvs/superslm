@@ -65,14 +65,19 @@ def piece_end(start, restores, fast_limit=FAST_LIMIT, slow_limit=SLOW_LIMIT, slo
     return min([end] + [r for r in restores if r > start])
 
 
-def verified_prefix(chain, directory):
-    """The pieces of a previous chain.json whose chain still verifies, in order."""
+def verified_prefix(chain, directory, exe_sha):
+    """The pieces of a previous chain.json whose chain still verifies, in order. A piece is reused only when the
+    executable resuming the chain made it: each piece records its maker's SHA-256 (exe_sha256), and a reusable piece
+    made by another executable, or recorded without one, is refused rather than relabelled (T-3202 F-6)."""
     out, at, previous = [], 0, "-"
     for piece in chain.get("pieces", []):
         path = directory / piece.get("file", "")
         if (piece.get("start") != at or piece.get("input_sha256") != previous or not path.is_file()
                 or sha(path) != piece.get("sha256")):
             break
+        if piece.get("exe_sha256") != exe_sha:
+            raise Refusal(f"piece {piece.get('file')} was made by executable {piece.get('exe_sha256')}, not by "
+                          f"{exe_sha}, the one resuming the chain; remove {directory} or resume with that executable")
         out.append(piece)
         at += piece["count"]
         previous = piece["sha256"]
@@ -111,7 +116,7 @@ def make_chain(exe, model, cap, layers, heads, dim, restores, directory, cap_sec
     except (OSError, ValueError):
         old = {}
     same = old.get("model_sha256") == model_sha and old.get("geometry") == geometry
-    pieces = verified_prefix(old, directory) if same else []
+    pieces = verified_prefix(old, directory, exe_sha) if same else []
     chain = {"model_sha256": model_sha, "exe_sha256": exe_sha, "geometry": geometry,
              "stream": {"seed": 79, "tokens": restores[-1]}, "restores": restores, "pieces": pieces}
     env = os.environ.copy()
@@ -140,7 +145,7 @@ def make_chain(exe, model, cap, layers, heads, dim, restores, directory, cap_sec
         os.replace(partial, output)
         digest = sha(output)
         pieces.append({"file": output.name, "start": at, "count": count,
-                       "input_sha256": pieces[-1]["sha256"] if pieces else "-", "sha256": digest})
+                       "input_sha256": pieces[-1]["sha256"] if pieces else "-", "sha256": digest, "exe_sha256": exe_sha})
         at += count
         atomic_json(chain_path, chain)
         print(f"piece {output.name} sha256={digest}", flush=True)

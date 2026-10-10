@@ -17,6 +17,12 @@
 // src/forward/forward_sites.cpp.
 #ifndef SUPERSLM_FORWARD_SITES_H
 #define SUPERSLM_FORWARD_SITES_H
+// Cell 7.9's must-reject mutant (KvPageRunSlot, below) builds only as the superslm_mr_opt target, which defines the
+// acknowledgement beside it (tests/paged-kv/paged_kv.cmake). A mutant definition that reaches any other compile, by a
+// global flag or the CL environment variable, is refused here (T-3202 F-4).
+#if defined(SUPERSLM_MUTANT_PKV_MR_OPT) && !defined(SUPERSLM_MUTANT_PKV_MR_OPT_TARGET)
+#error "SUPERSLM_MUTANT_PKV_MR_OPT is 7.9-MR-OPT's mutant: only the superslm_mr_opt target builds it"
+#endif
 #include "superslm/api.h"
 
 #include <cstddef>
@@ -1152,7 +1158,8 @@ struct KvPageView {
 inline size_t KvPageRunSlot(size_t run, size_t logical_page, size_t runs) noexcept {
 #if defined(SUPERSLM_MUTANT_PKV_MR_OPT)
 	// Cell 7.9's must-reject, 7.9-MR-OPT (D-SLM8423): the slot ignores the logical page (the unrotated layout). Built
-	// only into the superslm_mr_opt library; the production library refuses the definition at configure time.
+	// only into the superslm_mr_opt library. The production library refuses the definition at configure time
+	// (CMakeLists.txt) and at compile time (the #error at the top of this header and of src/sslm_abi.cpp).
 	(void)logical_page;
 	(void)runs;
 	return run;

@@ -63,6 +63,12 @@
 // stable-count cell states the engine's own scratch cost as disclosed and data-independent, never
 // a zero requirement) -- correctly, permanently out of this ABI layer's own scope per the design's
 // own text quoted above.
+// Cell 7.9's must-reject mutant (PageRuleB, below) builds only as the superslm_mr_opt target, which defines the
+// acknowledgement beside it (tests/paged-kv/paged_kv.cmake). A mutant definition that reaches any other compile, by a
+// global flag or the CL environment variable, is refused here (T-3202 F-4).
+#if defined(SUPERSLM_MUTANT_PKV_MR_OPT) && !defined(SUPERSLM_MUTANT_PKV_MR_OPT_TARGET)
+#error "SUPERSLM_MUTANT_PKV_MR_OPT is 7.9-MR-OPT's mutant: only the superslm_mr_opt target builds it"
+#endif
 #include "superslm/sslm_abi.h"
 
 #include <algorithm>
@@ -687,8 +693,10 @@ int64_t PageRuleB(uint64_t head_dim, uint64_t context_cap, uint64_t elem) {
 	uint64_t B = 16;
 #if defined(SUPERSLM_MUTANT_PKV_MR_OPT)
 	// Cell 7.9's must-reject, 7.9-MR-OPT (D-SLM8423): the shipped 1.11.0-era page size, B = 16, in the R9 tree. Built
-	// only into the superslm_mr_opt library (tests/paged-kv/paged_kv.cmake); the production library refuses the
-	// definition at configure time.
+	// only into the superslm_mr_opt library (tests/paged-kv/paged_kv.cmake). The production library refuses the
+	// definition twice: at configure time (CMakeLists.txt's check of the superslm target's definitions and options,
+	// the directory's definitions and every configuration's C and C++ flags), and at compile time (the #error at the
+	// top of this file and in forward_sites.h, for a definition CMake cannot see, such as the CL environment variable).
 	(void)target;
 	(void)elem;
 	(void)head_dim;
@@ -793,10 +801,12 @@ PoolSizing ComputePoolSizing(const superslm::SslmModelConfig& c, int64_t pinned,
 	    s.geo.ok && static_cast<uint64_t>(block_count) * s.geo.cap_pages <= static_cast<uint64_t>(UINT32_MAX);
 	if (s.page_count_fits) {
 		const uint64_t slack = uint64_t{s.geo.cap_pages} * static_cast<uint64_t>(s.geo.page_positions) - c.context_cap;
-		size_t q = 0, slack_bytes = 0;  // q: one position's K/V bytes, page_bytes / B
+		// One block's slack bytes, slack * q (q = page_bytes / B, one position's K/V bytes, as in the comment above),
+		// then N blocks' slack.
+		size_t block_slack_bytes = 0, slack_bytes = 0;
 		const bool slack_ok = CheckedMulSizeT(s.geo.page_bytes / static_cast<size_t>(s.geo.page_positions),
-		                                      static_cast<size_t>(slack), &q) &&
-		                      CheckedMulSizeT(q, static_cast<size_t>(block_count), &slack_bytes);
+		                                      static_cast<size_t>(slack), &block_slack_bytes) &&
+		                      CheckedMulSizeT(block_slack_bytes, static_cast<size_t>(block_count), &slack_bytes);
 		SaturatingAccumulator acc;
 		acc.AddProduct(static_cast<size_t>(block_count), sizeof(uint32_t) * 2);
 		size_t total = 0, with_slack = 0;
