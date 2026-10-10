@@ -31,9 +31,10 @@ else()
 endif()
 add_test(NAME superslm_g3_core_tests COMMAND superslm_g3_core_tests)
 
+# gpu_inflight_registry.cpp is a core library source (SUPERSLM_CORE_SOURCES) since the task
+# trampoline at parallel_split.cpp's `run` call site needs it, so superslm_tests links it from there.
 target_sources(superslm_tests PRIVATE
 	${G3_CORE_DIR}/g3_superslm_tests_adapter.cpp
-	${G3_CORE_DIR}/g3_cells_ledger.cpp
-	${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gpu_inflight_registry.cpp)
+	${G3_CORE_DIR}/g3_cells_ledger.cpp)
 target_include_directories(superslm_tests PRIVATE ${G3_CORE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu)
 target_compile_definitions(superslm_tests PRIVATE SUPERSLM_LEDGER_YIELD_HOOK)

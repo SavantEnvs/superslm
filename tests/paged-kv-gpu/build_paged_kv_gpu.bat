@@ -74,7 +74,7 @@ echo ===== engine: CPU sources (build.bat's list) =====
 cl /c %CLF% /Fo"%OUT%\cpu\\" "%ENG%\src\artifact.cpp" "%ENG%\src\sha256.cpp" "%ENG%\src\tokenizer.cpp" ^
     "%ENG%\src\model.cpp" "%ENG%\src\intmath.cpp" "%ENG%\src\silu_lut.cpp" "%ENG%\src\matmul.cpp" ^
     "%ENG%\src\proof_manifest.cpp" "%ENG%\src\trace_hook.cpp" "%ENG%\src\forward\checked_chain_funnel.cpp" ^
-    "%ENG%\src\forward\forward_sites.cpp" "%ENG%\src\forward\parallel_split.cpp" "%ENG%\src\decode_digest.cpp" ^
+    "%ENG%\src\forward\forward_sites.cpp" "%ENG%\src\forward\parallel_split.cpp" "%ENG%\src\gpu\gpu_inflight_registry.cpp" "%ENG%\src\decode_digest.cpp" ^
     "%ENG%\src\kv_pages.cpp" "%ENG%\src\sslm_abi.cpp" "%ENG%\src\damped_greedy_antilm.cpp" "%ENG%\src\damped_greedy_topk.cpp" ^
     "%ENG%\src\damped_greedy_phaseD.cpp" "%ENG%\src\damped_greedy_phaseD_loop.cpp" > "%OUT%\cpu\build.log" 2>&1
 if errorlevel 1 ( type "%OUT%\cpu\build.log" & echo ENGINE CPU BUILD FAILED & exit /b 3 )
@@ -200,7 +200,7 @@ rem ---- :gpulib CONFIG: every GPU source of build.bat's list, with the configur
 :gpulib
 echo ===== engine: GPU sources, configuration %1 =====
 if exist "%OUT%\gpu_%1\*.obj" del /Q "%OUT%\gpu_%1\*.obj"
-for %%S in ("%GPUDIR%\superslm_gpu.cpp" "%GPUDIR%\gpu_1p0.cpp" "%GPUDIR%\gpu_inflight_registry.cpp") do (
+for %%S in ("%GPUDIR%\superslm_gpu.cpp" "%GPUDIR%\gpu_1p0.cpp") do (
     cl /c %CLF% !DEF_%1! /Fo"%OUT%\gpu_%1\\" "%%~S" > "%OUT%\gpu_%1\%%~nS.log" 2>&1
     if errorlevel 1 ( type "%OUT%\gpu_%1\%%~nS.log" & echo ENGINE GPU BUILD FAILED: %%~S ^(%1^) & exit /b 3 )
 )
