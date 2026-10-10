@@ -515,14 +515,14 @@ class T6Remedies(unittest.TestCase):
         holder_src = (
             "import msvcrt, os, sys, time\n"
             "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_BINARY, 0o600)\n"
-            "os.write(fd, ('{\"pid\": %s}' % sys.argv[2]).encode())\n"
+            "os.write(fd, sys.argv[2].encode())\n"
             "os.lseek(fd, 1 << 20, os.SEEK_SET)\n"
             "msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)\n"
             "print('held', flush=True)\n"
             "time.sleep(60)\n") if os.name == "nt" else (
             "import fcntl, os, sys, time\n"
             "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
-            "os.write(fd, ('{\"pid\": %s}' % sys.argv[2]).encode())\n"
+            "os.write(fd, sys.argv[2].encode())\n"
             "fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 1 << 20)\n"
             "print('held', flush=True)\n"
             "time.sleep(60)\n")
@@ -868,7 +868,7 @@ class Process(unittest.TestCase):
         lock = self.root / "pkv-c6-timing.lock"
         holder = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(30)"])
         self.addCleanup(holder.kill)
-        lock.write_text(json.dumps({"pid": holder.pid}))
+        lock.write_text(str(holder.pid))  # D-SLM8464: the lock holds the bare pid
         with self.assertRaises(rows.Refusal):
             with rows.timing_lock(self.root / "b.json", lock_path=lock):
                 pass
@@ -877,7 +877,7 @@ class Process(unittest.TestCase):
         lock = self.root / "pkv-c6-timing.lock"
         dead = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
         dead.wait()
-        lock.write_text(json.dumps({"pid": dead.pid}))
+        lock.write_text(str(dead.pid))  # D-SLM8464: the lock holds the bare pid
         with rows.timing_lock(self.root / "a.json", lock_path=lock):
             self.assertTrue(lock.exists())
 
