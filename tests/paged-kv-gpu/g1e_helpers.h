@@ -227,6 +227,19 @@ inline std::vector<int32_t> DecodeN(const Env& e, GSeq& s, int64_t n, GS* last =
 	if (last) *last = st;
 	return out;
 }
+// Exactly `n` greedy steps, one outcome per step: the token, the schema dead end's -2, or -1000 - status
+// for a refused step. Neither a dead end nor a refusal stops the run, so a retry-stable outcome shows as
+// a repeat. The 8.16 outcome form (G4 cells fix; tests/paged-kv/c5_dim8_composition.cpp 8.3 CensusGreedy),
+// for constructions whose state has no real continuation on this fixture.
+inline std::vector<int32_t> StepOutcomes(const Env& e, GSeq& s, int64_t n) {
+	std::vector<int32_t> out;
+	for (int64_t i = 0; i < n; ++i) {
+		GS st = GS::SSLM_OK;
+		const int32_t t = Token(e, s, &st);
+		out.push_back(st == GS::SSLM_OK ? t : -1000 - static_cast<int32_t>(st));
+	}
+	return out;
+}
 inline std::vector<int32_t> RunToRefusal(const Env& e, GSeq& s, GS* refusal) { return DecodeN(e, s, 1 << 20, refusal); }
 
 inline GS Prefill(const Env& e, GSeq& s, const std::vector<int32_t>& t) {

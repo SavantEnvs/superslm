@@ -63,6 +63,18 @@ void Dirty(Rig& rig, int32_t budget, int32_t n) {
 	rig.ReleaseSeq(d.h);
 }
 
+std::string Join96(const std::vector<int32_t>& t) {
+	std::string o;
+	for (size_t i = 0; i < t.size(); ++i) o += (i ? "," : "") + std::to_string(t[i]);
+	return o;
+}
+
+// CONSTRUCTION (G5 cells fix): the "fresh" state (L = 0, never prefilled, no prefix) has nothing to decode
+// from, so its continuation cannot be 8 tokens on either side -- the CPU twin (c4_dim9_persistence.cpp
+// 9.1) skips the continuation for "fresh" for that reason. Its continuation here is graded the 8.16 way
+// (StepOutcomes: the token, -2, or -1000 - status per step, 8 steps on each side, equal), plus the two
+// holders' saves equal after those steps. The round trips (b1 == b2, twice) are unchanged and remain the
+// cell's grade for "fresh"; every other state keeps the 8-real-token continuation check.
 void PartA(const Env& e) {
 	for (const StateA& s : kStatesA) {
 		for (int with_handle = 0; with_handle <= (s.prefix_len > 0 ? 1 : 0); ++with_handle) {
@@ -96,9 +108,19 @@ void PartA(const Env& e) {
 				cur = b2;
 				if (round == 2) {
 					GSeq tw = r.seq;
-					const std::vector<int32_t> a = DecodeN(e, o, 8), b = DecodeN(e, tw, 8);
-					CHECK_MSG(a.size() == 8 && a == b, "%s: the restored holder's next tokens differ from the original's",
-					          what.c_str());
+					if (s.prefix_len == 0 && !s.prefill100) {
+						// fresh: nothing to decode from (see CONSTRUCTION above). One outcome per step on each side,
+						// equal, and the two holders' states still equal after the steps (their saves).
+						const std::vector<int32_t> a = StepOutcomes(e, o, 8), b = StepOutcomes(e, tw, 8);
+						CHECK_MSG(a.size() == 8 && a == b, "%s: the restored holder's step outcomes [%s] differ from the original's [%s]",
+						          what.c_str(), Join96(b).c_str(), Join96(a).c_str());
+						CHECK_MSG(Save(e, o.h) == Save(e, tw.h), "%s: after the steps, the restored holder's save differs from the original's",
+						          what.c_str());
+					} else {
+						const std::vector<int32_t> a = DecodeN(e, o, 8), b = DecodeN(e, tw, 8);
+						CHECK_MSG(a.size() == 8 && a == b, "%s: the restored holder's next tokens differ from the original's",
+						          what.c_str());
+					}
 				}
 			}
 		}
