@@ -400,20 +400,12 @@ void Cell412Refusals() {
 			PKV_CHECK_EQ(sslm_kv_page_positions(a.fx.model), rule);
 		}
 	}
-	// A B that neither divides the cap nor is the cap; on the cap-4,100 fixture, 16 (T-3171 S-1).
+	// A B that neither divides the cap nor is the cap (the cap-4,100 case is 4.12/T2:cap4100).
 	{
 		At a(def, 4096);
 		if (a.fx.ok) {
 			PKV_CHECK_EQ(KvPagesTestPinPagePositions(a.fx.model, 48), SSLM_INVALID_ARGUMENT);
 			PKV_CHECK_EQ(sslm_kv_page_positions(a.fx.model), rule);
-		}
-		const Fixture& odd = GetFixture("pkv_odd");
-		Fixture o;
-		Variant v;
-		v.kv_block_size = 16;
-		if (odd.ok && MakeVariant(odd, v, &o)) {
-			PKV_CHECK_EQ(KvPagesTestPinPagePositions(o.model, 16), SSLM_INVALID_ARGUMENT);
-			PKV_CHECK_EQ(sslm_kv_page_positions(o.model), RuleB(48, 4100, 1));  // 256
 		}
 	}
 	// Hostile pins (G9): 0, -1, cap + 1, 2^31; the model is left unchanged.
