@@ -16,13 +16,13 @@ set(PKV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests/paged-kv)
 
 # Paged-KV plan rev 16.24: the two test-side switches the R9 builder flips, each in the commit that lands the
 # behaviour it follows. Both default to 2ebe5e3's behaviour, so every C2 to C6 and R0 suite stays green there.
-#   SUPERSLM_PKV_T1_ROTATED_LAYOUT (D-SLM8449): ON in the T1 commit that lands rotation. Every test-side in-page
+#   SUPERSLM_PKV_T1_ROTATED_LAYOUT (D-SLM8449): RETIRED (T-3202 F-7). The engine rotates unconditionally since T1,
+#     and tests/paged-kv/pkv_common.h's in-page formula is rotated unconditionally. Its text was: every test-side in-page
 #     address (pkv_common.h, PageRunOffset) becomes §3.1's rotated slot (r + j) mod runs, and the C2 engine view
 #     carries the run count.
 #   SUPERSLM_PKV_T2_FALLBACK_RETIRED (D-SLM8448): ON in the T2 commit that removes the one-page fallback. The eight
 #     C4, C5 and R0 cells' pkv_odd fallback assertions retire (plan §26.5's table), and Fixture::B() reads the rule's
 #     256 for pkv_odd.
-option(SUPERSLM_PKV_T1_ROTATED_LAYOUT "Paged-KV tests address pages rotated (R9 T1, D-SLM8449)" ON)
 option(SUPERSLM_PKV_T2_FALLBACK_RETIRED "Paged-KV tests retire pkv_odd's one-page fallback cells (R9 T2, D-SLM8448)" ON)
 
 function(superslm_pkv_target name)
@@ -34,9 +34,6 @@ function(superslm_pkv_target name)
 	target_link_libraries(${name} PRIVATE ${PKV_LIBRARY})
 	target_include_directories(${name} PRIVATE ${PKV_DIR} include src tests)
 	target_compile_definitions(${name} PRIVATE PKV_REFERENCE_DIR="${PKV_DIR}/reference")
-	if(SUPERSLM_PKV_T1_ROTATED_LAYOUT)
-		target_compile_definitions(${name} PRIVATE PKV_T1_ROTATED_LAYOUT=1)
-	endif()
 	if(SUPERSLM_PKV_T2_FALLBACK_RETIRED)
 		target_compile_definitions(${name} PRIVATE PKV_T2_FALLBACK_RETIRED=1)
 	endif()

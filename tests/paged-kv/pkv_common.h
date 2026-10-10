@@ -171,16 +171,14 @@ inline int64_t PageRuleB(uint64_t D, uint64_t cap, uint64_t elem) {
 	return static_cast<int64_t>(B > cap ? cap : B);
 }
 
-// The T1 switch (D-SLM8449). From T1 every page is rotated at every B, pinned or not: run r = (layer * 2 + half) *
-// kv_heads + h of logical page j = pos / B sits in slot (r + j) mod runs, runs = layers * 2 * kv_heads. At 2ebe5e3 it
-// sits in slot r. PKV_T1_ROTATED_LAYOUT is set by the CMake option SUPERSLM_PKV_T1_ROTATED_LAYOUT (default OFF: the
-// 2ebe5e3 layout, so the C2 to C6 suites stay green there); the builder turns it ON in the T1 commit that lands
-// rotation. Flipped late, the C2 to C6 raw-byte reads go red at T1; flipped early, they go red on 2ebe5e3.
-#if defined(PKV_T1_ROTATED_LAYOUT)
+// Every page is rotated at every B, pinned or not (§3.1, T1): run r = (layer * 2 + half) * kv_heads + h of logical page
+// j = pos / B sits in slot (r + j) mod runs, runs = layers * 2 * kv_heads. Until T1 this was a switch
+// (SUPERSLM_PKV_T1_ROTATED_LAYOUT, D-SLM8449) so the suites stayed green on 2ebe5e3, whose pages sat in slot r. The
+// switch is retired (T-3202 F-7): the engine has rotated unconditionally since T1, so the unrotated branch described no
+// build that exists, and the option was a CMake cache variable, so a build directory configured before T1 kept it OFF
+// and turned every C2 to C6 raw-byte read red with nothing to say why. The R9 cells that need the unrotated layout
+// (6.6a's and 7.9-MR-OPT's) name it explicitly through PageRunOffset's `rotated` argument.
 constexpr bool kRotatedLayout = true;
-#else
-constexpr bool kRotatedLayout = false;
-#endif
 
 // The byte offset of (layer, half, h, pos) inside its page at page size B, rows of `row_bytes` (head_dim * elem):
 // §3.1's formula. Every test-side in-page address in tests/paged-kv goes through this function (the census is the
