@@ -30,6 +30,8 @@
 #include <string>
 #include <vector>
 
+#include "submission_ledger.h"
+
 namespace superslm_gpu {
 namespace harness {
 
@@ -85,14 +87,9 @@ private:
 	HRESULT hr_;
 };
 
-// A submission the engine cannot confirm recovered: a command list that could not be confirmed
-// Closed, or submitted work whose completion could not be confirmed (a failed fence Signal with no
-// successful retry, or a failed SetEventOnCompletion). Every catch site reads it as rule 0 of the
-// fault classification below, whatever else is true.
-class GpuSubmissionStrandedError : public std::runtime_error {
-public:
-	explicit GpuSubmissionStrandedError(const char* what) : std::runtime_error(what) {}
-};
+// GpuSubmissionStrandedError (a submission the engine cannot confirm recovered; rule 0 of the fault
+// classification below) is declared in submission_ledger.h from G3, so the D3D12-free ledger can
+// throw it.
 
 // SSLM_GPU_HR's failure branch: E_OUTOFMEMORY throws GpuAllocationError, every other failing
 // HRESULT a plain std::runtime_error.

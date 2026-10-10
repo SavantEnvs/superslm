@@ -51,12 +51,15 @@ for %%f in (src\gpu\shaders\*.hlsl) do (
 	)
 )
 
-cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_ENABLE_MATVEC_TEST_SEAMS /DSUPERSLM_O11_ALLOC_INJECTION /DSUPERSLM_ENABLE_GPU_API_FAILURE_INJECTION ^
+rem GPU paged-KV G3: src\gpu and tests\gpu-g3-core on the path, and SUPERSLM_LEDGER_YIELD_HOOK on the
+rem whole binary (one definition of the ledger), for cell 3.6h (tests\gpu-g3-core\g3_superslm_tests_adapter.cpp).
+cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /Isrc\gpu /Itests\gpu-g3-core /DSUPERSLM_LEDGER_YIELD_HOOK /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_ENABLE_MATVEC_TEST_SEAMS /DSUPERSLM_O11_ALLOC_INJECTION /DSUPERSLM_ENABLE_GPU_API_FAILURE_INJECTION ^
 	src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp ^
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
 	src\kv_pages.cpp src\sslm_abi.cpp src\damped_greedy_antilm.cpp src\damped_greedy_topk.cpp src\damped_greedy_phaseD.cpp src\damped_greedy_phaseD_loop.cpp ^
 	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
-	tests\test_main.cpp tests\test_slm18x_saturation_census.cpp tests\test_slm19x_schema_damped_greedy.cpp tests\test_tiled_gemm.cpp tests\test_attn_rowsites.cpp tests\test_decode_threading.cpp tests\test_decode_threading_d1.cpp /Fo:out\ /Fe:out\superslm_tests.exe ^
+	tests\test_main.cpp tests\test_slm18x_saturation_census.cpp tests\test_slm19x_schema_damped_greedy.cpp tests\test_tiled_gemm.cpp tests\test_attn_rowsites.cpp tests\test_decode_threading.cpp tests\test_decode_threading_d1.cpp ^
+	src\gpu\gpu_inflight_registry.cpp tests\gpu-g3-core\g3_superslm_tests_adapter.cpp tests\gpu-g3-core\g3_cells_ledger.cpp /Fo:out\ /Fe:out\superslm_tests.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
 if errorlevel 1 (
 	goto :hard_fail
