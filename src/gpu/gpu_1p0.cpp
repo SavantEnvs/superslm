@@ -3115,6 +3115,282 @@ SslmGpuStatus sslm_gpu_readyImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq
 	return SSLM_OK;
 }
 
+namespace {
+// T-2895 (closing TE-362): untrusted-input validation on a restored schema binding, mirroring
+// sslm_seq_restore's own C1 fix (src/sslm_abi.cpp) -- the restored walk-state is bounded against the
+// RESOLVED schema's own state_count before it is ever used to index mask_pages, and a bound index this
+// model does not have is refused. Unbound (restored_schema_index < 0) passes only with the unused-walk
+// sentinel. Paged KV (G5): factored out of sslm_gpu_seq_restoreImpl unchanged, so both GPU restore verbs
+// run the same two checks (and tests/t2899-schema-deadend-red-suite/make_mut_slm5_bounds.py, re-anchored
+// here, mutates them for both).
+bool RestoredSchemaBindingValid(const SslmGpuModelHandle* model, int32_t restored_schema_index,
+                                uint32_t restored_walk_state) {
+	if (restored_schema_index >= 0) {
+		// T-2917 (folding TE-370 S3, D-SLM7600): the `>= model->schemas.Count()` pre-check
+		// this comment used to gate on is removed -- provably dead, not merely redundant.
+		// SchemaMasksTable::ByIndex (include/superslm/schema_masks.h) is itself bounds-safe
+		// (`index < entries_.size() ? &entries_[index] : nullptr`), so no `restored_schema_index`
+		// this check could have caught can ever make it return non-null; the null-check below
+		// already refuses every input the removed check refused, by the same mechanism. T-2916
+		// confirmed by execution (mutant deletion): the removed check's own mutant survives
+		// (failures=0) because the adjacent null-check kills every input that would exercise it.
+		// The null-check IS the bound.
+		const superslm::SchemaEntry* resolved_entry =
+		    model->schemas.ByIndex(static_cast<size_t>(restored_schema_index));
+		if (!resolved_entry || restored_walk_state >= resolved_entry->state_count) {
+			return false;
+		}
+	} else if (restored_walk_state != 0xFFFFFFFFu) {
+		// Symmetric malformation, mirroring sslm_seq_restore's own identical check: an unbound
+		// blob (schema index < 0) must carry the unused-walk sentinel, never a real state id.
+		return false;
+	}
+	return true;
+}
+
+// Paged-KV plan (rev 16.2) §4 item 10, step G5: the 'SLM6' blob, which only a POOLED sequence writes
+// (the writer rule: a dedicated sequence keeps writing 'SLM5', SaveGpuSequenceState, unchanged).
+// "SLM5 fields, plus kv_mode, budget, origin and the canonical [0, L') K/V gather of §3.7". The plan fixes
+// the fields; this is the layout, the one the GPU red suite pins (tests/paged-kv-gpu/pkvg_slm6_layout.h):
+//   [0, 120)    SLM5's header (superslm_gpu.cpp GpuSeqBlobHeader, field for field), magic 'SLM6', with
+//               hidden_codes_size = the residual's bytes and workspace_size = L' * bytes_per_token (the
+//               K/V rows the blob carries, as SLM5's workspace_size is the K/V bytes it carries)
+//   [120, 132)  SLM5's twelve-byte tail (bound_schema_index i32, dfa_walk_state u32, ready u32)
+//   132         kv_mode u32 (1 budget: the writer rule makes every SLM6 a budget blob)
+//   136         budget i32 (the declared budget)
+//   140         origin i64
+//   148         the residual (hidden_codes_size bytes)
+//   148 + R     kv_positions u64 = L' = context_length + (layer_index > 0 ? 1 : 0)
+//   156 + R     the rows [0, L') in canonical layout [layer][K|V][kv_head][pos < L'][d] (int8)
+// The rows are gathered from the pool's host mirror (complete by G24) through the holder's table, and at
+// row `context_length` the layers >= layer_index are written as zero bytes whatever the page holds (§3.7)
+// -- every layer of it when layer_index == num_hidden_layers, the GPU's rest after a full-depth token,
+// whose row L was never written (SavePooledSlm6) -- so the blob is a function of the sequence's valid
+// state alone. No relation between
+// the per-site counters and the aggregate is validated (§3.7).
+constexpr uint32_t kGpuSeqBlobMagicSlm6 = 0x364D4C53u;  // "SLM6" little-endian u32
+constexpr size_t kSlm6OffLayerIndex = 4;
+constexpr size_t kSlm6OffScaleM = 8;
+constexpr size_t kSlm6OffScaleE = 16;
+constexpr size_t kSlm6OffKvSaturation = 24;
+constexpr size_t kSlm6OffContextLength = 32;
+constexpr size_t kSlm6OffHiddenCodesSize = 40;
+constexpr size_t kSlm6OffWorkspaceSize = 48;
+constexpr size_t kSlm6OffModelHash = 56;
+constexpr size_t kSlm6OffKvLandingSaturation = 88;
+constexpr size_t kSlm6OffKChannelLandingSaturation = 96;
+constexpr size_t kSlm6OffRopeQSaturation = 104;
+constexpr size_t kSlm6OffRopeKSaturation = 112;
+constexpr size_t kSlm6OffSchemaIndex = 120;
+constexpr size_t kSlm6OffWalkState = 124;
+constexpr size_t kSlm6OffReady = 128;
+constexpr size_t kSlm6OffKvMode = 132;
+constexpr size_t kSlm6OffBudget = 136;
+constexpr size_t kSlm6OffOrigin = 140;
+constexpr size_t kSlm6FixedBytes = 148;
+constexpr size_t kSlm6KvPositionsBytes = 8;
+constexpr uint32_t kSlm6KvModeBudget = 1;
+static_assert(kSlm6OffModelHash + superslm::kIntegrityHashBytes == kSlm6OffKvLandingSaturation, "SLM6 layout");
+
+template <typename T>
+void Slm6Put(uint8_t* blob, size_t off, T v) {
+	std::memcpy(blob + off, &v, sizeof(T));
+}
+template <typename T>
+T Slm6Get(const uint8_t* blob, size_t off) {
+	T v{};
+	std::memcpy(&v, blob + off, sizeof(T));
+	return v;
+}
+
+// The 4-byte magic, or 0 when the blob is too short to hold one.
+uint32_t GpuSeqBlobMagic(const void* blob, size_t blob_size) {
+	if (!blob || blob_size < sizeof(uint32_t)) return 0;
+	return Slm6Get<uint32_t>(static_cast<const uint8_t*>(blob), 0);
+}
+
+// One K/V row's bytes, and one token's across every (layer, half, kv_head) run, at the GPU's int8 element.
+size_t GpuKvRuns(const SslmGpuModelHandle* model) {
+	return static_cast<size_t>(model->num_hidden_layers) * 2u * static_cast<size_t>(model->num_key_value_heads);
+}
+
+// The pooled holder's row `position` of run `run` in the pool's host mirror (§3.1's in-page layout
+// [run][pos < B][d]). The holder maps the position's page.
+uint8_t* PooledMirrorRow(const SslmGpuKvPoolHandle* pool, const superslm::kv_pages::PageHolder* holder, size_t run,
+                         int64_t position, size_t head_dim) {
+	const int64_t B = pool->geo.page_positions;
+	const uint32_t page = superslm::kv_pages::HolderTableEntryForAddress(holder, static_cast<uint32_t>(position / B));
+	return superslm::kv_pages::PageBase(pool->pages, page) + run * static_cast<size_t>(B) * head_dim +
+	       static_cast<size_t>(position % B) * head_dim;
+}
+
+// §4 item 10: a pooled sequence's save, the 'SLM6' writer. The size contract is SaveGpuSequenceState's:
+// a null or too-small `out_blob` reports the required size through *out_blob_size and returns false, and
+// the caller maps false to the status the 'SLM5' save returns for it.
+bool SavePooledSlm6(const SslmGpuSequenceHandle* seq, void* out_blob, size_t* out_blob_size) {
+	if (!out_blob_size || seq->pool == nullptr || seq->holder == nullptr || seq->model == nullptr) return false;
+	const SslmGpuModelHandle* model = seq->model;
+	const SslmGpuKvPoolHandle* pool = seq->pool;
+	const superslm::SequenceLayerState& st = seq->live_state;
+	const size_t D = model->head_dim;
+	const size_t runs = GpuKvRuns(model);
+	const int64_t L = st.context_length;
+	const uint32_t layer_index = st.layer_index;
+	const int64_t lprime = L + (layer_index > 0 ? 1 : 0);
+	if (L < 0 || lprime > seq->context_cap) return false;
+	const size_t residual = seq->hidden_codes.size();
+	const size_t rows_bytes = static_cast<size_t>(lprime) * runs * D;
+	const size_t required = kSlm6FixedBytes + residual + kSlm6KvPositionsBytes + rows_bytes;
+	if (!out_blob || *out_blob_size < required) {
+		*out_blob_size = required;  // report the size a real call needs, never truncate
+		return false;
+	}
+	// The layers of row L that hold committed state. The engine advances context_length when a token's
+	// last layer commits (forward_sites.cpp), so a GPU sequence resting after a full-depth token carries
+	// layer_index == num_hidden_layers with row L never written: §3.7's formula (written against the CPU,
+	// which rests at layer_index 0) still counts that row in L', and none of its layers is valid state,
+	// so all of them are zero-substituted. A mid-token save (0 < layer_index < layers) keeps the layers
+	// below layer_index. Only rows the sequence wrote are read, and each lies in a page the holder maps.
+	const uint32_t valid_layers_at_l = layer_index < model->num_hidden_layers ? layer_index : 0u;
+	const int64_t rows_read = valid_layers_at_l > 0 ? lprime : L;
+	if (superslm_gpu::kv_pool::PagesToCover(rows_read, pool->geo.page_positions) >
+	    superslm::kv_pages::HolderMapped(seq->holder)) {
+		return false;
+	}
+	uint8_t* dst = static_cast<uint8_t*>(out_blob);
+	Slm6Put<uint32_t>(dst, 0, kGpuSeqBlobMagicSlm6);
+	Slm6Put<uint32_t>(dst, kSlm6OffLayerIndex, layer_index);
+	Slm6Put<int64_t>(dst, kSlm6OffScaleM, st.hidden_scale.m);
+	Slm6Put<int64_t>(dst, kSlm6OffScaleE, st.hidden_scale.e);
+	Slm6Put<uint64_t>(dst, kSlm6OffKvSaturation, st.kv_saturation_count);
+	Slm6Put<int64_t>(dst, kSlm6OffContextLength, L);
+	Slm6Put<uint64_t>(dst, kSlm6OffHiddenCodesSize, static_cast<uint64_t>(residual));
+	Slm6Put<uint64_t>(dst, kSlm6OffWorkspaceSize, static_cast<uint64_t>(rows_bytes));
+	std::memcpy(dst + kSlm6OffModelHash, model->content_hash.data(), superslm::kIntegrityHashBytes);
+	Slm6Put<uint64_t>(dst, kSlm6OffKvLandingSaturation, st.kv_landing_saturation_count);
+	Slm6Put<uint64_t>(dst, kSlm6OffKChannelLandingSaturation, st.k_channel_landing_saturation_count);
+	Slm6Put<uint64_t>(dst, kSlm6OffRopeQSaturation, st.rope_q_saturation_count);
+	Slm6Put<uint64_t>(dst, kSlm6OffRopeKSaturation, st.rope_k_saturation_count);
+	Slm6Put<int32_t>(dst, kSlm6OffSchemaIndex, seq->bound_schema_index);
+	Slm6Put<uint32_t>(dst, kSlm6OffWalkState, seq->dfa_walk_state);
+	Slm6Put<uint32_t>(dst, kSlm6OffReady, seq->ready_for_logits ? 1u : 0u);
+	Slm6Put<uint32_t>(dst, kSlm6OffKvMode, kSlm6KvModeBudget);
+	Slm6Put<int32_t>(dst, kSlm6OffBudget, seq->budget);
+	Slm6Put<int64_t>(dst, kSlm6OffOrigin, seq->origin);
+	size_t off = kSlm6FixedBytes;
+	if (residual > 0) std::memcpy(dst + off, seq->hidden_codes.data(), residual);
+	off += residual;
+	Slm6Put<uint64_t>(dst, off, static_cast<uint64_t>(lprime));
+	off += kSlm6KvPositionsBytes;
+	// The canonical gather (§3.7): rows [0, L) page by page, then the mid-token row at L.
+	const int64_t B = pool->geo.page_positions;
+	const size_t per_layer = 2u * static_cast<size_t>(model->num_key_value_heads);
+	for (size_t r = 0; r < runs; ++r) {
+		uint8_t* run_dst = dst + off + r * static_cast<size_t>(lprime) * D;
+		for (int64_t p0 = 0; p0 < L; p0 += B) {
+			const int64_t n = std::min<int64_t>(B, L - p0);
+			std::memcpy(run_dst + static_cast<size_t>(p0) * D, PooledMirrorRow(pool, seq->holder, r, p0, D),
+			            static_cast<size_t>(n) * D);
+		}
+		if (lprime > L) {
+			uint8_t* row = run_dst + static_cast<size_t>(L) * D;
+			if (r / per_layer < valid_layers_at_l) {
+				std::memcpy(row, PooledMirrorRow(pool, seq->holder, r, L, D), D);
+			} else {
+				std::memset(row, 0, D);  // §3.7's zero substitution
+			}
+		}
+	}
+	*out_blob_size = required;
+	return true;
+}
+
+// An 'SLM6' blob read and validated (§3.7's restore validation and 2.6's cases), nothing drawn.
+struct Slm6Restore {
+	uint32_t layer_index = 0;
+	superslm::CarriedScale hidden_scale{};
+	uint64_t kv_saturation_count = 0;
+	uint64_t kv_landing_saturation_count = 0;
+	uint64_t k_channel_landing_saturation_count = 0;
+	uint64_t rope_q_saturation_count = 0;
+	uint64_t rope_k_saturation_count = 0;
+	int64_t context_length = 0;
+	int32_t bound_schema_index = -1;
+	uint32_t dfa_walk_state = 0xFFFFFFFFu;
+	bool ready_for_logits = false;
+	int32_t budget = 0;
+	int64_t origin = 0;
+	int64_t lprime = 0;
+	const uint8_t* residual = nullptr;
+	const uint8_t* rows = nullptr;  // [run][pos < L'][d]
+};
+
+// §4.10 step 4, the body of an 'SLM6' (the magic is the caller's step 3): every check of 2.6 and 2.3 with
+// SSLM_SEQUENCE_KV_BUFFER_MISMATCH, the status today's GPU restore returns for a malformed blob -- a
+// kv_mode other than budget (the writer rule makes every SLM6 a budget blob, so a whole_reserve or unknown
+// kv_mode is malformed here), a budget outside [1, cap], an origin outside [0, context_length], a
+// context_length above min(origin + budget, cap), a layer_index past the model's layers, an L' above the
+// cap, kv_positions or workspace_size inconsistent with L', a residual of another size, and any size other
+// than the exact one; then SSLM_RESTORE_MODEL_MISMATCH for another model's blob (as sslm_gpu_seq_restore);
+// then the schema binding's two checks (RestoredSchemaBindingValid).
+SslmGpuStatus ParseSlm6Body(const SslmGpuModelHandle* model, const void* blob, size_t blob_size, Slm6Restore* out) {
+	const uint8_t* p = static_cast<const uint8_t*>(blob);
+	if (blob_size < kSlm6FixedBytes) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	const int64_t cap = model->context_cap;
+	const uint32_t kv_mode = Slm6Get<uint32_t>(p, kSlm6OffKvMode);
+	const int32_t budget = Slm6Get<int32_t>(p, kSlm6OffBudget);
+	const int64_t origin = Slm6Get<int64_t>(p, kSlm6OffOrigin);
+	const int64_t context_length = Slm6Get<int64_t>(p, kSlm6OffContextLength);
+	const uint32_t layer_index = Slm6Get<uint32_t>(p, kSlm6OffLayerIndex);
+	const uint64_t residual = Slm6Get<uint64_t>(p, kSlm6OffHiddenCodesSize);
+	const uint64_t workspace = Slm6Get<uint64_t>(p, kSlm6OffWorkspaceSize);
+	if (kv_mode != kSlm6KvModeBudget) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (!superslm_gpu::kv_pool::BudgetInDomain(budget, cap)) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (context_length < 0 || context_length > cap) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (origin < 0 || origin > context_length) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (context_length > superslm_gpu::kv_pool::HolderLimit(origin, budget, cap)) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (layer_index > model->num_hidden_layers) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	const int64_t lprime = context_length + (layer_index > 0 ? 1 : 0);
+	if (lprime > cap) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (residual != static_cast<uint64_t>(model->hidden_size)) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	// Every term below is bounded: lprime <= cap (a u32), runs and head_dim are the model's own.
+	const uint64_t rows_bytes = static_cast<uint64_t>(lprime) * GpuKvRuns(model) * model->head_dim;
+	if (workspace != rows_bytes) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	const uint64_t kvpos_off = kSlm6FixedBytes + residual;
+	if (static_cast<uint64_t>(blob_size) < kvpos_off + kSlm6KvPositionsBytes) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (Slm6Get<uint64_t>(p, static_cast<size_t>(kvpos_off)) != static_cast<uint64_t>(lprime)) {
+		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	}
+	if (static_cast<uint64_t>(blob_size) != kvpos_off + kSlm6KvPositionsBytes + rows_bytes) {
+		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;  // the exact size: truncated or trailing bytes
+	}
+	if (std::memcmp(p + kSlm6OffModelHash, model->content_hash.data(), superslm::kIntegrityHashBytes) != 0) {
+		return SSLM_RESTORE_MODEL_MISMATCH;
+	}
+	const int32_t schema_index = Slm6Get<int32_t>(p, kSlm6OffSchemaIndex);
+	const uint32_t walk_state = Slm6Get<uint32_t>(p, kSlm6OffWalkState);
+	if (!RestoredSchemaBindingValid(model, schema_index, walk_state)) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	out->layer_index = layer_index;
+	out->hidden_scale.m = Slm6Get<int64_t>(p, kSlm6OffScaleM);
+	out->hidden_scale.e = Slm6Get<int64_t>(p, kSlm6OffScaleE);
+	out->kv_saturation_count = Slm6Get<uint64_t>(p, kSlm6OffKvSaturation);
+	out->kv_landing_saturation_count = Slm6Get<uint64_t>(p, kSlm6OffKvLandingSaturation);
+	out->k_channel_landing_saturation_count = Slm6Get<uint64_t>(p, kSlm6OffKChannelLandingSaturation);
+	out->rope_q_saturation_count = Slm6Get<uint64_t>(p, kSlm6OffRopeQSaturation);
+	out->rope_k_saturation_count = Slm6Get<uint64_t>(p, kSlm6OffRopeKSaturation);
+	out->context_length = context_length;
+	out->bound_schema_index = schema_index;
+	out->dfa_walk_state = walk_state;
+	out->ready_for_logits = Slm6Get<uint32_t>(p, kSlm6OffReady) != 0;
+	out->budget = budget;
+	out->origin = origin;
+	out->lprime = lprime;
+	out->residual = p + kSlm6FixedBytes;
+	out->rows = p + kvpos_off + kSlm6KvPositionsBytes;
+	return SSLM_OK;
+}
+}  // namespace
+
 // Design Sec4.2/Sec5.3 (T-2113 B5): the device-resident save/restore/reset trio,
 // declared for B3/B5 (gpu_1p0.h's own header comment) -- reusing
 // `SaveGpuSequenceState`/`RestoreGpuSequenceState` (gpu_port.h, the substrate's own
@@ -3132,9 +3408,10 @@ SslmGpuStatus sslm_gpu_seq_saveImpl(SslmGpuContext* ctx, const SslmGpuSequenceHa
 	if (!superslm_gpu::CallProceedsOrBusy_SeqSave(is_submitted)) {
 		return SSLM_BUSY;  // design Sec4.2's own state table, unchanged policy.
 	}
-	// Paged KV (G3): a pooled sequence saves 'SLM6' (§4 item 10), which lands at G5. Until then
-	// its save is refused, never written as an 'SLM5' blob of the whole pool's mirror.
-	if (seq->pool != nullptr) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	// Paged KV (G5, §4 item 10's writer rule): a pooled sequence saves 'SLM6', gathered from the pool's
+	// host mirror through its table; a dedicated sequence keeps saving 'SLM5', below, unchanged. A
+	// too-small buffer reports the required size and returns the status the 'SLM5' save returns.
+	if (seq->pool != nullptr) return SavePooledSlm6(seq, out_blob, out_blob_size) ? SSLM_OK : SSLM_DEVICE_LOST;
 	// T-2114 (C1): hidden_codes_size = seq->hidden_codes.size() -- the 1.0 handle owns this
 	// vector (design Sec5.3), so the residual stream now round-trips through the blob
 	// alongside the K/V workspace bytes, closing the class of loss a restored, non-zero
@@ -3209,6 +3486,10 @@ SslmGpuStatus sslm_gpu_seq_restoreImpl(SslmGpuContext* ctx, SslmGpuModelHandle* 
 	// a short, cheaply-capped sequence -- the common case, since context_cap is a sslm_gpu_seq_create
 	// parameter for exactly the reason not every sequence needs the model's full capacity -- the one
 	// case that always failed the size check below, loudly but wrongly scoped.
+	// Paged KV (G5, §4.10 step 3, §3.9 A11): an 'SLM6' is a pooled sequence's budget blob, and a
+	// dedicated holder's per-handle cap has no budget, origin or pool to restore it into. The magic alone
+	// decides it, so a hostile 'SLM6' is a mode mismatch too; nothing is allocated.
+	if (GpuSeqBlobMagic(blob, blob_size) == kGpuSeqBlobMagicSlm6) return SSLM_GPU_HOLDER_MODE_MISMATCH;
 	uint64_t blob_workspace_size = 0;
 	if (!superslm_gpu::PeekGpuSeqBlobWorkspaceSize(blob, blob_size, &blob_workspace_size)) {
 		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
@@ -3363,25 +3644,9 @@ SslmGpuStatus sslm_gpu_seq_restoreImpl(SslmGpuContext* ctx, SslmGpuModelHandle* 
 	// walk-state against the RESOLVED schema's own state_count before it is ever used to
 	// index mask_pages, and reject a bound index this model does not have. Unbound
 	// (restored_schema_index < 0) always passes: no state to validate.
-	if (restored_schema_index >= 0) {
-		// T-2917 (folding TE-370 S3, D-SLM7600): the `>= model->schemas.Count()` pre-check
-		// this comment used to gate on is removed -- provably dead, not merely redundant.
-		// SchemaMasksTable::ByIndex (include/superslm/schema_masks.h) is itself bounds-safe
-		// (`index < entries_.size() ? &entries_[index] : nullptr`), so no `restored_schema_index`
-		// this check could have caught can ever make it return non-null; the null-check below
-		// already refuses every input the removed check refused, by the same mechanism. T-2916
-		// confirmed by execution (mutant deletion): the removed check's own mutant survives
-		// (failures=0) because the adjacent null-check kills every input that would exercise it.
-		// The null-check IS the bound.
-		const superslm::SchemaEntry* resolved_entry =
-		    model->schemas.ByIndex(static_cast<size_t>(restored_schema_index));
-		if (!resolved_entry || restored_walk_state >= resolved_entry->state_count) {
-			sslm_gpu_seq_release(ctx, fresh);
-			return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
-		}
-	} else if (restored_walk_state != 0xFFFFFFFFu) {
-		// Symmetric malformation, mirroring sslm_seq_restore's own identical check: an unbound
-		// blob (schema index < 0) must carry the unused-walk sentinel, never a real state id.
+	// Paged KV (G5): the two checks live in RestoredSchemaBindingValid (above), shared with
+	// sslm_gpu_seq_restore_into_pool, which runs them before it draws anything.
+	if (!RestoredSchemaBindingValid(model, restored_schema_index, restored_walk_state)) {
 		sslm_gpu_seq_release(ctx, fresh);
 		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	}
@@ -4847,7 +5112,8 @@ Microsoft::WRL::ComPtr<ID3D12Resource> AllocatePoolUploadStaging(
 // INVARIANT (as the zero-fill's): nothing between the list's Reset and CloseListOrThrow allocates or
 // throws. The latch is cleared only once the wait has returned; a throw leaves it as it was.
 void SubmitPoolUploadSync(superslm_gpu::harness::Device& dev, SslmGpuKvPoolHandle* pool,
-                          const std::vector<superslm_gpu::PoolUploadRegion>& regions, ID3D12Resource* staging) {
+                          const std::vector<superslm_gpu::PoolUploadRegion>& regions,
+                          const Microsoft::WRL::ComPtr<ID3D12Resource>& staging) {
 	// The ledger's reset (G3, plan §4.4): the eighth reset site (§4 item 8). BeginRecording() runs the
 	// stranded check, the boundary guard check and PoolSubmitAssert before it.
 	dev.BeginRecording();
@@ -4863,7 +5129,7 @@ void SubmitPoolUploadSync(superslm_gpu::harness::Device& dev, SslmGpuKvPoolHandl
 	const uint64_t page_bytes = pool->geo.page_bytes;
 	uint64_t at = 0;
 	for (const superslm_gpu::PoolUploadRegion& r : regions) {
-		dev.list->CopyBufferRegion(pool->pool_buf.Get(), uint64_t{r.page} * page_bytes + r.offset, staging, at, r.bytes);
+		dev.list->CopyBufferRegion(pool->pool_buf.Get(), uint64_t{r.page} * page_bytes + r.offset, staging.Get(), at, r.bytes);
 		at += r.bytes;
 	}
 	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -4871,8 +5137,11 @@ void SubmitPoolUploadSync(superslm_gpu::harness::Device& dev, SslmGpuKvPoolHandl
 	dev.list->ResourceBarrier(1, &barrier);
 	dev.CloseListOrThrow();
 	// ---- end of the recording window ----
-	// The ledger's submission and wait (G3), as the zero-fill's: Submit(no retry), then its Wait().
-	dev.Submit(/*retry=*/false).Wait();
+	// The ledger's submission and wait (G3), as the zero-fill's: Submit(no retry), then its Wait(); the
+	// staging buffer and the pool buffer are kept alive if it strands (review-g23 F1, as the other
+	// synchronous sites). Every pool upload -- the prefix tail copy, adopt's tail copy, and
+	// restore_into_pool through UploadPoolRegionsSync -- submits here.
+	dev.SubmitAndWaitKeepingAlive(/*retry=*/false, staging, pool->pool_buf);
 	pool->kv_needs_resume_barrier = false;
 }
 
@@ -4893,9 +5162,14 @@ void CheckPoolUploadRegions(const SslmGpuKvPoolHandle* pool, const std::vector<s
 // fails after this releases `(*out)->holder` and lets the handle go. The budgeted create's body
 // (sslm_gpu_seq_create_budgetedImpl), for the prefix verbs. Refusals: SSLM_GPU_KV_POOL_EXHAUSTED with
 // nothing drawn; a table-buffer failure returns the draw and is classified as every handle create's.
+//
+// G5: `extra_pages` more pages in the same draw (restore-into-pool's E materialized pages, §3.7), so the
+// draw of R(budget) + E is refused whole, with nothing drawn.
 SslmGpuStatus MakePooledSeqUnpublished(SslmGpuContext* ctx, SslmGpuModelHandle* model, SslmGpuKvPoolHandle* pool,
-                                       int32_t budget, std::unique_ptr<SslmGpuSequenceHandle>* out) {
-	const uint32_t reserve = superslm_gpu::kv_pool::ReservationPages(budget, pool->geo, model->context_cap);
+                                       int32_t budget, std::unique_ptr<SslmGpuSequenceHandle>* out,
+                                       uint32_t extra_pages = 0) {
+	const uint32_t reserve =
+	    superslm_gpu::kv_pool::ReservationPages(budget, pool->geo, model->context_cap) + extra_pages;
 	std::unique_ptr<SslmGpuSequenceHandle> h(new SslmGpuSequenceHandle());
 	h->hidden_codes.assign(model->hidden_size, 0);
 	h->prefill_hidden_codes.assign(model->hidden_size, 0);
@@ -4991,7 +5265,7 @@ void UploadPoolRegionsSync(harness::Device& dev, SslmGpuKvPoolHandle* pool, cons
 		             static_cast<size_t>(regions[i].offset);
 	}
 	const Microsoft::WRL::ComPtr<ID3D12Resource> staging = AllocatePoolUploadStaging(dev, regions, sources);
-	SubmitPoolUploadSync(dev, pool, regions, staging.Get());
+	SubmitPoolUploadSync(dev, pool, regions, staging);
 }
 }  // namespace superslm_gpu
 
@@ -5094,7 +5368,7 @@ SslmGpuStatus sslm_gpu_prefix_begin_fromImpl(SslmGpuContext* ctx, SslmGpuPrefixH
 		            superslm::kv_pages::PageBase(pool->pages, src_page), pool->geo.page_bytes);
 		regions[0].page = dst_page;
 		try {
-			SubmitPoolUploadSync(dev, pool, regions, staging.Get());
+			SubmitPoolUploadSync(dev, pool, regions, staging);
 		} catch (...) {
 			superslm::kv_pages::HolderRelease(h->holder);
 			return ClassifyHandleFault(&dev);
@@ -5279,7 +5553,7 @@ SslmGpuStatus sslm_gpu_seq_adopt_prefixImpl(SslmGpuContext* ctx, SslmGpuSequence
 		            superslm::kv_pages::PageBase(pool->pages, src_page), pool->geo.page_bytes);
 		regions[0].page = dst_page;
 		try {
-			SubmitPoolUploadSync(dev, pool, regions, staging.Get());
+			SubmitPoolUploadSync(dev, pool, regions, staging);
 		} catch (...) {
 			const SslmGpuStatus fault = ClassifyHandleFault(&dev);
 			(void)sslm_gpu_seq_resetImpl(ctx, seq);
@@ -5295,6 +5569,164 @@ SslmGpuStatus sslm_gpu_seq_adopt_prefixImpl(SslmGpuContext* ctx, SslmGpuSequence
 	seq->origin = len;
 	seq->limit = superslm_gpu::kv_pool::HolderLimit(len, seq->budget, seq->context_cap);
 	seq->bind_eligible = false;  // gap 4d: a successful adopt revokes it, as the CPU adopt does
+	return SSLM_OK;
+}
+
+// §4 item 10, §3.7 and §3.9 A12-A14 and A21, step G5: restores an 'SLM6' budget blob into a fresh pooled
+// sequence of `pool`, keeping its budget and origin (the same holder as before the save: the same limit,
+// and R(budget) private pages after its first reset or adopt). `prefix_or_null` is a sharing hint, never
+// a checked argument. §4.10's order, each refusal changing nothing:
+//   1. the arguments: a null out-handle, context, model, pool or blob, a model or pool of another
+//      context, a pool of another model (A21) -> SSLM_SEQUENCE_KV_BUFFER_MISMATCH, null out-handle;
+//   2. EntrySubmitGuard: any sequence in the process Submitted, or the singleton's ledger unobserved ->
+//      SSLM_BUSY (stranded -> SSLM_DEVICE_LOST), as the sibling restore's guard (§4.4's row: singleton,
+//      any sequence);
+//   3. the magic: anything that is not 'SLM6' ('SLM5', 'SLM4', any other magic, or a blob too short to
+//      carry one) -> SSLM_GPU_HOLDER_MODE_MISMATCH (A14);
+//   4. the body (ParseSlm6Body): SSLM_SEQUENCE_KV_BUFFER_MISMATCH, or SSLM_RESTORE_MODEL_MISMATCH for
+//      another model's blob;
+//   5. the draw: SSLM_GPU_KV_POOL_EXHAUSTED with nothing drawn. R(budget) and, on the private path, the E
+//      materialized pages are one kv_pages draw (HolderCreate), so a refusal of either part draws nothing
+//      and the first is rolled back by construction.
+// Re-sharing (A12) only under §3.7's identity conditions: (a) the blob is budget mode (every valid SLM6
+// is), (b) the prefix is frozen, (c) of the destination model, (d) of the destination pool (which also
+// makes it of this context), (e) its context_length == origin, and (f) its HOST-MIRROR rows at positions
+// [0, floor(origin/B)*B), every layer, K and V, equal the blob's own. Then its floor(origin/B) full pages
+// are shared (+1 each under the pool mutex) and only [floor(origin/B)*B, L') is scattered. Otherwise
+// (A13: no prefix, a mismatch, a prefix of another context, model or pool) the restore is private:
+// R(budget) + E pages, E = min(floor(origin/B), ceil(cap/B) - R(budget)), the E pages mapped as
+// materialized (back to the pool at the first reset, adopt or release, §3.3), *out_shared_pages = 0.
+// The scatter writes the pool's host mirror, and only the pages it wrote are uploaded, whole, through the
+// pool upload (UploadPoolRegionsSync on the process's device, after the guard). A failure of that upload
+// releases the holder (its pages back to the pool; nothing was published) and is classified, rules 0-3,
+// as every handle create's.
+SslmGpuStatus sslm_gpu_seq_restore_into_poolImpl(SslmGpuContext* ctx, SslmGpuModelHandle* model, SslmGpuKvPoolHandle* pool,
+                                                 const void* blob, size_t blob_size, SslmGpuPrefixHandle* prefix_or_null,
+                                                 SslmGpuSequenceHandle** out_seq, uint32_t* out_shared_pages) {
+	if (out_shared_pages) *out_shared_pages = 0;
+	if (!out_seq) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	*out_seq = nullptr;
+	// 1. The checked arguments (A21). The prefix is not one of them (A13, decision 64).
+	if (!ctx || !model || !pool || !blob || model->ctx != ctx || pool->ctx != ctx || pool->model != model ||
+	    pool->pages == nullptr) {
+		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	}
+	// 2. EntrySubmitGuard (§4.4): the pool upload reaches the singleton; scope any sequence; after the
+	// call-level refusals, before the magic (§4.10 step 2).
+	if (const SslmGpuStatus g = EntrySubmitGuard(GuardScope::kAny, GuardDevice::kReachesSingleton); g != SSLM_OK) {
+		return g;
+	}
+	// 3. The magic (A14): only a pooled sequence's 'SLM6' restores into a pool.
+	if (GpuSeqBlobMagic(blob, blob_size) != kGpuSeqBlobMagicSlm6) return SSLM_GPU_HOLDER_MODE_MISMATCH;
+	// 4. The body.
+	Slm6Restore b;
+	if (const SslmGpuStatus st = ParseSlm6Body(model, blob, blob_size, &b); st != SSLM_OK) return st;
+
+	const superslm_gpu::kv_pool::GpuPageGeometry& geo = pool->geo;
+	const int64_t B = geo.page_positions;
+	const size_t D = model->head_dim;
+	const size_t runs = GpuKvRuns(model);
+	const uint32_t full = static_cast<uint32_t>(b.origin / B);
+	const uint32_t reserve = superslm_gpu::kv_pool::ReservationPages(b.budget, geo, model->context_cap);
+	// The identity conditions (a)-(f), read before anything is drawn. (a) holds for every valid SLM6.
+	const SslmGpuSequenceHandle* src = (prefix_or_null != nullptr) ? prefix_or_null->seq : nullptr;
+	bool share = full > 0 && src != nullptr && prefix_or_null->frozen &&                 // (b)
+	             prefix_or_null->model == model && src->model == model &&               // (c)
+	             prefix_or_null->pool == pool && src->pool == pool && src->holder != nullptr &&  // (d)
+	             src->context_length == b.origin &&                                     // (e)
+	             full <= superslm::kv_pages::HolderMapped(src->holder);
+	if (share) {  // (f): the prefix's host-mirror rows against the blob's, [0, full * B), every run
+		const size_t span_bytes = static_cast<size_t>(B) * D;
+		for (size_t r = 0; share && r < runs; ++r) {
+			const uint8_t* run_src = b.rows + r * static_cast<size_t>(b.lprime) * D;
+			for (uint32_t pg = 0; pg < full; ++pg) {
+				const int64_t p0 = static_cast<int64_t>(pg) * B;
+				if (std::memcmp(PooledMirrorRow(pool, src->holder, r, p0, D), run_src + static_cast<size_t>(p0) * D,
+				                span_bytes) != 0) {
+					share = false;
+					break;
+				}
+			}
+		}
+	}
+	const uint32_t share_pages = share ? full : 0u;
+	const uint32_t materialized = share ? 0u : std::min<uint32_t>(full, geo.cap_pages - reserve);
+	const uint32_t needed = superslm_gpu::kv_pool::PagesToCover(b.lprime, B);
+	if (needed > geo.cap_pages || share_pages > needed || materialized > needed) {
+		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;  // unreachable: L' <= cap and floor(origin/B) <= ceil(L'/B)
+	}
+	std::vector<superslm_gpu::PoolUploadRegion> regions;
+	regions.reserve(needed - share_pages);  // before the draw: nothing below it allocates but the upload
+
+	// 5. The draw: R(budget) + E in one kv_pages draw, and the table buffer (MakePooledSeqUnpublished).
+	std::unique_ptr<SslmGpuSequenceHandle> h;
+	if (const SslmGpuStatus st = MakePooledSeqUnpublished(ctx, model, pool, b.budget, &h, materialized); st != SSLM_OK) {
+		return st;
+	}
+	superslm::kv_pages::PageHolder* kv = h->holder;
+	superslm::kv_pages::PageStatus ps = superslm::kv_pages::PageStatus::kOk;
+	if (share_pages > 0) {
+		ps = superslm::kv_pages::HolderShareLeading(kv, src->holder, share_pages);
+	} else if (materialized > 0) {
+		ps = superslm::kv_pages::HolderMapMaterialized(kv, materialized);
+	}
+	while (ps == superslm::kv_pages::PageStatus::kOk && superslm::kv_pages::HolderMapped(kv) < needed) {
+		ps = superslm::kv_pages::HolderMapNext(kv);  // R(budget) covers the rest (§3.4/§3.7)
+	}
+	if (ps != superslm::kv_pages::PageStatus::kOk) {
+		superslm::kv_pages::HolderRelease(kv);
+		return ps == superslm::kv_pages::PageStatus::kExhausted ? SSLM_GPU_KV_POOL_EXHAUSTED
+		                                                        : SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	}
+	// The scatter into the host mirror: rows [share_pages * B, L') of every run.
+	for (size_t r = 0; r < runs; ++r) {
+		const uint8_t* run_src = b.rows + r * static_cast<size_t>(b.lprime) * D;
+		for (int64_t p0 = static_cast<int64_t>(share_pages) * B; p0 < b.lprime; p0 += B) {
+			const int64_t n = std::min<int64_t>(B, b.lprime - p0);
+			std::memcpy(PooledMirrorRow(pool, kv, r, p0, D), run_src + static_cast<size_t>(p0) * D,
+			            static_cast<size_t>(n) * D);
+		}
+	}
+	for (uint32_t i = share_pages; i < needed; ++i) {
+		regions.push_back(superslm_gpu::PoolUploadRegion{superslm::kv_pages::HolderTableEntryForAddress(kv, i), 0u,
+		                                                 static_cast<uint64_t>(geo.page_bytes)});
+	}
+	// The pool upload of the pages written (phase A and phase B), on the process's device.
+	superslm_gpu::harness::Device& dev = superslm_gpu::harness::GetDevice();
+	try {
+		superslm_gpu::UploadPoolRegionsSync(dev, pool, regions);
+	} catch (...) {
+		const SslmGpuStatus fault = ClassifyHandleFault(&dev);
+		superslm::kv_pages::HolderRelease(kv);
+		return fault;
+	}
+	// The holder the blob was saved from (§3.7): its budget, origin and limit, its forward state verbatim,
+	// its schema binding and walk state (validated above), the ready flag; no adapter, no bind permission.
+	h->table_dirty = true;
+	h->budget = b.budget;
+	h->origin = b.origin;
+	h->limit = superslm_gpu::kv_pool::HolderLimit(b.origin, b.budget, model->context_cap);
+	std::memcpy(h->hidden_codes.data(), b.residual, h->hidden_codes.size());
+	h->hidden_scale = b.hidden_scale;
+	h->layer_index = b.layer_index;
+	h->kv_saturation_count = b.kv_saturation_count;
+	h->context_length = b.context_length;
+	h->live_state.hidden_scale = b.hidden_scale;
+	h->live_state.layer_index = b.layer_index;
+	h->live_state.kv_saturation_count = b.kv_saturation_count;
+	h->live_state.kv_landing_saturation_count = b.kv_landing_saturation_count;
+	h->live_state.k_channel_landing_saturation_count = b.k_channel_landing_saturation_count;
+	h->live_state.rope_q_saturation_count = b.rope_q_saturation_count;
+	h->live_state.rope_k_saturation_count = b.rope_k_saturation_count;
+	h->live_state.context_length = b.context_length;
+	h->bound_schema_index = b.bound_schema_index;
+	h->dfa_walk_state = b.dfa_walk_state;
+	h->ready_for_logits = b.ready_for_logits;
+	h->prefill_hidden_valid = false;
+	h->bind_eligible = false;
+	SetGpuSeqState(h.get(), superslm_gpu::SslmSequenceGpuState::Idle, nullptr);  // a fresh handle: Idle, no count
+	if (out_shared_pages) *out_shared_pages = share_pages;
+	*out_seq = PublishPooledSeq(std::move(h));
 	return SSLM_OK;
 }
 
@@ -5601,6 +6033,19 @@ SslmGpuStatus sslm_gpu_prefix_release(SslmGpuContext* ctx, SslmGpuPrefixHandle* 
 SslmGpuStatus sslm_gpu_seq_adopt_prefix(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq,
                                         SslmGpuPrefixHandle* prefix) noexcept {
 	return InvokeGpuApiBoundary(__func__, [&] { return sslm_gpu_seq_adopt_prefixImpl(ctx, seq, prefix); });
+}
+
+// Paged KV (1.13.0), step G5: restore into a pool, through the boundary, its out-handle and shared-page
+// count cleared first.
+SslmGpuStatus sslm_gpu_seq_restore_into_pool(SslmGpuContext* ctx, SslmGpuModelHandle* model, SslmGpuKvPoolHandle* pool,
+                                             const void* blob, size_t blob_size, SslmGpuPrefixHandle* prefix_or_null,
+                                             SslmGpuSequenceHandle** out_seq, uint32_t* out_shared_pages) noexcept {
+	ClearOutputHandle(out_seq);
+	if (out_shared_pages) *out_shared_pages = 0;
+	return InvokeGpuApiBoundary(__func__, [&] {
+		return sslm_gpu_seq_restore_into_poolImpl(ctx, model, pool, blob, blob_size, prefix_or_null, out_seq,
+		                                          out_shared_pages);
+	});
 }
 
 // G3 test seams the GPU red suite names (gpu_1p0_bench_bridge.h). Host-only reads and one flag;
