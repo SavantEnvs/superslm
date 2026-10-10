@@ -5112,7 +5112,8 @@ Microsoft::WRL::ComPtr<ID3D12Resource> AllocatePoolUploadStaging(
 // INVARIANT (as the zero-fill's): nothing between the list's Reset and CloseListOrThrow allocates or
 // throws. The latch is cleared only once the wait has returned; a throw leaves it as it was.
 void SubmitPoolUploadSync(superslm_gpu::harness::Device& dev, SslmGpuKvPoolHandle* pool,
-                          const std::vector<superslm_gpu::PoolUploadRegion>& regions, ID3D12Resource* staging) {
+                          const std::vector<superslm_gpu::PoolUploadRegion>& regions,
+                          const Microsoft::WRL::ComPtr<ID3D12Resource>& staging) {
 	// The ledger's reset (G3, plan §4.4): the eighth reset site (§4 item 8). BeginRecording() runs the
 	// stranded check, the boundary guard check and PoolSubmitAssert before it.
 	dev.BeginRecording();
@@ -5128,7 +5129,7 @@ void SubmitPoolUploadSync(superslm_gpu::harness::Device& dev, SslmGpuKvPoolHandl
 	const uint64_t page_bytes = pool->geo.page_bytes;
 	uint64_t at = 0;
 	for (const superslm_gpu::PoolUploadRegion& r : regions) {
-		dev.list->CopyBufferRegion(pool->pool_buf.Get(), uint64_t{r.page} * page_bytes + r.offset, staging, at, r.bytes);
+		dev.list->CopyBufferRegion(pool->pool_buf.Get(), uint64_t{r.page} * page_bytes + r.offset, staging.Get(), at, r.bytes);
 		at += r.bytes;
 	}
 	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -5136,8 +5137,11 @@ void SubmitPoolUploadSync(superslm_gpu::harness::Device& dev, SslmGpuKvPoolHandl
 	dev.list->ResourceBarrier(1, &barrier);
 	dev.CloseListOrThrow();
 	// ---- end of the recording window ----
-	// The ledger's submission and wait (G3), as the zero-fill's: Submit(no retry), then its Wait().
-	dev.Submit(/*retry=*/false).Wait();
+	// The ledger's submission and wait (G3), as the zero-fill's: Submit(no retry), then its Wait(); the
+	// staging buffer and the pool buffer are kept alive if it strands (review-g23 F1, as the other
+	// synchronous sites). Every pool upload -- the prefix tail copy, adopt's tail copy, and
+	// restore_into_pool through UploadPoolRegionsSync -- submits here.
+	dev.SubmitAndWaitKeepingAlive(/*retry=*/false, staging, pool->pool_buf);
 	pool->kv_needs_resume_barrier = false;
 }
 
@@ -5261,7 +5265,7 @@ void UploadPoolRegionsSync(harness::Device& dev, SslmGpuKvPoolHandle* pool, cons
 		             static_cast<size_t>(regions[i].offset);
 	}
 	const Microsoft::WRL::ComPtr<ID3D12Resource> staging = AllocatePoolUploadStaging(dev, regions, sources);
-	SubmitPoolUploadSync(dev, pool, regions, staging.Get());
+	SubmitPoolUploadSync(dev, pool, regions, staging);
 }
 }  // namespace superslm_gpu
 
@@ -5364,7 +5368,7 @@ SslmGpuStatus sslm_gpu_prefix_begin_fromImpl(SslmGpuContext* ctx, SslmGpuPrefixH
 		            superslm::kv_pages::PageBase(pool->pages, src_page), pool->geo.page_bytes);
 		regions[0].page = dst_page;
 		try {
-			SubmitPoolUploadSync(dev, pool, regions, staging.Get());
+			SubmitPoolUploadSync(dev, pool, regions, staging);
 		} catch (...) {
 			superslm::kv_pages::HolderRelease(h->holder);
 			return ClassifyHandleFault(&dev);
@@ -5549,7 +5553,7 @@ SslmGpuStatus sslm_gpu_seq_adopt_prefixImpl(SslmGpuContext* ctx, SslmGpuSequence
 		            superslm::kv_pages::PageBase(pool->pages, src_page), pool->geo.page_bytes);
 		regions[0].page = dst_page;
 		try {
-			SubmitPoolUploadSync(dev, pool, regions, staging.Get());
+			SubmitPoolUploadSync(dev, pool, regions, staging);
 		} catch (...) {
 			const SslmGpuStatus fault = ClassifyHandleFault(&dev);
 			(void)sslm_gpu_seq_resetImpl(ctx, seq);
