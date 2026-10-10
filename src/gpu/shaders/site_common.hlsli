@@ -716,6 +716,10 @@ bool ApplyBiasReconcileRowGpuP(uint t, RWByteAddressBuffer scratch, uint wide_ba
     }
     int64_t r_a = DynamicScaleReciprocalSharedGpu(in_scale_m);
 
+    // Every thread must finish reading the previous call's gBiasAnyOutOfDomain before thread 0 resets it:
+    // this function runs twice per dispatch, and without this barrier a thread still between the
+    // previous call's closing barrier and its read can observe the reset value instead.
+    GroupMemoryBarrierWithGroupSync();
     if (t == 0) gBiasAnyOutOfDomain = 0;
     GroupMemoryBarrierWithGroupSync();
     for (int i = (int)t; i < out_channels; i += 256)
@@ -781,6 +785,9 @@ bool PreflightRequantChainFullGpuP(uint t, RWByteAddressBuffer scratch, uint wid
             uint64_t a = (xi < 0) ? (~(uint64_t)xi + 1ULL) : (uint64_t)xi;
             if (a > local) local = a;
         }
+        // A previous reduction in this dispatch ends with every thread reading slot 0; thread 0 must
+        // not overwrite it until they all have.
+        GroupMemoryBarrierWithGroupSync();
         gFunnelMax[t] = local;
         GroupMemoryBarrierWithGroupSync();
         for (uint s = 128; s > 0; s >>= 1)
@@ -911,6 +918,9 @@ void RequantChainCheckedFullGpuP(uint t, RWByteAddressBuffer scratch, uint wide_
             uint64_t a = (xi < 0) ? (~(uint64_t)xi + 1ULL) : (uint64_t)xi;
             if (a > local) local = a;
         }
+        // A previous reduction in this dispatch ends with every thread reading slot 0; thread 0 must
+        // not overwrite it until they all have.
+        GroupMemoryBarrierWithGroupSync();
         gFunnelMax[t] = local;
         GroupMemoryBarrierWithGroupSync();
         for (uint s = 128; s > 0; s >>= 1)
@@ -1063,6 +1073,9 @@ void RequantChainCheckedFullGpuP1024(uint t, RWByteAddressBuffer scratch, uint w
             uint64_t a = (xi < 0) ? (~(uint64_t)xi + 1ULL) : (uint64_t)xi;
             if (a > local) local = a;
         }
+        // A previous reduction in this dispatch ends with every thread reading slot 0; thread 0 must
+        // not overwrite it until they all have.
+        GroupMemoryBarrierWithGroupSync();
         gFunnelMax1024[t] = local;
         GroupMemoryBarrierWithGroupSync();
         for (uint s = 512; s > 0; s >>= 1)

@@ -484,7 +484,7 @@ private:
 			// Only when SSLM_GPU_ADAPTER_INDEX was set -- see the Init() header comment (S2).
 			DXGI_ADAPTER_DESC1 d;
 			adapter->GetDesc1(&d);
-			std::fwprintf(stderr, L"# adapter: %s\n", d.Description);
+			std::fwprintf(stderr, L"# adapter: %ls\n", d.Description);
 			std::fflush(stderr);
 		}
 		D3D12_COMMAND_QUEUE_DESC qd{};
