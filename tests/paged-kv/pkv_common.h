@@ -77,6 +77,10 @@ struct RunState {
 	int checks = 0;
 	int failures = 0;
 	int cell_failures = 0;
+	// A vitality member runs a cell's checks against a deliberate mutant with `muted` set: each failing check is
+	// counted in muted_failures and printed as MUTED, not FAIL, and the member grades the count itself.
+	int muted = 0;
+	int muted_failures = 0;
 };
 
 inline RunState& State() {
@@ -86,14 +90,18 @@ inline RunState& State() {
 
 inline void Fail(const char* file, int line, const char* fmt, ...) {
 	RunState& s = State();
-	++s.failures;
-	++s.cell_failures;
-	std::fprintf(stderr, "FAIL [%s] %s:%d: ", s.cell, file, line);
+	if (s.muted) ++s.muted_failures;
+	else {
+		++s.failures;
+		++s.cell_failures;
+	}
+	std::FILE* to = s.muted ? stdout : stderr;
+	std::fprintf(to, "%s [%s] %s:%d: ", s.muted ? "MUTED" : "FAIL", s.cell, file, line);
 	va_list ap;
 	va_start(ap, fmt);
-	std::vfprintf(stderr, fmt, ap);
+	std::vfprintf(to, fmt, ap);
 	va_end(ap);
-	std::fputc('\n', stderr);
+	std::fputc('\n', to);
 }
 
 #define PKV_CHECK(cond)                                                    \

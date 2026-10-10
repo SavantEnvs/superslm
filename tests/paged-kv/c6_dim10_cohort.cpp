@@ -1,26 +1,35 @@
-// Paged-KV plan (rev 16.1) step C1: dimension 10's CPU achievement cells, owned by C6 (§7, §8).
+// Paged-KV plan (rev 16.1) step C1: dimension 10's CPU achievement cells, owned by C6 (§7, §8). The figures are per
+// page size from rev 16.25 (§27, D-SLM8450): kCohortFigures below, one engine-executed row per B.
 //
 //   10.1  the cohort on the 0.5B artifact at cap 4096: world 1,000 -> 10 personas (begin_from) -> 50
 //         budget-512 sequences; each emits the §3.4 count, with tokens equal to the same prompts run
 //         with no sharing on v1.11.0
 //   10.2  the 1.5B artifact at cap 32768: one 8-sequence cohort on a nested prefix, tokens equal v1.11.0
-//   10.4  the memory achievement: 1,842 pages admit the cohort, 1,841 refuse exactly the 50th create;
-//         a v1.11.0 block pool in the same bytes admits 7
-//   10.6  the cohort survives a save and load: 1,842 admits the 50 shared restores, 1,841 refuses the
-//         50th, both passes (1,456 and the limit); tokens continue equal to the unsaved run's
-//   10.8  the no-handle recovery: 5,592 admits the 50 private restores, 5,591 refuses the 50th; after
-//         each re-adopts, exactly 113 further budget-512 creates are admitted
+//   10.4  the memory achievement: the row's pool (505 at B = 64, 287 at B = 128) admits the cohort, one page fewer
+//         refuses exactly the 50th create; the construction peak (66, 38) admits all ten personas open, one fewer
+//         refuses the tenth; a v1.11.0 block pool in the same bytes admits the row's contrast count (7, 8)
+//   10.4/C6:table-mutant  bench-only vitality: the lookup forced to B = 16's row (1,842, 203, 7) at the running B;
+//         10.4's bounds must fail, so a table not keyed by B is separated
+//   10.6  the cohort survives a save and load: the row's pool admits the 50 shared restores, one page fewer refuses
+//         the 50th, both passes (1,456 and the limit); tokens continue equal to the unsaved run's
+//   10.8  the no-handle recovery: the row's private pool (1,405, 737) admits the 50 private restores, one fewer
+//         refuses the 50th; after each re-adopts, exactly the row's further budget-512 creates (100, 90) are admitted
 //
 // Each cell is registered twice. "<id>/C6" is the box cell: it reads the real artifact from
 // SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR (a missing variable or file is a failed check) and its reference
-// from v1.11.0_<artifact stem>.ref (the box's R0 run). "<id>/C6:pkv_def" (and ":pkv_32k" for 10.2)
-// runs the same construction on the cloud fixture, which has 0.5B's page arithmetic at cap 4096
-// (B = 16, 256 pages per cap), so every page count below is the same number.
+// from v1.11.0_<artifact stem>.ref (the box's R0 run); unpinned, the 0.5B runs at the rule's B = 64.
+// "<id>/C6:pkv_def" (and ":pkv_32k" for 10.2) runs the same construction on the cloud fixture at the rule's B as
+// well (D-SLM8447): pkv_def (D = 48, cap 4,096) runs at B = 128, not at 16 and not at the 0.5B's 64, so it takes the
+// B = 128 row. The function looks its row up by the B the engine reports, asserted first to equal the rule's B written
+// in the test; a B with no row fails, naming it. The test's §3.4 / §3.7 arithmetic (CohortPages, PrivateCohortPages,
+// the peak, the further count) is kept as a cross-check asserted equal to the row: the row is executed on the engine
+// (§27.2), independent of that arithmetic, so a formula mutant fails against the table and a table mutant against
+// the engine's admission.
 //
 // The no-sharing reference is the scenario "cohort" (records persona<i>_1456 and persona<i>_1712): each
 // persona's whole 1,200-token prompt prefilled into its own v1.11.0 block and 513 tokens decoded. The
-// flat path through the new code is never the reference (§8). Page counts are computed here from §3.4 /
-// §3.7 and graded by admission; *out_shared_pages and the stats verbs are never read for a verdict.
+// flat path through the new code is never the reference (§8). Page counts are graded by admission;
+// *out_shared_pages and the stats verbs are never read for a verdict.
 
 #include "pkv_budget_c_helpers.h"
 
@@ -90,6 +99,50 @@ int64_t CohortPages(const Fixture& fx) { return ChainPages(fx, kPersonas) + kSeq
 int64_t PrivateCohortPages(const Fixture& fx) {
 	return ChainPages(fx, kPersonas) + kSeqs * (fx.R(kBudget) + MaterializedPages(fx, kOrigin, kBudget));
 }
+
+// ---- the figures per B (plan rev 16.25 §27.2, D-SLM8450) ----------------------------------------
+
+// Each figure is the smallest page pool at which the engine admits the stated verdict, bisected on 2ebe5e3's engine
+// with the boundary's two neighbours run (§27.2, Claude/Plans/superslm-paged-kv/probes/cohort_engine_boundary.cpp),
+// independent of the arithmetic above. Cap 4,096, 50 budget-512 sequences, 10 personas of 200 over a 1,000 world.
+struct CohortFigures {
+	int64_t B;
+	int64_t pool;           // 10.4 and 10.6: admits the cohort; one page fewer refuses exactly the 50th
+	int64_t peak;           // 10.4: construction peak, all ten personas open
+	int64_t contrast;       // 10.4: a block pool in the same bytes admits this many
+	int64_t private_pool;   // 10.8: admits the 50 restores without handles
+	int64_t further;        // 10.8: further budget-512 creates after each re-adopts
+};
+const CohortFigures kCohortFigures[] = {
+    {64, 505, 66, 7, 1405, 100},   // the box (0.5B, D = 64)
+    {128, 287, 38, 8, 737, 90},    // the cloud twin (pkv_def, D = 48)
+};
+// B = 16's row, the method's control in §27.2. No C6 cell runs at 16; only the table mutant reads it.
+const CohortFigures kCohortFiguresB16 = {16, 1842, 203, 7, 5592, 113};
+bool g_table_mutant = false;  // 10.4/C6:table-mutant: the lookup ignores B and returns B = 16's row
+
+// The row for the B the engine reports. Asserted first: that B equals the rule's B written in the test, and the table
+// has a row for it; otherwise a failed check names B and the caller returns without running the cohort.
+const CohortFigures* FiguresFor(const Fixture& fx, const char* cell) {
+	const int64_t B = sslm_kv_page_positions(fx.model);
+	const int64_t rule = PageRuleB(fx.geo.head_dim, static_cast<uint64_t>(fx.geo.context_cap), 1);
+	PKV_CHECK_MSG(B == rule, "%s %s: the engine reports B = %lld; the rule's B is %lld", cell, fx.stem.c_str(),
+	              static_cast<long long>(B), static_cast<long long>(rule));
+	if (B != rule) return nullptr;
+	if (g_table_mutant) return &kCohortFiguresB16;
+	for (const CohortFigures& f : kCohortFigures)
+		if (f.B == B) return &f;
+	PKV_CHECK_MSG(false, "%s %s: no cohort figures row for B = %lld (rows: 64, 128)", cell, fx.stem.c_str(),
+	              static_cast<long long>(B));
+	return nullptr;
+}
+
+// What the table mutant must break: 10.4's two lower bounds (one page below the pool, one below the peak).
+struct BoundsSeen {
+	int pool_short_failed = 0;
+	int peak_short_failed = 0;
+};
+BoundsSeen g_bounds;
 
 // ---- the reference --------------------------------------------------------------------------------
 
@@ -677,8 +730,11 @@ int BuildWorldAllOpen(const Fixture& fx, sslm_kv_pool* pool, World* w, sslm_stat
 }
 
 void Peak104(const Fixture& fx) {
-	const int64_t peak = PrefixPages(fx, 1000) + kPersonas * fx.R(200);
-	PKV_CHECK_EQ(peak, 203);  // the plan's executed construction peak, from §3.4 written here
+	const CohortFigures* f = FiguresFor(fx, "10.4 peak");
+	if (!f) return;
+	const int64_t peak = f->peak;
+	// the cross-check: §3.4's peak, written here, equals the engine-executed row
+	PKV_CHECK_EQ(PrefixPages(fx, 1000) + kPersonas * fx.R(200), peak);
 	{
 		PagePool pool(fx.model, static_cast<uint32_t>(peak));
 		PKV_CHECK_EQ(pool.status, SSLM_OK);
@@ -689,10 +745,24 @@ void Peak104(const Fixture& fx) {
 		// kills: a begin_from that draws more than R(200) or copies the world's pages (refused at 203)
 		PKV_CHECK_MSG(refused == -1 && w.ok, "10.4 peak %s: a pool of %lld refused begin_from %d (status %d)",
 		              fx.stem.c_str(), static_cast<long long>(peak), refused, static_cast<int>(refusal));
-		// The end of construction, graded by one-state admission: the chain holds 62 + 10 * 13 = 192.
+		// The end of construction, graded by one-state admission: the chain holds ChainPages (62 + 10 * 13 = 192 at
+		// B = 16, 15 + 10 * 4 = 55 at 64, 7 + 10 * 3 = 37 at 128), so the peak's pool has k = peak - ChainPages free.
 		// kills: freeze not returning a persona's spare reserve page; the world's release keeping its
 		// unshared tail page, or freeing a page the personas share (more free)
-		if (w.ok) ProbeExactlyFreeOneState(fx, &pool.pool, peak - ChainPages(fx, kPersonas));
+		// The fill probe resolves k >= 2 (its smallest create is 2 pages). At B = 128, k = 38 - 37 = 1: then a 2-page
+		// create must be refused (at most 1 free), and with the last persona released (its own pages, PrefixPages(1,200)
+		// - SharedPages(1,000), go back: the others still hold the shared ones) the probe grades k + own exactly.
+		const int64_t k = peak - ChainPages(fx, kPersonas);
+		if (w.ok && k >= 2) ProbeExactlyFreeOneState(fx, &pool.pool, k);
+		if (w.ok && k < 2) {
+			sslm_seq two = nullptr;
+			PKV_CHECK_EQ(sslm_seq_create_budgeted(fx.model, &pool.pool, 1, &two), SSLM_KV_POOL_EXHAUSTED);
+			if (two) sslm_seq_release(two);
+			const int64_t own = PrefixPages(fx, kOrigin) - SharedPages(fx, 1000);
+			sslm_prefix_release(w.personas.back());
+			w.personas.back() = nullptr;
+			ProbeExactlyFreeOneState(fx, &pool.pool, k + own);
+		}
 		w.Release();
 	}
 	{
@@ -702,7 +772,8 @@ void Peak104(const Fixture& fx) {
 		World w;
 		sslm_status refusal = SSLM_OK;
 		const int refused = BuildWorldAllOpen(fx, &pool.pool, &w, &refusal);
-		// kills: a begin_from that draws less than R(200) (the tenth admitted at 202)
+		// kills: a begin_from that draws less than R(200) (the tenth admitted one page below the peak)
+		g_bounds.peak_short_failed += !(refused == kPersonas - 1 && refusal == SSLM_KV_POOL_EXHAUSTED);
 		PKV_CHECK_MSG(refused == kPersonas - 1 && refusal == SSLM_KV_POOL_EXHAUSTED,
 		              "10.4 peak %s: a pool of %lld refused begin_from %d (status %d), want the last, exhausted",
 		              fx.stem.c_str(), static_cast<long long>(peak - 1), refused, static_cast<int>(refusal));
@@ -717,8 +788,10 @@ void Peak104(const Fixture& fx) {
 // ================================================================================================
 void Cell104On(const Fixture& fx) {
 	if (!fx.ok) return;
-	const int64_t N = CohortPages(fx);
-	PKV_CHECK_EQ(N, 1842);  // §5's figure, from §3.4 written here
+	const CohortFigures* f = FiguresFor(fx, "10.4");
+	if (!f) return;
+	const int64_t N = f->pool;
+	PKV_CHECK_EQ(CohortPages(fx), N);  // the cross-check: §3.4 written here equals the engine-executed row
 	{
 		const CohortRun r = RunCohort(fx, static_cast<uint32_t>(N), false, false);
 		// kills: any draw beyond §3.4's (an adopt that draws, a begin_from that copies the world)
@@ -727,7 +800,9 @@ void Cell104On(const Fixture& fx) {
 	}
 	{
 		const CohortRun r = RunCohort(fx, static_cast<uint32_t>(N - 1), false, false);
-		// kills: a reservation one page short anywhere in the cohort (admitted at 1,841)
+		// kills: a reservation one page short anywhere in the cohort (admitted one page below the pool)
+		g_bounds.pool_short_failed +=
+		    !(r.built && r.first_refused == kSeqs - 1 && r.creates_refused == 1 && r.refusal == SSLM_KV_POOL_EXHAUSTED);
 		PKV_CHECK_MSG(r.built && r.first_refused == kSeqs - 1 && r.creates_refused == 1 && r.refusal == SSLM_KV_POOL_EXHAUSTED,
 		              "10.4 %s: a pool of %lld refused %d creates, the first at index %d (status %d)", fx.stem.c_str(),
 		              static_cast<long long>(N - 1), r.creates_refused, r.first_refused, static_cast<int>(r.refusal));
@@ -737,7 +812,7 @@ void Cell104On(const Fixture& fx) {
 	const size_t bytes = static_cast<size_t>(N) * fx.PageBytes();
 	const size_t block = static_cast<size_t>(fx.CapPages()) * fx.PageBytes();
 	const uint32_t blocks = static_cast<uint32_t>(bytes / block);
-	PKV_CHECK_EQ(blocks, 7);
+	PKV_CHECK_EQ(blocks, f->contrast);
 	PKV_CHECK_EQ(block, sslm_kv_block_size(fx.model));
 	AlignedBuf mem(bytes + sslm_kv_pool_overhead_size(fx.model, blocks + 1));
 	sslm_kv_pool lp = nullptr;
@@ -804,12 +879,15 @@ RestoreRun RestoreCohort(const Fixture& fx, uint32_t pages, const std::vector<st
 
 void Cell106On(const Fixture& fx) {
 	if (!fx.ok) return;
+	const CohortFigures* f = FiguresFor(fx, "10.6");  // first, so a wrong B is the red reason, not the run
+	if (!f) return;
 	const CohortRun& run = Cohort(fx);
 	if (run.mid.size() != kSeqs || run.lim.size() != kSeqs) {
 		PKV_CHECK_MSG(false, "10.6 %s: the cohort run did not save 50 sequences", fx.stem.c_str());
 		return;
 	}
-	const int64_t N = CohortPages(fx);
+	const int64_t N = f->pool;
+	PKV_CHECK_EQ(CohortPages(fx), N);  // the cross-check
 	for (int pass = 0; pass < 2; ++pass) {
 		const char* name = pass == 0 ? "1,456" : "the limit";
 		const std::vector<std::vector<uint8_t>>& blobs = pass == 0 ? run.mid : run.lim;
@@ -851,16 +929,18 @@ void Cell106On(const Fixture& fx) {
 
 void Cell108On(const Fixture& fx) {
 	if (!fx.ok) return;
+	const CohortFigures* f = FiguresFor(fx, "10.8");  // first, so a wrong B is the red reason, not the run
+	if (!f) return;
 	const CohortRun& run = Cohort(fx);
 	if (run.mid.size() != kSeqs || run.lim.size() != kSeqs) {
 		PKV_CHECK_MSG(false, "10.8 %s: the cohort run did not save 50 sequences", fx.stem.c_str());
 		return;
 	}
-	const int64_t N = PrivateCohortPages(fx);
-	PKV_CHECK_EQ(N, 5592);
-	const int64_t free_after = N - CohortPages(fx);
-	const int64_t further = free_after / fx.R(kBudget);
-	PKV_CHECK_EQ(further, 113);
+	const int64_t N = f->private_pool;
+	const int64_t further = f->further;
+	// the cross-checks: §3.4 / §3.7 written here equal the engine-executed row
+	PKV_CHECK_EQ(PrivateCohortPages(fx), N);
+	PKV_CHECK_EQ((PrivateCohortPages(fx) - CohortPages(fx)) / fx.R(kBudget), further);
 	for (int pass = 0; pass < 2; ++pass) {
 		const char* name = pass == 0 ? "1,456" : "the limit";
 		const std::vector<std::vector<uint8_t>>& blobs = pass == 0 ? run.mid : run.lim;
@@ -912,12 +992,35 @@ void Cell106Fixture() { Cell106On(GetFixture("pkv_def")); }
 void Cell108Box() { Cell108On(GetArtifact(k05B, kGeo05B)); }
 void Cell108Fixture() { Cell108On(GetFixture("pkv_def")); }
 
+// 10.4/C6:table-mutant (rev 16.25 §27.5 item 5), bench-only: 10.4 on the cloud twin with the lookup forced to
+// B = 16's row at the running B. Its checks run muted; the member owes that both of 10.4's lower bounds fail (one page
+// below the pool admits the 50th create, one page below the peak admits the tenth persona), which is what separates a
+// table not keyed by B. Green on a correct build and on 2ebe5e3 alike: the mutant is the test's own.
+void Cell104TableMutant() {
+	const Fixture& fx = GetFixture("pkv_def");
+	if (!fx.ok) return;
+	g_bounds = BoundsSeen{};
+	State().muted = 1;
+	State().muted_failures = 0;
+	g_table_mutant = true;
+	Cell104On(fx);
+	g_table_mutant = false;
+	State().muted = 0;
+	const int muted = State().muted_failures;
+	std::printf("10.4/C6:table-mutant: B = %lld, %d muted failures; pool bound failed %d, peak bound failed %d\n",
+	            static_cast<long long>(sslm_kv_page_positions(fx.model)), muted, g_bounds.pool_short_failed,
+	            g_bounds.peak_short_failed);
+	PKV_CHECK_MSG(g_bounds.pool_short_failed > 0, "the table mutant passes 10.4's pool bound (B = 16's 1,841 refused the 50th)");
+	PKV_CHECK_MSG(g_bounds.peak_short_failed > 0, "the table mutant passes 10.4's peak bound (B = 16's 202 refused the tenth)");
+}
+
 PKV_CELL("10.1/C6", "C6", Cell101Box);
 PKV_CELL("10.1/C6:pkv_def", "C6", Cell101Fixture);
 PKV_CELL("10.2/C6", "C6", Cell102Box);
 PKV_CELL("10.2/C6:pkv_32k", "C6", Cell102Fixture);
 PKV_CELL("10.4/C6", "C6", Cell104Box);
 PKV_CELL("10.4/C6:pkv_def", "C6", Cell104Fixture);
+PKV_CELL("10.4/C6:table-mutant", "C6", Cell104TableMutant);
 PKV_CELL("10.6/C6", "C6", Cell106Box);
 PKV_CELL("10.6/C6:pkv_def", "C6", Cell106Fixture);
 PKV_CELL("10.8/C6", "C6", Cell108Box);
