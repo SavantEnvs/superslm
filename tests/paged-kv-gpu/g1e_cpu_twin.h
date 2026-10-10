@@ -102,6 +102,16 @@ inline std::vector<int32_t> DecodeN(sslm_model m, sslm_seq s, int64_t n) {
 	}
 	return out;
 }
+// StepOutcomes' CPU form (g1e_helpers.h): exactly `n` steps, the token, -2, or -1000 - status each.
+inline std::vector<int32_t> StepOutcomes(sslm_model m, sslm_seq s, int64_t n) {
+	std::vector<int32_t> out;
+	for (int64_t i = 0; i < n; ++i) {
+		sslm_status st = SSLM_OK;
+		const int32_t t = Token(m, s, &st);
+		out.push_back(st == SSLM_OK ? t : -1000 - static_cast<int32_t>(st));
+	}
+	return out;
+}
 inline sslm_status PrefillAll(sslm_model m, sslm_seq s, const std::vector<int32_t>& t, sslm_span_kind kind = SSLM_SPAN_PROMPT) {
 	size_t at = 0;
 	sslm_status st = SSLM_OK;

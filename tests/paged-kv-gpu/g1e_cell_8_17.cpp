@@ -26,6 +26,16 @@
 //       re-saved SLM6 are byte-equal (the adapter does not round-trip, so their state is one state).
 //       The construction is checked not to be vacuous: the adapter changes the tokens.
 //
+//   CONSTRUCTION (G5 cells fix, the 8.16 precedent in g1a_g4_prefix.cpp): pkv_def's S8 schema accepts
+//   one document spelled by one token, and (b)'s world takes exactly that token, so the walk the persona
+//   carries is at the accepting state with no outgoing transition: every side's decode is the defined
+//   dead end (-2 at SSLM_OK, retry-stable). DecodeN stops at the first -2, so the three sides gave [-2]
+//   and the size check (3 / 4 tokens) could not hold. (b) therefore grades one outcome per step
+//   (StepOutcomes: the token, -2, or -1000 - status), 3 before the save and 4 after, byte-equal across
+//   the GPU original, the GPU twin and the CPU twin, with no refused step. A restore that took the walk
+//   from the handle or dropped it would restart the walk and emit the admitted token; one that dropped
+//   the binding would decode unmasked and emit real tokens: either differs from the CPU twin's -2s.
+//
 // Mutants killed: (a) a restore that refuses a mid-token blob's share or draws E when sharing; (b) a
 // shared restore taking the walk state or binding from the handle; (c) an adapter applied to rows the
 // restored holder shares (they are base-only), or a share under the adapter.
@@ -148,7 +158,7 @@ void PartB(const Env& e, cpu::Model& cm) {
 		if (!s.h) return;
 		CHECK(SslmGpuSeqSetSchemaForG5Bridge(e.ctx, s.h, gidx) == GS::SSLM_OK);
 		CHECK(Adopt(rig, s, c.persona, origin) == GS::SSLM_OK);
-		gpu_pre = DecodeN(e, s, 3);
+		gpu_pre = StepOutcomes(e, s, 3);
 		const std::vector<uint8_t> blob = Save(e, s.h);
 		Slm6SelfCheck(blob, g, kBudget, origin, ContextLength(s.h), "8.17 (b)");
 		Restored r = RestoreIntoPool(rig, blob, c.persona, s);
@@ -164,9 +174,9 @@ void PartB(const Env& e, cpu::Model& cm) {
 		CHECK_MSG(ta == oa, "8.17 (b): accepting flag: original %d, restored %d", oa, ta);
 		const uint32_t ow = SslmGpuSeqWalkStateForG5Bridge(s.h), tw = SslmGpuSeqWalkStateForG5Bridge(r.seq.h);
 		CHECK_MSG(tw == ow, "8.17 (b): walk state: original %u, restored %u", ow, tw);
-		gpu_orig = DecodeN(e, s, 4);
+		gpu_orig = StepOutcomes(e, s, 4);
 		GSeq t = r.seq;
-		gpu_twin = DecodeN(e, t, 4);
+		gpu_twin = StepOutcomes(e, t, 4);
 	}
 	{
 		cpu::Pool pool(cm.model, P);
@@ -178,14 +188,20 @@ void PartB(const Env& e, cpu::Model& cm) {
 		pool.Seq(s);
 		CHECK(sslm_seq_set_schema(s, schema) == SSLM_OK);
 		CHECK(sslm_seq_adopt_prefix(s, c.persona) == SSLM_OK);
-		cpu_pre = cpu::DecodeN(cm.model, s, 3);
+		cpu_pre = cpu::StepOutcomes(cm.model, s, 3);
 		const std::vector<uint8_t> blob = cpu::Save(s);
 		sslm_seq r = nullptr;
 		CHECK(sslm_seq_restore_shared(cm.model, &pool.pool, blob.data(), blob.size(), c.persona, &r, nullptr) == SSLM_OK);
 		if (!pool.Seq(r)) return;
-		cpu_twin = cpu::DecodeN(cm.model, r, 4);
+		cpu_twin = cpu::StepOutcomes(cm.model, r, 4);
 	}
-	CHECK_MSG(gpu_pre == cpu_pre, "8.17 (b): construction: the 3 tokens before the save differ between GPU and CPU");
+	CHECK_MSG(gpu_pre == cpu_pre && gpu_pre.size() == 3, "8.17 (b): construction: the 3 outcomes before the save [%s] differ from the CPU's [%s]",
+	          Ids(gpu_pre).c_str(), Ids(cpu_pre).c_str());
+	// No step may be a refusal (-1000 - status): the outcomes are tokens or the schema dead end.
+	bool refused = false;
+	for (const auto* v : {&gpu_pre, &gpu_orig, &gpu_twin, &cpu_twin})
+		for (int32_t t : *v) refused = refused || t <= -1000;
+	CHECK_MSG(!refused, "8.17 (b): a decode step was refused (outcome <= -1000)");
 	Compare3(gpu_orig, gpu_twin, cpu_twin, 4, "8.17 (b) schema-bound prefix");
 }
 

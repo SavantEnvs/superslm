@@ -121,10 +121,17 @@ void Cell26G5() {
 // after the call in the same scene; the case's other prefix, when it has one, after the call, against
 // the same read in a twin scene that never made the call (an unfrozen prefix is frozen first, in both
 // scenes, since only a frozen prefix can be adopted).
+//
+// CONSTRUCTION (G5 cells fix): an adopter must carry the prefix's schema binding (§3.9 A18), so when the
+// prefix is schema-bound -- "adopt with a schema mismatch"'s other prefix is bound to schema 0 and has
+// schema-content progress -- the adopter binds schema 0 before adopting. An unbound adopter of it is
+// correctly refused PREFIX_SCHEMA_MISMATCH, which made the read itself fail rather than the graded call.
+// The binding is the same in the case scene and the twin scene, so the comparison is unchanged.
 std::vector<uint8_t> AdopterSave(Scene& sc, SslmGpuContext* ctx, SslmGpuModelHandle* model, SslmGpuKvPoolHandle* pool,
-                                 SslmGpuPrefixHandle* p, const char* what) {
+                                 SslmGpuPrefixHandle* p, const char* what, int32_t schema = -1) {
 	SslmGpuSequenceHandle* a = NewBudgetSeq(sc, ctx, model, pool, 16);
 	if (!a) return {};
+	if (schema >= 0) G1B_CHECK_STATUS(SslmGpuSeqSetSchemaForG5Bridge(ctx, a, schema), S::SSLM_OK, "2.7/G5: adopter schema bind for %s", what);
 	G1B_CHECK_STATUS(sslm_gpu_seq_adopt_prefix(ctx, a, p), S::SSLM_OK, "2.7/G5: adopter of %s", what);
 	S st = S::SSLM_OK;
 	std::vector<uint8_t> b = SaveBlob(ctx, a, &st);
@@ -132,10 +139,12 @@ std::vector<uint8_t> AdopterSave(Scene& sc, SslmGpuContext* ctx, SslmGpuModelHan
 	sc.Release(a);
 	return b;
 }
-std::vector<uint8_t> OtherPrefixSave(Scene& sc, hostile::HostileScene& h, const char* name) {
+std::vector<uint8_t> OtherPrefixSave(Scene& sc, hostile::HostileScene& h, const hostile::HostileCase& c) {
 	if (!h.other) return {};
 	sslm_gpu_prefix_freeze(h.other_ctx, h.other);  // idempotent on a frozen prefix (G33)
-	return AdopterSave(sc, h.other_ctx, h.other_model, h.other_pool, h.other, name);
+	// SchemaProgressPrefix binds schema 0 (g1b_hostile_prefix.h); every other case's prefix is unbound.
+	const int32_t schema = c.kind == hostile::HostileCase::kAdoptSchemaMismatch ? 0 : -1;
+	return AdopterSave(sc, h.other_ctx, h.other_model, h.other_pool, h.other, c.name, schema);
 }
 
 void Cell27G5() {
@@ -146,7 +155,7 @@ void Cell27G5() {
 		{
 			Scene twin;
 			hostile::HostileScene h = hostile::BuildHostile(twin, e, c);
-			if (h.ok) other_twin = OtherPrefixSave(twin, h, c.name);
+			if (h.ok) other_twin = OtherPrefixSave(twin, h, c);
 		}
 		Scene sc;
 		hostile::HostileScene h = hostile::BuildHostile(sc, e, c);
@@ -165,7 +174,7 @@ void Cell27G5() {
 		const std::vector<uint8_t> x_after = AdopterSave(sc, e.ctx1, e.m1, h.pool_a, h.x, "X after");
 		G1B_CHECK_MSG(!x_before.empty() && x_after == x_before, "2.7/G5 %s: X's re-save (through an adopter) differs", c.name);
 		if (h.other) {
-			const std::vector<uint8_t> other_after = OtherPrefixSave(sc, h, c.name);
+			const std::vector<uint8_t> other_after = OtherPrefixSave(sc, h, c);
 			G1B_CHECK_MSG(!other_twin.empty() && other_after == other_twin,
 			              "2.7/G5 %s: the case's prefix re-save (through an adopter) differs from the twin that never saw the call", c.name);
 		}
