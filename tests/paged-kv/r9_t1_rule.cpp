@@ -11,6 +11,10 @@
 //   4.11/T1               CFG1 kv_block_size in {1, 16, 32, 4,096, 0xFFFFFFFF} gives the rule's B; 0 refused
 //   4.12/T1:refusals      the pin's refusals and hostile pins, the model left unchanged
 //   4.12/T1:pins          a pin that takes: 16, 1 (the hand-built B = 1 geometry), the cap
+//   4.10/T2:grid, :boundary, :extremes, :seam-tie, 4.11/T2
+//                         the same sweeps' rows at caps the rule's B does not divide (grid and 4.11 at 4,095,
+//                         4,097, 4,100, 32,767; boundary at 65 and 127; extremes at 4,097; the seam tie's pkv_odd):
+//                         T2's partial last page, re-bracketed from T1 after the builder's T1 stop (T-3198 §5.1)
 //
 // Each named mutant's separation is executed at the cell's own construction: the mutant's value
 // (r9::RuleB with the mutant) is required to differ from the asserted value at the row the plan
@@ -55,6 +59,17 @@ void Separates(RuleMutant m, uint64_t D, uint64_t cap, uint64_t elem, int64_t ex
 	              RuleMutantName(m), static_cast<long long>(got), row);
 }
 
+// The step a row belongs to (T-3198 §5.1, re-bracketed 2026-10-09). A cap the rule's B does not divide needs T2's
+// partial last page (ceil(cap/B) pages, the slack in the overhead, D-SLM8427); until T2 the engine keeps the
+// one-page fallback (§23.8). So each cell below that sweeps caps runs twice: its T1 registration takes the dividing
+// rows, its T2 registration the non-dividing ones, which stay red until T2.
+enum class Rows { kDividing, kNonDividing };
+bool Takes(Rows rows, uint64_t D, uint64_t cap, uint64_t elem) {
+	const int64_t B = RuleB(D, cap, elem);
+	const bool dividing = B > 0 && cap % static_cast<uint64_t>(B) == 0;
+	return dividing == (rows == Rows::kDividing);
+}
+
 struct DBase {
 	uint32_t D;
 	const Fixture& (*get)();
@@ -67,12 +82,16 @@ const Fixture& GetD64() { return D64Cap(4096); }
 const DBase kBases[] = {{2, D2Cap8}, {48, GetDef}, {64, GetD64}, {128, GetQk}, {512, D512}, {1024, D1024}};
 const int64_t kGridCaps[] = {8, 4095, 4096, 4097, 4100, 8192, 32767, 32768, 40960};
 
-// 4.10 [T1]. The grid: every value equals the test's own evaluation of §3.1's rule.
-void Cell410Grid() {
+// 4.10 [T1 dividing caps, T2 non-dividing]. The grid: every value equals the test's own evaluation of §3.1's rule.
+// The T2 rows (caps 4,095, 4,097, 4,100 and 32,767 at every D) overlap 4.10/T2:non-dividing at five (D, cap) pairs;
+// both stay: the grid asserts B across the whole sweep, non-dividing asserts B, the page count and the overhead's slack
+// at its named rows.
+void Cell410GridRows(Rows rows) {
 	for (const DBase& b : kBases) {
 		const Fixture& base = b.get();
 		if (!base.ok) continue;
 		for (int64_t cap : kGridCaps) {
+			if (!Takes(rows, b.D, static_cast<uint64_t>(cap), 1)) continue;
 			At a(base, cap);
 			PKV_CHECK_MSG(a.fx.ok, "D = %u at cap %lld: the variant did not map (%s)", b.D, static_cast<long long>(cap),
 			              AbiStatusName(a.map));
@@ -85,10 +104,13 @@ void Cell410Grid() {
 			              static_cast<long long>(cap), static_cast<long long>(got), static_cast<long long>(want));
 		}
 	}
+	if (rows == Rows::kNonDividing) return;
 	// The grid's own reach: 2ebe5e3's rule (kv_block_size 16, else the cap) differs at D = 64, cap 4,096.
 	Separates(RuleMutant::kShipped, 64, 4096, 1, 64, "D = 64, cap 4,096");
 	Separates(RuleMutant::kReadsCfg1, 48, 4096, 1, 128, "D = 48, cap 4,096");
 }
+void Cell410Grid() { Cell410GridRows(Rows::kDividing); }
+void Cell410GridT2() { Cell410GridRows(Rows::kNonDividing); }
 
 // 4.10 [T1]. Below one page: D = 2, cap 8 -> B = 8, one page per holder (D-SLM8412). The fixture's
 // CFG1 kv_block_size is patched to 4, a divisor of 8, so 2ebe5e3's rule (which reads it) gives
@@ -181,12 +203,14 @@ void Cell410BelowPage() {
 	}
 }
 
-// 4.10 [T1]. The page condition's boundary (T-3178 G-4, R-1, D-SLM8412): D = 64, Int8, unpinned.
-// Each fixture keeps the converter's kv_block_size 16, so 2ebe5e3 gives 63, 16, 65 and 127.
-void Cell410Boundary() {
+// 4.10 [T1 caps 63 and 64, T2 caps 65 and 127]. The page condition's boundary (T-3178 G-4, R-1, D-SLM8412): D = 64,
+// Int8, unpinned. Each fixture keeps the converter's kv_block_size 16, so 2ebe5e3 gives 63, 16, 65 and 127. Caps 65
+// and 127 are two pages with slack (T2's partial last page), so they and their two separations are T2's.
+void Cell410BoundaryRows(Rows sel) {
 	struct Row { int cap; int64_t B, pages, slack, budget1_pages; };
 	const Row rows[] = {{63, 63, 1, 0, 1}, {64, 64, 1, 0, 1}, {65, 64, 2, 63, 2}, {127, 64, 2, 1, 2}};
 	for (const Row& r : rows) {
+		if (!Takes(sel, 64, static_cast<uint64_t>(r.cap), 1)) continue;
 		const Fixture& fx = D64Cap(r.cap);
 		if (!fx.ok) continue;
 		const int64_t B = RuleB(64, static_cast<uint64_t>(r.cap), 1);
@@ -264,13 +288,16 @@ void Cell410Boundary() {
 			if (px) sslm_prefix_release(px);
 		}
 	}
+	if (sel == Rows::kDividing) return;
 	// Mutants: a clamp at 2B > cap gives cap 65 B = 65 and one page; floor(cap/B) gives cap 127 one page.
 	Separates(RuleMutant::kClampAt2B, 64, 65, 1, 64, "cap 65");
 	PKV_CHECK_MSG(CapPages(127, 64, true) != 2, "separation: the floor page count gives 2 pages at cap 127");
 }
+void Cell410Boundary() { Cell410BoundaryRows(Rows::kDividing); }
+void Cell410BoundaryT2() { Cell410BoundaryRows(Rows::kNonDividing); }
 
-// 4.10 [T1]. The floor, the element width, the cap term's boundary and a non-power-of-two D.
-void Cell410Extremes() {
+// 4.10 [T1; the cap-4,097 row T2]. The floor, the element width, the cap term's boundary and a non-power-of-two D.
+void Cell410ExtremesRows(Rows sel) {
 	struct Row { const Fixture& (*base)(); uint32_t D; int64_t cap; int64_t prec; int64_t want; RuleMutant kills; };
 	const Row rows[] = {
 	    {D1024, 1024, 4096, -1, 16, RuleMutant::kNoFloor},   // the floor
@@ -283,6 +310,7 @@ void Cell410Extremes() {
 	    {GetDef, 48, 4096, -1, 128, RuleMutant::kNoPow2},    // a non-power-of-two D
 	};
 	for (const Row& r : rows) {
+		if (!Takes(sel, r.D, static_cast<uint64_t>(r.cap), r.prec == 1 ? 2 : 1)) continue;
 		const Fixture& base = r.base();
 		if (!base.ok) continue;
 		At a(base, r.cap, -1, r.prec);
@@ -300,9 +328,12 @@ void Cell410Extremes() {
 			PKV_CHECK_MSG(sslm_kv_pool_overhead_size(a.fx.model, 1) == LayoutOf(a.fx.geo, 1, 128).Overhead(1),
 			              "cap 4,097: 33 pages of 128 positions, so the overhead carries 127 slack positions");
 	}
+	if (sel == Rows::kNonDividing) return;
 	// The 32-bit product wraps at D = 2^31 (the hostile row, model gap below); its separation:
 	Separates(RuleMutant::kU32Product, uint64_t{1} << 31, 4096, 1, 16, "D = 2^31");
 }
+void Cell410Extremes() { Cell410ExtremesRows(Rows::kDividing); }
+void Cell410ExtremesT2() { Cell410ExtremesRows(Rows::kNonDividing); }
 
 // 4.10 [T1]. A hostile head_dim, D = 2^20 and 2^31 (both even, so the loader's CFG1 checks admit
 // them), on the CFG1-and-sigmoid-only fixture the plan specifies; B is 16 with no 32-bit wrap. Rev 16.23
@@ -402,10 +433,13 @@ void Cell410Generality() {
 // verdict on a buffer smaller than any requirement (SSLM_BUFFER_TOO_SMALL when both fit, SSLM_INVALID_ARGUMENT
 // otherwise), and requirement_fits equals the verbs' own block and overhead summed in the test. Mutant: a seam
 // with its own copy of the sizing that omits the slack term, which fails at pkv_odd's overhead (96,808 against 40).
+// Re-bracketed (T-3198 §5.1): pkv_odd (cap 4,100, B = 256, 17 pages) is T2's partial last page, so its member, and the
+// slack-omitting copy's separation that lives there, are 4.10/T2:seam-tie; the other nine fixtures divide.
+struct Tied { std::string what; const Fixture* fx; };
+void TieOne(const Tied& f);
 void Cell410SeamTie() {
-	struct Tied { std::string what; const Fixture* fx; };
 	std::vector<Tied> fixtures;
-	for (const char* stem : {"pkv_def", "pkv_32k", "pkv_qk", "pkv_odd"}) fixtures.push_back({stem, &GetFixture(stem)});
+	for (const char* stem : {"pkv_def", "pkv_32k", "pkv_qk"}) fixtures.push_back({stem, &GetFixture(stem)});
 	fixtures.push_back({"r9_d2_c8", &D2Cap8()});
 	fixtures.push_back({"r9_d48_c100", &Get("r9_d48_c100", Geometry{2, 2, 48, 100})});
 	fixtures.push_back({"r9_d64_c4096", &D64Cap(4096)});
@@ -420,7 +454,16 @@ void Cell410SeamTie() {
 		MakeVariant(Q8(), v, &q8big);
 	}
 	fixtures.push_back({"r9_q8 Int16 cap 40,960", &q8big});
-	for (const Tied& f : fixtures) {
+	for (const Tied& f : fixtures) TieOne(f);
+}
+void Cell410SeamTieT2() {
+	TieOne({"pkv_odd", &GetFixture("pkv_odd")});
+	// separation of the slack-omitting copy at pkv_odd (D = 48, cap 4,100, B = 256: 252 slack positions of 384 bytes)
+	const Lay odd = LayoutOf(Geometry{2, 2, 48, 4100}, 1, 256);
+	PKV_CHECK(odd.Overhead(1) == 96808u && 8u + 32u != odd.Overhead(1));
+}
+void TieOne(const Tied& f) {
+	{
 		// like with like: every fixture here is at the derived B (the seam's), never the C4 loader's pinned 16
 		if (f.fx->ok)
 			PKV_CHECK_MSG(sslm_kv_page_positions(f.fx->model) ==
@@ -428,7 +471,7 @@ void Cell410SeamTie() {
 			              "%s is not at the rule's B (a pinned fixture would make the tie compare unlike with unlike)", f.what.c_str());
 		if (!f.fx->ok) {
 			PKV_CHECK_MSG(false, "%s did not map", f.what.c_str());
-			continue;
+			return;
 		}
 		const std::vector<uint8_t> bytes(f.fx->bytes.p, f.fx->bytes.p + f.fx->size);
 		const int64_t B = sslm_kv_page_positions(f.fx->model);
@@ -443,9 +486,14 @@ void Cell410SeamTie() {
 			              "%s: seam (B %lld, page %zu, block %zu, overhead %zu) against the verbs (%lld, %zu, %zu, %zu)",
 			              what.c_str(), static_cast<long long>(g.page_positions), g.page_size, g.block_size, g.overhead,
 			              static_cast<long long>(B), sslm_kv_page_size(f.fx->model), block, overhead);
+			// A buffer smaller than this requirement (T-3198 §5.2: a fixed 4,096 bytes is not, at r9_d2_c8's 168): one
+			// byte below it when it fits in 4,096 bytes, else the whole 4,096. Every size below the requirement.
 			AlignedBuf tiny(4096);
+			const bool req_fits = overhead != SIZE_MAX && block <= (SIZE_MAX - overhead) / n;
+			const size_t req = req_fits ? block * n + overhead : SIZE_MAX;
+			const size_t below = req_fits && req <= tiny.n ? req - 1 : tiny.n;
 			sslm_kv_pool pool = nullptr;
-			const sslm_status st = sslm_kv_pool_create(f.fx->model, tiny.p, tiny.n, n, &pool);
+			const sslm_status st = sslm_kv_pool_create(f.fx->model, tiny.p, below, n, &pool);
 			if (pool) sslm_kv_pool_destroy(pool);
 			PKV_CHECK_MSG((g.page_count_fits && g.requirement_fits) == (st == SSLM_BUFFER_TOO_SMALL),
 			              "%s: seam fits (pages %d, requirement %d) against the create's %s", what.c_str(), g.page_count_fits,
@@ -455,19 +503,17 @@ void Cell410SeamTie() {
 			              what.c_str(), g.requirement_fits, sum_fits ? 1 : 0);
 		}
 	}
-	// separation of the slack-omitting copy at pkv_odd (D = 48, cap 4,100, B = 256: 252 slack positions of 384 bytes)
-	const Lay odd = LayoutOf(Geometry{2, 2, 48, 4100}, 1, 256);
-	PKV_CHECK(odd.Overhead(1) == 96808u && 8u + 32u != odd.Overhead(1));
 }
 
-// 4.11 [T1]. Header independence: kv_block_size in {1, 16, 32, 4,096, 0xFFFFFFFF} gives the rule's B
-// at each (D, cap) of the grid, and 0 is still refused at load.
-void Cell411() {
+// 4.11 [T1 dividing caps; T2 the four non-dividing caps]. Header independence: kv_block_size in {1, 16, 32, 4,096,
+// 0xFFFFFFFF} gives the rule's B at each (D, cap) of the grid, and 0 is still refused at load (T1).
+void Cell411Rows(Rows sel) {
 	const uint32_t kvbs[] = {1, 16, 32, 4096, 0xFFFFFFFFu};
 	for (const DBase& b : kBases) {
 		const Fixture& base = b.get();
 		if (!base.ok) continue;
 		for (int64_t cap : kGridCaps) {
+			if (!Takes(sel, b.D, static_cast<uint64_t>(cap), 1)) continue;
 			const int64_t want = RuleB(b.D, static_cast<uint64_t>(cap), 1);
 			for (uint32_t k : kvbs) {
 				At a(base, cap, k);
@@ -485,12 +531,15 @@ void Cell411() {
 					PKV_CHECK(true);
 			}
 		}
+		if (sel == Rows::kNonDividing) continue;
 		At zero(base, 4096, 0);
 		PKV_CHECK_MSG(!zero.fx.ok && zero.map == SSLM_ARTIFACT_REJECTED,
 		              "D %u: kv_block_size 0 maps with %s; the loader must refuse it", b.D, AbiStatusName(zero.map));
 	}
-	Separates(RuleMutant::kReadsCfg1, 64, 4096, 1, 64, "D = 64, cap 4,096, kv_block_size 32");
+	if (sel == Rows::kDividing) Separates(RuleMutant::kReadsCfg1, 64, 4096, 1, 64, "D = 64, cap 4,096, kv_block_size 32");
 }
+void Cell411() { Cell411Rows(Rows::kDividing); }
+void Cell411T2() { Cell411Rows(Rows::kNonDividing); }
 
 // 4.12 [T1]. The pin's refusals in the test library, each leaving the model's B unchanged.
 void Cell412Refusals() {
@@ -610,5 +659,11 @@ PKV_CELL("4.10/T1:seam-refusals", "T1", Cell410SeamRefusals);
 PKV_CELL("4.11/T1", "T1", Cell411);
 PKV_CELL("4.12/T1:refusals", "T1", Cell412Refusals);
 PKV_CELL("4.12/T1:pins", "T1", Cell412Pins);
+// the non-dividing rows of the T1 sweeps, re-bracketed (T-3198 §5.1): red until T2's partial last page
+PKV_CELL("4.10/T2:grid", "T2", Cell410GridT2);
+PKV_CELL("4.10/T2:boundary", "T2", Cell410BoundaryT2);
+PKV_CELL("4.10/T2:extremes", "T2", Cell410ExtremesT2);
+PKV_CELL("4.10/T2:seam-tie", "T2", Cell410SeamTieT2);
+PKV_CELL("4.11/T2", "T2", Cell411T2);
 
 }  // namespace
