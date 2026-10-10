@@ -153,3 +153,19 @@ endforeach()
 add_executable(superslm_pkv_r9_pin_link_probe EXCLUDE_FROM_ALL ${PKV_DIR}/pkv_r9_pin_link_probe.cpp)
 target_link_libraries(superslm_pkv_r9_pin_link_probe PRIVATE superslm)
 target_include_directories(superslm_pkv_r9_pin_link_probe PRIVATE ${PKV_DIR} include)
+
+# Cell 4.13 [T1]'s forced-SIMD half: the derived-B crossing (tests/paged-kv/r9_t1_crossing.cpp) linked
+# against each forced-tier library, as the C5 tier legs are; run by id, e.g.
+#   superslm_pkv_r9_avx2_forced 4.13/T1 4.6/T1
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|X64)$")
+	foreach(tier sse2 avx2 avx512)
+		superslm_pkv_target(superslm_pkv_r9_${tier}_forced LIBRARY superslm_${tier}_forced
+			SOURCES ${PKV_DIR}/r9_t1_crossing.cpp ${PKV_DIR}/pkv_r9_stubs.cpp)
+		if(SUPERSLM_PKV_R9_STUB_CONTIGUOUS)
+			target_compile_definitions(superslm_pkv_r9_${tier}_forced PRIVATE PKV_R9_STUB_CONTIGUOUS=1)
+		endif()
+		if(SUPERSLM_PKV_R9_STUB_PIN)
+			target_compile_definitions(superslm_pkv_r9_${tier}_forced PRIVATE PKV_R9_STUB_PIN=1)
+		endif()
+	endforeach()
+endif()
