@@ -30,6 +30,7 @@
 #define SUPERSLM_T2791_SUPPRESS_GPU_STATUS_USING_ENUM 1
 #endif
 #include "fixture_common.h"  // tests/t2791-gpu-prefill-read-red-suite
+#include "pkvg_slm6_layout.h"
 
 #include <cstdint>
 #include <cstring>
@@ -332,21 +333,24 @@ inline std::vector<uint8_t> Slm4FromSlm5(const std::vector<uint8_t>& slm5) {
 // 'SLM6' (§4 item 10): "SLM5 fields, plus kv_mode, budget, origin and the canonical [0, L') K/V
 // gather of §3.7". The plan fixes the fields, not the byte offsets.
 //
-// PROVISIONAL LAYOUT, the test author's reading (G5 fixes it): SLM5's 120-byte header with the magic
-// 'SLM6' and workspace_size = L' * bytes_per_token; SLM5's 12-byte tail; kv_mode u32, budget i32,
-// origin i64 (16 bytes, SSB6's order and widths, §3.7); the residual; the K/V rows [0, L') in
-// canonical layout [layer][K|V][head][pos < L'][d] (SSB6's, "the one-page layout at B = L'"). No
-// kv_positions field: L' is workspace_size / bytes_per_token, and Slm6Parse checks it against
-// context_length and layer_index (§3.7's validation).
+// PROVISIONAL LAYOUT (G5 fixes it). pkvg unification: the offsets are the suite's one SLM6 pin,
+// pkvg_slm6_layout.h (shared with g1b): SLM5's 120-byte header with the magic 'SLM6' (and, this group's
+// reading, workspace_size = L' * bytes_per_token); SLM5's 12-byte tail; kv_mode u32, budget i32, origin
+// i64 (16 bytes, SSB6's order and widths, §3.7); the residual; then §3.7's K/V section: kv_positions u64
+// = L', and the K/V rows [0, L') in canonical layout [layer][K|V][head][pos < L'][d] (SSB6's, "the
+// one-page layout at B = L'"). Slm6Parse checks L' against context_length and layer_index (§3.7's
+// validation). (g1e's draft had no kv_positions field; §3.7's K/V section and 2.6 [G5]'s hostile
+// "kv_positions inconsistent" case both need it, so the unified pin follows g1b and the plan.)
 //
 // Every cell reads SLM6 fields only through Slm6Parse, and every cell that saves an SLM6 first runs
 // Slm6SelfCheck against the budget and origin it declared, so a G5 layout that differs from this one
 // turns the cells red with "SLM6 layout" in the message, never green. G5 updates the constants and
 // Slm6Parse here, never an assertion.
-constexpr size_t kSlm6KvModeOff = kSlmHeader + kSlm5Tail;  // 132
-constexpr size_t kSlm6BudgetOff = kSlm6KvModeOff + 4;      // 136
-constexpr size_t kSlm6OriginOff = kSlm6BudgetOff + 4;      // 140
-constexpr size_t kSlm6Header = kSlm6OriginOff + 8;         // 148
+constexpr size_t kSlm6KvModeOff = pkvg_slm6::kOffKvMode;  // 132
+constexpr size_t kSlm6BudgetOff = pkvg_slm6::kOffBudget;  // 136
+constexpr size_t kSlm6OriginOff = pkvg_slm6::kOffOrigin;  // 140
+constexpr size_t kSlm6Header = pkvg_slm6::kFixedBytes;    // 148
+static_assert(kSlmHeader == pkvg_slm6::kSlm5HeaderBytes && kSlm5Tail == pkvg_slm6::kSlm5TailBytes, "SLM5 pin");
 
 struct Slm6View {
 	bool ok = false;
@@ -374,8 +378,12 @@ inline Slm6View Slm6Parse(const std::vector<uint8_t>& b, const Geo& g) {
 	v.budget = static_cast<int32_t>(Le32(b, kSlm6BudgetOff));
 	v.origin = static_cast<int64_t>(Le64(b, kSlm6OriginOff));
 	v.Lp = v.context_length + (v.layer_index > 0 ? 1 : 0);
-	v.kv_off = kSlm6Header + static_cast<size_t>(hidden);
-	v.ok = hidden == g.hidden && kv == static_cast<uint64_t>(v.Lp) * g.BytesPerToken() && b.size() == v.kv_off + kv;
+	const size_t kvpos_off = pkvg_slm6::OffKvPositions(hidden);
+	if (b.size() < kvpos_off + pkvg_slm6::kKvPositionsBytes) return v;
+	const uint64_t kv_positions = Le64(b, kvpos_off);
+	v.kv_off = pkvg_slm6::OffRows(hidden);
+	v.ok = hidden == g.hidden && kv_positions == static_cast<uint64_t>(v.Lp) &&
+	       kv == static_cast<uint64_t>(v.Lp) * g.BytesPerToken() && b.size() == v.kv_off + kv;
 	return v;
 }
 // The canonical row (layer, half, head, pos) of an SLM6 blob.

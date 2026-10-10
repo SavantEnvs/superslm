@@ -55,6 +55,7 @@
 #include <string>
 #include <vector>
 
+#include "pkvg_slm6_layout.h"
 #include "superslm/gpu_1p0.h"
 #include "superslm/gpu_1p0_bench_bridge.h"
 #include "superslm/gpu_1p0_g5_bridge.h"
@@ -562,14 +563,15 @@ constexpr size_t kOffMagic = 0;
 constexpr size_t kOffLayerIndex = 4;
 constexpr size_t kOffContextLength = 32;
 constexpr size_t kOffHiddenCodesSize = 40;
-constexpr size_t kV5HeaderBytes = 120;
-constexpr size_t kV5TailBytes = 12;
-constexpr size_t kOffKvMode = kV5HeaderBytes + kV5TailBytes;  // 132, u32: 0 whole_reserve, 1 budget
-constexpr size_t kOffBudget = kOffKvMode + 4;                 // 136, i32
-constexpr size_t kOffOrigin = kOffBudget + 4;                 // 140, i64
-constexpr size_t kFixedBytes = kOffOrigin + 8;                // 148
+// pkvg unification: the offsets are the suite's one SLM6 pin, pkvg_slm6_layout.h (shared with g1e).
+constexpr size_t kV5HeaderBytes = pkvg_slm6::kSlm5HeaderBytes;
+constexpr size_t kV5TailBytes = pkvg_slm6::kSlm5TailBytes;
+constexpr size_t kOffKvMode = pkvg_slm6::kOffKvMode;    // 132, u32: 0 whole_reserve, 1 budget
+constexpr size_t kOffBudget = pkvg_slm6::kOffBudget;    // 136, i32
+constexpr size_t kOffOrigin = pkvg_slm6::kOffOrigin;    // 140, i64
+constexpr size_t kFixedBytes = pkvg_slm6::kFixedBytes;  // 148
 inline size_t OffKvPositions(const std::vector<uint8_t>& b) {
-	return kFixedBytes + static_cast<size_t>(ReadAt<uint64_t>(b, kOffHiddenCodesSize));
+	return pkvg_slm6::OffKvPositions(ReadAt<uint64_t>(b, kOffHiddenCodesSize));
 }
 inline size_t RowBytes(const Geometry& g) { return static_cast<size_t>(g.layers) * 2u * g.kv_heads * g.head_dim * g.elem; }
 }  // namespace slm6
@@ -585,7 +587,7 @@ inline bool Slm6LayoutMatches(const Geometry& g, const std::vector<uint8_t>& b, 
 	                ReadAt<int32_t>(b, slm6::kOffBudget) == budget && ReadAt<int64_t>(b, slm6::kOffOrigin) == origin &&
 	                ReadAt<int64_t>(b, slm6::kOffContextLength) == context_length &&
 	                ReadAt<uint32_t>(b, slm6::kOffLayerIndex) == 0u && kvpos == static_cast<uint64_t>(context_length) &&
-	                b.size() == slm6::OffKvPositions(b) + 8 + static_cast<size_t>(kvpos) * slm6::RowBytes(g);
+	                b.size() == slm6::OffKvPositions(b) + pkvg_slm6::kKvPositionsBytes + static_cast<size_t>(kvpos) * slm6::RowBytes(g);
 	if (!ok) {
 		std::printf("g1b: SLM6 layout pin check: size=%zu magic=0x%08x kv_mode=%u budget=%d origin=%lld ctx=%lld kvpos=%llu\n",
 		            b.size(), ReadAt<uint32_t>(b, slm6::kOffMagic), ReadAt<uint32_t>(b, slm6::kOffKvMode),

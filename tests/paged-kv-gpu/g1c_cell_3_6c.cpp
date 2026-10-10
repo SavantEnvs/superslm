@@ -28,6 +28,7 @@
 // mirror peek (G3), the prefix verbs and adopt (G4), restore-into-pool (G5).
 // GREEN: each part at its step, on both GPUs.
 #include "g1c_guard_runs.h"
+// pkvg unification: the parts after PKVG_STEP (g1c_helpers.h) are compiled out.
 
 namespace {
 using namespace g1c;
@@ -96,13 +97,21 @@ void G3PoolCreate() {
 	}
 }
 
+#if PKVG_STEP >= 4
 void G4Adopt() { Run(SpecAdopt(AKind::Dedicated), "3.6c/G4"); }
 void G4BeginFrom() { Run(SpecBeginFrom(AKind::Dedicated), "3.6c/G4"); }
+#endif  // PKVG_STEP >= 4
+#if PKVG_STEP >= 5
 void G5RestoreIntoPool() { Run(SpecRestoreIntoPool(AKind::Dedicated), "3.6c/G5"); }
+#endif  // PKVG_STEP >= 5
 }  // namespace
 
 G1C_CELL("3.6c/G3:two_pools", "G3", G3TwoPools);
 G1C_CELL("3.6c/G3:pool_create", "G3", G3PoolCreate);
+#if PKVG_STEP >= 4
 G1C_CELL("3.6c/G4:adopt", "G4", G4Adopt);
 G1C_CELL("3.6c/G4:begin_from", "G4", G4BeginFrom);
+#endif
+#if PKVG_STEP >= 5
 G1C_CELL("3.6c/G5:restore_into_pool", "G5", G5RestoreIntoPool);
+#endif

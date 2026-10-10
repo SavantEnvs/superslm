@@ -34,6 +34,7 @@
 // every existing entry point for a pooled holder (no pool scope exists to refuse it).
 // GREEN: each part at its step, on both GPUs.
 #include "g1c_guard_runs.h"
+// pkvg unification: the parts after PKVG_STEP (g1c_helpers.h) are compiled out.
 
 namespace {
 using namespace g1c;
@@ -54,10 +55,13 @@ void G3Prefill() { Run(NoResave(SpecPromptPrefill(AKind::PooledSamePool)), "3.6b
 // "One run per submitting verb": the schema-content bridge is the second prefill verb.
 void G3SchemaPrefill() { Run(NoResave(SpecSchemaPrefill(AKind::PooledSamePool)), "3.6b/G3"); }
 
+#if PKVG_STEP >= 4
 void G4Adopt() { Run(NoResave(SpecAdopt(AKind::PooledSamePool)), "3.6b/G4"); }
 void G4BeginFrom() { Run(SpecBeginFrom(AKind::PooledSamePool), "3.6b/G4"); }
 void G4PrefixPrefill() { Run(SpecPrefixPrefill(AKind::PooledSamePool), "3.6b/G4"); }
 
+#endif  // PKVG_STEP >= 4
+#if PKVG_STEP >= 5
 void G5RestoreIntoPool() { Run(SpecRestoreIntoPool(AKind::PooledSamePool), "3.6b/G5"); }
 // The re-save added to every verb whose B is a sequence. begin_from's and the prefix prefill's B is a
 // prefix, which has no save verb (see the notes: reading taken).
@@ -68,15 +72,19 @@ void G5ResaveSchemaPrefill() { Run(SpecSchemaPrefill(AKind::PooledSamePool), "3.
 void G5ResaveAdopt() { Run(SpecAdopt(AKind::PooledSamePool), "3.6b/G5 re-save"); }
 // §7: "the re-save sees adopt's mutant at 1,008 too" -- the aligned prefix, where no G4 operand does.
 void G5ResaveAdoptAligned() { Run(SpecAdopt(AKind::PooledSamePool, 1008), "3.6b/G5 re-save"); }
+#endif  // PKVG_STEP >= 5
 }  // namespace
 
 G1C_CELL("3.6b/G3:decode", "G3", G3Decode);
 G1C_CELL("3.6b/G3:batch", "G3", G3Batch);
 G1C_CELL("3.6b/G3:prefill", "G3", G3Prefill);
 G1C_CELL("3.6b/G3:schema_prefill", "G3", G3SchemaPrefill);
+#if PKVG_STEP >= 4
 G1C_CELL("3.6b/G4:adopt", "G4", G4Adopt);
 G1C_CELL("3.6b/G4:begin_from", "G4", G4BeginFrom);
 G1C_CELL("3.6b/G4:prefix_prefill", "G4", G4PrefixPrefill);
+#endif
+#if PKVG_STEP >= 5
 G1C_CELL("3.6b/G5:restore_into_pool", "G5", G5RestoreIntoPool);
 G1C_CELL("3.6b/G5:resave-decode", "G5", G5ResaveDecode);
 G1C_CELL("3.6b/G5:resave-batch", "G5", G5ResaveBatch);
@@ -84,3 +92,4 @@ G1C_CELL("3.6b/G5:resave-prefill", "G5", G5ResavePrefill);
 G1C_CELL("3.6b/G5:resave-schema_prefill", "G5", G5ResaveSchemaPrefill);
 G1C_CELL("3.6b/G5:resave-adopt", "G5", G5ResaveAdopt);
 G1C_CELL("3.6b/G5:resave-adopt-1008", "G5", G5ResaveAdoptAligned);
+#endif
