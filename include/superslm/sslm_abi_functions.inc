@@ -120,6 +120,20 @@ SUPERSLM_API int64_t sslm_kv_page_positions(sslm_model model);
 SUPERSLM_API size_t sslm_kv_page_size(sslm_model model);
 /* R(budget), the pages a budget holder reserves; 0 for a budget outside [1, cap] or a null model. */
 SUPERSLM_API size_t sslm_kv_pages_for_budget(sslm_model model, int32_t budget);
+/* The contiguous pool option (1.12.0, CPU only): a pool whose page is the whole context cap, one page
+ * per block, which keeps 1.11.0's contiguous layout for single-sequence speed. Every verb works on it as
+ * on a page pool with B = cap: a legacy or budget holder takes one page, adopt and begin_from copy and
+ * share no page, and saves are canonical, so blobs restore across pool kinds. It trades away what page
+ * pools give a budget holder (sharing a prefix's pages, reserving by budget). Copy adopt between a
+ * contiguous pool and a page pool of one model is SSLM_INVALID_ARGUMENT wherever their page sizes differ;
+ * move state across pool kinds by save and restore. sslm_kv_page_positions, sslm_kv_page_size and
+ * sslm_kv_pages_for_budget keep answering for the model's B; sslm_kv_pool_stats reports the pool's.
+ * sslm_kv_pool_contiguous_size returns the bytes for `block_count` blocks, block_count *
+ * (sslm_kv_block_size + 8) + 32, and 0 on a null model, a zero count or overflow. The create refuses in
+ * sslm_kv_pool_create's order and alignment rule. */
+SUPERSLM_API size_t sslm_kv_pool_contiguous_size(sslm_model model, uint32_t block_count);
+SUPERSLM_API sslm_status sslm_kv_pool_create_contiguous(sslm_model model, void* buf, size_t buf_size, uint32_t block_count,
+                                                        sslm_kv_pool* out);
 /* The page-pool bookkeeping a buffer must hold beyond its pages; sslm_kv_pool_overhead_size's
  * convention (0 on a null model, SIZE_MAX where no buffer suffices). As with the block verb, the
  * pool's per-page bookkeeping (free list, reference counts, written and shared flags: 13 bytes

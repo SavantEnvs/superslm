@@ -146,7 +146,7 @@ endif()
 # nothing written), so the cells link and fail at their assertions. The builder turns each option
 # OFF in the commit that defines the real symbol; a stub left ON beside a real definition fails the
 # link with a duplicate symbol, so the two cannot coexist.
-option(SUPERSLM_PKV_R9_STUB_CONTIGUOUS "T0 stubs for sslm_kv_pool_contiguous_size and sslm_kv_pool_create_contiguous" ON)
+option(SUPERSLM_PKV_R9_STUB_CONTIGUOUS "T0 stubs for sslm_kv_pool_contiguous_size and sslm_kv_pool_create_contiguous" OFF)
 option(SUPERSLM_PKV_R9_STUB_PIN "T0 stub for the test-only pin KvPagesTestPinPagePositions" OFF)
 file(GLOB PKV_R9_SOURCES CONFIGURE_DEPENDS ${PKV_DIR}/r9_*.cpp)
 file(GLOB PKV_R9_BOX_SOURCES CONFIGURE_DEPENDS ${PKV_DIR}/r9box_*.cpp)

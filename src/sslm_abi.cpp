@@ -819,6 +819,18 @@ uint32_t ReservationPages(const sslm_model_s* model, int32_t budget) {
 	return static_cast<uint32_t>(std::min<int64_t>(pages, geo.cap_pages));
 }
 
+// The same R(budget) in a given pool, by the POOL's page size and pages per cap: what a budget holder
+// created, begun or restored in that pool actually reserves. A page pool's B is the model's (the pin is
+// refused once a pool exists), so it answers as ReservationPages; the contiguous option's page is the cap,
+// so a budget holder there reserves one page (§21.2; T-3195's lesser plane). 0 for a budget outside [1, cap].
+uint32_t ReservationPagesIn(const sslm_kv_pool_s* pool, int32_t budget) {
+	const sslm_model_s* model = pool->model;
+	if (budget < 1 || static_cast<int64_t>(budget) > static_cast<int64_t>(model->view.config.context_cap)) return 0;
+	const int64_t B = pool->page_positions;
+	const int64_t pages = (static_cast<int64_t>(budget) + B - 1) / B + 1;
+	return static_cast<uint32_t>(std::min<int64_t>(pages, pool->cap_pages));
+}
+
 // §3.4: limit = min(origin + budget, cap) for a budget holder; the cap for a whole_reserve one.
 int64_t HolderLimit(const sslm_model_s* model, KvHolderMode mode, int32_t budget, int64_t origin) {
 	const int64_t cap = static_cast<int64_t>(model->view.config.context_cap);
@@ -1390,6 +1402,78 @@ extern "C" sslm_status sslm_kv_page_pool_create(sslm_model model, void* buf, siz
 		}
 		// Cell 5.6: the allocation-failure seam, consulted after the pool's own heap state exists,
 		// so an injected failure unwinds a real construction.
+		superslm::internal::MaybeThrowInjectedBadAllocFault();
+		return SSLM_OK;
+	});
+	if (fill_st != SSLM_OK) {
+		delete h;  // ~sslm_kv_pool_s destroys the page pool, if it was made
+		return fill_st;
+	}
+	model->live_pools.fetch_add(1, std::memory_order_acq_rel);
+	*out = h;
+	return SSLM_OK;
+}
+
+// Paged-KV plan §21.2 (D-SLM8398): the contiguous pool option. A pool whose page is `cap` positions, one page
+// per block, through the same page module: every holder in it is one page (1.11.0's layout), and every verb works
+// on it as on a page pool with B = cap. Its size is block_count * (block + 8) + 32: 1.11.0's flat block per block,
+// plus the page module's 8 bytes a page and 32 (§3.6). 0 on a null model, a zero count, or where the product or the
+// sum overflows (rev 16.21, D-SLM8422: the sum is the binding term).
+namespace {
+size_t ContiguousSize(const sslm_model_s* model, uint32_t block_count) {
+	if (!model || block_count == 0) return 0;
+	const size_t block = FlatBlockSize(model->view.config);
+	if (block == 0 || block == kSizeMax) return 0;
+	size_t per = 0, product = 0, total = 0;
+	if (!CheckedAddSizeT(block, sizeof(uint32_t) * 2, &per)) return 0;
+	if (!CheckedMulSizeT(static_cast<size_t>(block_count), per, &product)) return 0;
+	if (!CheckedAddSizeT(product, 32, &total)) return 0;
+	return total;
+}
+}  // namespace
+
+extern "C" size_t sslm_kv_pool_contiguous_size(sslm_model model, uint32_t block_count) {
+	return ContiguousSize(model, block_count);
+}
+
+// The refusals of sslm_kv_pool_create, in its order: a null `out` (nothing written), then `*out` nulled; a null
+// model or buffer or a zero count; an overflowing size; a buffer below the size (before the alignment, so a
+// buffer both too small and misaligned is SSLM_BUFFER_TOO_SMALL); a misaligned buffer; heap failure. No refusal
+// writes into the caller's buffer.
+extern "C" sslm_status sslm_kv_pool_create_contiguous(sslm_model model, void* buf, size_t buf_size, uint32_t block_count,
+                                                      sslm_kv_pool* out) {
+	if (!out) return SSLM_INVALID_ARGUMENT;
+	*out = nullptr;
+	if (!model || !buf) return SSLM_INVALID_ARGUMENT;
+	if (block_count == 0) return SSLM_INVALID_ARGUMENT;
+	const size_t required = ContiguousSize(model, block_count);
+	if (required == 0) return SSLM_INVALID_ARGUMENT;  // the product or the sum overflows
+	const PageGeometry geo = ComputePageGeometry(model);
+	if (!geo.ok) return SSLM_INVALID_ARGUMENT;
+	if (buf_size < required) return SSLM_BUFFER_TOO_SMALL;
+	if (!IsAligned(buf)) return SSLM_MISALIGNED_BUFFER;
+	const superslm::SslmModelConfig& c = model->view.config;
+	const size_t block = FlatBlockSize(c);
+	sslm_kv_pool_s* h = new (std::nothrow) sslm_kv_pool_s();
+	if (!h) return SSLM_ALLOCATION_FAILED;
+	h->model = model;
+	h->buf = buf;
+	h->buf_size = buf_size;
+	h->block_count = block_count;
+	h->block_size = block;
+	h->page_positions = static_cast<int64_t>(c.context_cap);  // one page per block: the cap
+	h->page_bytes = block;
+	h->cap_pages = 1;
+	h->runs = geo.runs;
+	const sslm_status fill_st = CatchAllocationFailure([&]() -> sslm_status {
+		const superslm::kv_pages::PageStatus ps = superslm::kv_pages::PoolCreate(
+		    static_cast<uint8_t*>(buf), block_count, block, h->page_positions, &h->pages);
+		if (ps != superslm::kv_pages::PageStatus::kOk) {
+			return ps == superslm::kv_pages::PageStatus::kAllocationFailed ? SSLM_ALLOCATION_FAILED
+			                                                                : SSLM_INVALID_ARGUMENT;
+		}
+		// Cell 5.6: the allocation-failure seam, consulted after the pool's heap state exists, as the page-pool
+		// create does, so an injected failure unwinds a real construction.
 		superslm::internal::MaybeThrowInjectedBadAllocFault();
 		return SSLM_OK;
 	});
@@ -2283,7 +2367,7 @@ extern "C" sslm_status sslm_prefix_begin_budgeted(sslm_model model, sslm_kv_pool
 	if (p->model != model) return SSLM_INVALID_ARGUMENT;
 	if (!BudgetInDomain(model, budget)) return SSLM_INVALID_ARGUMENT;
 	superslm::kv_pages::PageHolder* kv = nullptr;
-	const sslm_status draw_st = CreateHolder(p, ReservationPages(model, budget), &kv);
+	const sslm_status draw_st = CreateHolder(p, ReservationPagesIn(p, budget), &kv);
 	if (draw_st != SSLM_OK) return draw_st;
 	return FinishPrefix(model, p, kv, KvHolderMode::kBudget, budget, 0, true, out);
 }
@@ -2305,7 +2389,7 @@ extern "C" sslm_status sslm_prefix_begin_from(sslm_prefix parent, int32_t budget
 	const int64_t len = parent->state.context_length;
 	const uint32_t full = static_cast<uint32_t>(len / B);
 	const uint32_t tail = (len % B) != 0 ? 1u : 0u;
-	const uint32_t reserve = ReservationPages(model, budget);
+	const uint32_t reserve = ReservationPagesIn(p, budget);
 	if (full + tail > p->cap_pages || full + tail > superslm::kv_pages::HolderMapped(parent->kv) || tail > reserve) {
 		return SSLM_INVALID_ARGUMENT;  // unreachable for a frozen parent of this pool (its table covers len)
 	}
@@ -2495,7 +2579,7 @@ extern "C" sslm_status sslm_seq_create_budgeted(sslm_model model, sslm_kv_pool* 
 	if (p->model != model) return SSLM_INVALID_ARGUMENT;
 	if (!BudgetInDomain(model, budget)) return SSLM_INVALID_ARGUMENT;
 	superslm::kv_pages::PageHolder* kv = nullptr;
-	const sslm_status draw_st = CreateHolder(p, ReservationPages(model, budget), &kv);
+	const sslm_status draw_st = CreateHolder(p, ReservationPagesIn(p, budget), &kv);
 	if (draw_st != SSLM_OK) return draw_st;
 	return FinishSeq(model, p, kv, KvHolderMode::kBudget, budget, true, out);
 }
@@ -2627,6 +2711,9 @@ extern "C" superslm::SequenceLayerState* SslmPrefixLiveStateForTest(sslm_prefix 
 // counted under the pool mutex) and copies at most its one partial tail page. Neither draws from
 // the pool. Both are bit-identical in what the sequence then reads: context_length gates what
 // RunLayerLoop treats as valid history, and every write lands at or after the prefix's length.
+// Both copies are page-whole, so they are exact only between pools of one page geometry: an adopt whose
+// two pools' page_positions differ (a page pool and the contiguous option of one model, above one rule
+// page) is refused before any state change (paged-KV plan §3.5, §25.4, D-SLM8434).
 extern "C" sslm_status sslm_seq_adopt_prefix(sslm_seq seq, sslm_prefix prefix) {
 	if (!seq) return SSLM_INVALID_ARGUMENT;
 	if (!prefix) return SSLM_INVALID_ARGUMENT;
@@ -2645,6 +2732,11 @@ extern "C" sslm_status sslm_seq_adopt_prefix(sslm_seq seq, sslm_prefix prefix) {
 	// once sslm_kv_pool_s is itself bound to one model, below).
 	if (seq->model != prefix->model) return SSLM_INVALID_ARGUMENT;  // different models
 	if (seq->block_size != prefix->block_size) return SSLM_INVALID_ARGUMENT;
+	// Paged-KV plan §3.5 (rev 16.23, D-SLM8434): the block check guards the legacy layout's cap; equal blocks
+	// no longer mean equal pages. A copy between pools of two page geometries would copy one geometry's pages
+	// as the other's, so it is refused here, with the model and block checks, before the bind permission is
+	// revoked or any state moves (A22, cell 4.15). Equal page_positions mean one page_bytes and one formula.
+	if (seq->pool->page_positions != prefix->pool->page_positions) return SSLM_INVALID_ARGUMENT;
 	// Paged-KV plan §3.5 (C5): the adopter's mode decides. A budget adopter share-adopts, which maps
 	// the prefix's own pages, so a prefix of another pool is refused here, with the model check and
 	// before any state change (A16; the bind permission is not revoked). A whole_reserve adopter
@@ -4087,7 +4179,7 @@ static sslm_status SeqRestoreImpl(sslm_model model, sslm_kv_pool* pool, const vo
 	if (budget_restore) {
 		const int64_t B = pool_ptr->page_positions;
 		const uint32_t full = static_cast<uint32_t>(saved_origin / B);
-		reserve_pages = ReservationPages(model, saved_budget);
+		reserve_pages = ReservationPagesIn(pool_ptr, saved_budget);
 		if (handle && SharingHandleMatches(handle, model, pool_ptr, saved_origin, kv_block_count_ptr + kv_count_bytes,
 		                                   kv_stride)) {
 			share_pages = full;
