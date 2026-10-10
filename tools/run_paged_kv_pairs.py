@@ -113,13 +113,33 @@ def _os_unlock(fd: int) -> None:
         pass
 
 
+def boot_epoch() -> float | None:
+    """The system's last boot, in seconds since the epoch: now less the uptime (GetTickCount64 on Windows, counting
+    sleep and hibernation; CLOCK_BOOTTIME on Linux); None where neither exists. The same reading as
+    run_paged_kv_rows.py's and paged_kv_c6_provenance.ps1's (D-SLM8466 (3))."""
+    if os.name == "nt":
+        import ctypes
+        tick = ctypes.windll.kernel32.GetTickCount64
+        tick.restype = ctypes.c_uint64
+        return time.time() - tick() / 1000.0
+    boottime = getattr(time, "CLOCK_BOOTTIME", None)
+    return time.time() - time.clock_gettime(boottime) if boottime is not None else None
+
+
+def _before_boot(fd: int) -> bool:
+    """True when the lock file's modification time is earlier than the last boot (D-SLM8466 (3))."""
+    boot = boot_epoch()
+    return boot is not None and os.fstat(fd).st_mtime < boot
+
+
 class PidLock:
     """The pid lock: the file holds the owner's bare decimal pid. D-SLM8464 gives the box timing lock one format and one
     protocol in every program that takes it (run_paged_kv_rows.py's timing_lock and paged_kv_c6_provenance.ps1's
     Enter-PkvTimingLock are the others): a fresh acquire moves a temporary file holding the pid into place without
     replacing, so the lock is never visible empty; an existing file is recovered only under an exclusive non-blocking OS
-    lock on it, then a pid liveness check (a live pid refuses), then an overwrite with this pid, and an empty file is
-    stale; a release unlinks the file when it still holds this pid and never truncates it."""
+    lock on it; then a file modified before the system's last boot is stale whatever pid it holds (D-SLM8466 (3): that
+    pid may now name an unrelated process); otherwise a pid liveness check (a live pid refuses); then an overwrite with
+    this pid. An empty file is stale. A release unlinks the file when it still holds this pid and never truncates it."""
 
     ATTEMPTS = 3
 
@@ -156,11 +176,10 @@ class PidLock:
                     return False
                 os.lseek(fd, 0, os.SEEK_SET)
                 text = os.read(fd, 4096).decode("ascii", "replace").strip()
-                if text:
-                    try:
-                        owner = int(text)
-                    except ValueError:
-                        raise Refusal(f"torn pid lock: {self.path}") from None
+                if text and not _before_boot(fd):
+                    if not text.isdigit():
+                        raise Refusal(f"torn pid lock: {self.path}")
+                    owner = int(text)
                     if pid_live(owner):
                         raise Refusal(f"second runner refused: pid {owner}")
                 os.lseek(fd, 0, os.SEEK_SET)

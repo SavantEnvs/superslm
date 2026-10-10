@@ -89,7 +89,8 @@ target_compile_definitions(superslm_mr_opt PRIVATE SUPERSLM_MUTANT_PKV_MR_OPT SU
 add_executable(superslm_pkv_pair_mr_opt EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_pair.cpp)
 target_link_libraries(superslm_pkv_pair_mr_opt PRIVATE superslm_mr_opt)
 target_include_directories(superslm_pkv_pair_mr_opt PRIVATE ${PKV_DIR} include src tests)
-target_compile_definitions(superslm_pkv_pair_mr_opt PRIVATE PKV_REFERENCE_DIR="${PKV_DIR}/reference")
+# PKV_PAIR_MR_OPT: this pair prints 7.9-MR-OPT's own identity line (D-SLM8466 (2), tools/paged_kv_pair.cpp BuildIdentity).
+target_compile_definitions(superslm_pkv_pair_mr_opt PRIVATE PKV_REFERENCE_DIR="${PKV_DIR}/reference" PKV_PAIR_MR_OPT)
 if(MSVC)
 	target_compile_options(superslm_mr_opt PRIVATE /W4 /fp:precise)
 	target_compile_options(superslm_pkv_pair_mr_opt PRIVATE /W4 /fp:precise)

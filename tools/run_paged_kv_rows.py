@@ -4,12 +4,16 @@ One model, one blob per row restored into both arms (a legacy holder in a page p
 and a legacy holder in the same build's contiguous pool option), 104 timed pairs per process after 4 warm-up
 tokens, five processes on one boot. The process statistic is the median of s_i = tau_paged / tau_contiguous - 1;
 the row rule: PASS when the largest of the five process medians is <= 0.05, FAIL when their median is > 0.05,
-NO RESULT otherwise. A row is graded only on five complete processes, only when their five measured-holder id
-lists agree, and only when the scatter guard admits those ids (M <= M99(n, P) at the n read after the run).
+NO RESULT otherwise. A row is graded only on five complete processes; for a construction with a paged arm
+(production, 7.9-MR-OPT), also only when their five measured-holder id lists agree and the scatter guard admits those
+ids (M <= M99(n, P) at the n read after the run). The must-accept constructions MA-1 and MA-2 have no paged arm: their
+row record reads `guard: "not applicable (no paged arm)"` and the row rule alone grades them (D-SLM8466 (1)).
 
 Every refusal under the per-process rule has its own exit code, writes no record for the refused process, and leaves
-the row ungraded: 79-6 a blob or manifest mismatch (checked before each process restores the blob), 79-7 a
-seam-library pair executable (its identity line, checked once per process before any pair is read), 79-8 a token
+the row ungraded: 79-6 a blob or manifest mismatch (checked before each process restores the blob), 79-7 a pair
+executable that is not the construction it was run as (its identity line is not the construction's own, checked once
+per process before any pair is read: a seam library, or another construction's build; an MA run that printed an IDS
+page-id line; or a production or 7.9-MR-OPT run that printed none), 79-8 a token
 mismatch between the arms, 79-9 a process with other than 104 timed pairs. A refused row writes no row record at a
 fresh result path; where an earlier run's record already stands at that path, the refusal replaces it with a REFUSED
 record carrying the exit code and no verdict, so a refused run never leaves an earlier verdict standing there (T-3202
@@ -31,8 +35,26 @@ result.json with `slot`, `runs` (each run's row, construction, status, verdict, 
 `status` (STANDING only when every run is STANDING, REFUSED otherwise) and `exe_sha256`. It refuses, writing no
 aggregate (and superseding an existing record at R as above), when the runs' exe_sha256 differ or when the runs are
 not exactly the slot's set: R79A is MA-1 at R2b, R4a and R4b plus MA-2 at R4a; R79MR is 7.9-MR-OPT at R2b, R4a and
-R4b. The construction label is the run's command line's: the driver checks it against the page positions, and
-nothing in the pair executable's output tells MA-1 from MA-2.
+R4b.
+
+Records (D-SLM8466 (2)): every process record carries `argv` (the exact pair command it ran) and `identity` (the
+identity line it read); the row record carries `argv` (the driver's own command line) and `identity`. The label
+--construction is checked against the identity line the pair executable prints, so a record shows which construction
+ran without trusting the label.
+
+The pair executable's contract, per construction (the identity strings are CONSTRUCTION_IDENTITY, and
+tools/paged_kv_pair.cpp's kIdentity* constants):
+    production   superslm_pkv_pair row79           PKV_PAIR_PRODUCTION_V2 defs=none   RESERVE, PAIR x 104, IDS
+    7.9-MR-OPT   superslm_pkv_pair_mr_opt row79    PKV_PAIR_MR_OPT_V1 defs=none       RESERVE, PAIR x 104, IDS
+    MA-1         the commissioning seat's (T7)     PKV_PAIR_MA1_V1 defs=none          PAIR x 104 only
+    MA-2         the commissioning seat's (T7)     PKV_PAIR_MA2_V1 defs=none          PAIR x 104 only
+An MA executable is invoked as `<--pair-cmd ...> --blob B --model F --process K --pairs 104 --warmup 4` (the arguments
+the driver appends to every pair command); it restores the blob into both of its contiguous-option arms, times W
+warm-up tokens per arm untimed and then N pairs, the order of each pair drawn from its seed and K as row79 does, and
+prints, in order: its identity line first; then one `PAIR <arm_a_ns> <arm_b_ns> <arm_a_token> <arm_b_token>` line per
+timed pair, arm_a in the paged column (the statistic is tau_a / tau_b - 1); and no IDS line (an IDS line from an MA
+run is refused, 79-7) and no RESERVE line. It exits 0. MA-1 and MA-2 share one executable (R79A's runs share one
+exe_sha256, D-SLM8463), selecting the construction from its own command line, and each prints its own identity line.
 """
 
 from __future__ import annotations
@@ -108,7 +130,22 @@ MR_OPT_ROWS = {
     "R4b": {"n": 1175, "P": 2048, "m99": 6},
 }
 
+# D-SLM8466 (2): each construction prints its own identity line, first on stdout, so a record shows which construction
+# ran without relying on the --construction label. Production's is unchanged; 7.9-MR-OPT's pair
+# (superslm_pkv_pair_mr_opt, built with PKV_PAIR_MR_OPT) prints its own; MA-1 and MA-2 are the commissioning seat's
+# (T7), and must print theirs. The strings are tools/paged_kv_pair.cpp's kIdentity* constants.
 IDENTITY = "PKV_PAIR_PRODUCTION_V2 defs=none"
+CONSTRUCTION_IDENTITY = {
+    "production": IDENTITY,
+    "7.9-MR-OPT": "PKV_PAIR_MR_OPT_V1 defs=none",
+    "MA-1": "PKV_PAIR_MA1_V1 defs=none",
+    "MA-2": "PKV_PAIR_MA2_V1 defs=none",
+}
+# D-SLM8466 (1): the scatter guard grades the paged arm's page order, so it runs only for the constructions that have a
+# paged arm. MA-1 and MA-2 (contiguous-option arms only) are graded by the row rule alone, and an IDS line from one of
+# them is refused.
+PAGED_ARM = frozenset({"production", "7.9-MR-OPT"})
+GUARD_NOT_APPLICABLE = "not applicable (no paged arm)"
 
 
 # ---- the statistic and the row rule -------------------------------------------------------------------------
@@ -228,9 +265,10 @@ def pid_live(pid):
 # driver's own fields, such as the recovery, go into its row record). One protocol in all three programs:
 #   - a fresh acquire writes the pid to a temporary file and moves it into place without replacing, so the lock file is
 #     never visible empty or half-written;
-#   - a file that already exists is recovered only under an exclusive non-blocking OS lock on it, then a pid liveness
-#     check (any live pid refuses, the caller's own included), then an overwrite with the new owner's pid; an empty file
-#     is stale, so a lock left empty by a crash recovers;
+#   - a file that already exists is recovered only under an exclusive non-blocking OS lock on it; then a file modified
+#     before the system's last boot is stale whatever pid it holds, since that pid may now name an unrelated process
+#     (D-SLM8466 (3)); otherwise a pid liveness check (any live pid refuses, the caller's own included); then an
+#     overwrite with the new owner's pid. An empty file is stale, so a lock left empty by a crash recovers;
 #   - a release unlinks the file when it still holds the releaser's pid, and never truncates it. A reader holding the
 #     file open at the release instant leaves the releaser's pid in place, which is stale once the releaser exits.
 # The OS lock is one byte far past any content, so a plain reader of the pid is never blocked by it.
@@ -268,8 +306,8 @@ def _os_unlock(fd):
 
 
 def _read_owner(fd):
-    """The pid the lock's content names, None when the content is empty (stale). Reads the bare pid every leg writes,
-    and a {"pid": ...} object a driver before D-SLM8464 left; raises ValueError on anything else."""
+    """The pid the lock's content names, None when the content is empty (stale). The content is the bare decimal pid
+    every leg writes (D-SLM8464); anything else raises ValueError (torn), as in the other two legs (T-3204 N-2)."""
     os.lseek(fd, 0, os.SEEK_SET)
     chunks = []
     while True:
@@ -280,15 +318,29 @@ def _read_owner(fd):
     text = b"".join(chunks).decode("utf-8").strip()
     if not text:
         return None
-    try:
-        value = json.loads(text)
-    except ValueError:
-        value = text
-    if isinstance(value, dict):
-        value = value.get("pid")
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
+    if not text.isdigit():
         raise ValueError(f"lock content {text[:60]!r}")
-    return int(value)
+    return int(text)
+
+
+def boot_epoch():
+    """The system's last boot, in seconds since the epoch: now less the uptime (GetTickCount64 on Windows, which counts
+    sleep and hibernation; CLOCK_BOOTTIME on Linux). None where neither exists. The same reading in all three lock
+    holders (D-SLM8466 (3); paged_kv_c6_provenance.ps1 uses [Environment]::TickCount64)."""
+    if os.name == "nt":
+        import ctypes
+        tick = ctypes.windll.kernel32.GetTickCount64
+        tick.restype = ctypes.c_uint64
+        return time.time() - tick() / 1000.0
+    boottime = getattr(time, "CLOCK_BOOTTIME", None)
+    return time.time() - time.clock_gettime(boottime) if boottime is not None else None
+
+
+def _before_boot(fd):
+    """D-SLM8466 (3): True when the lock file's modification time is earlier than the last boot. Its pid was recorded
+    before the reboot and may now name an unrelated process, so the file is stale whatever pid it holds."""
+    boot = boot_epoch()
+    return boot is not None and os.fstat(fd).st_mtime < boot
 
 
 def _publish_lock(lock_path, pid):
@@ -308,9 +360,10 @@ def _publish_lock(lock_path, pid):
 
 
 def _recover_lock(lock_path, pid, result_path):
-    """Recover an existing lock file for `pid`: under the OS lock, a live owner refuses, and an empty or dead owner's
-    file is overwritten with `pid`. Returns {"recovered_from": the stale pid or None when the file was empty}, or None
-    when the file went away first (retry the fresh acquire)."""
+    """Recover an existing lock file for `pid`: under the OS lock, a file modified before the last boot is stale
+    whatever it holds (D-SLM8466 (3), checked first); otherwise a live owner refuses, and an empty or dead owner's file
+    is stale. A stale file is overwritten with `pid`. Returns {"recovered_from": the stale pid or None, "reason"}, or
+    None when the file went away first (retry the fresh acquire)."""
     try:
         fd = os.open(lock_path, os.O_RDWR | getattr(os, "O_BINARY", 0))
     except (FileNotFoundError, PermissionError):
@@ -325,17 +378,25 @@ def _recover_lock(lock_path, pid, result_path):
                     return None  # released and replaced after this open
             except FileNotFoundError:
                 return None
-            try:
-                owner = _read_owner(fd)
-            except (OSError, ValueError, TypeError, UnicodeDecodeError):
-                raise Refusal(f"torn timing lock: {lock_path}") from None
-            if owner is not None and pid_live(owner):
-                raise Refusal(f"79-10: the C6 timing lock {lock_path} is held by live pid {owner}; second runner "
-                              f"(result {result_path}) refused")
+            if _before_boot(fd):
+                try:
+                    owner = _read_owner(fd)
+                except (OSError, ValueError, UnicodeDecodeError):
+                    owner = None
+                reason = "before the last boot"
+            else:
+                try:
+                    owner = _read_owner(fd)
+                except (OSError, ValueError, UnicodeDecodeError):
+                    raise Refusal(f"torn timing lock: {lock_path}") from None
+                if owner is not None and pid_live(owner):
+                    raise Refusal(f"79-10: the C6 timing lock {lock_path} is held by live pid {owner}; second runner "
+                                  f"(result {result_path}) refused")
+                reason = "empty" if owner is None else "dead pid"
             os.lseek(fd, 0, os.SEEK_SET)
             os.ftruncate(fd, 0)
             os.write(fd, str(pid).encode("ascii"))
-            return {"recovered_from": owner}
+            return {"recovered_from": owner, "reason": reason}
         finally:
             _os_unlock(fd)
     finally:
@@ -355,14 +416,15 @@ def _release_lock(lock_path, pid):
 def timing_lock(result_path, lock_path=LOCK_PATH):
     """Context manager: the box-global C6 timing pid lock, independent of the result path (D-SLM8464's protocol, above).
     A live owner refuses a second runner whatever its result path (79-10); a dead owner's or an empty lock is
-    recovered, and the recovery is yielded for the row record ({"recovered_from", "acquired"})."""
+    recovered, and the recovery is yielded for the row record ({"recovered_from", "reason", "acquired"}; reason is
+    None for a fresh acquire, else "before the last boot", "dead pid" or "empty")."""
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     pid = os.getpid()
     held = None
     for _ in range(LOCK_ATTEMPTS):
         if _publish_lock(lock_path, pid):
-            held = {"recovered_from": None}
+            held = {"recovered_from": None, "reason": None}
             break
         held = _recover_lock(lock_path, pid, result_path)
         if held is not None:
@@ -453,11 +515,14 @@ def check_row_blob(manifest_path, model_path, restore):
     return blob, sha(manifest_path)
 
 
-def check_build_identity(identity_line):
-    """79-7: the production pair executable's identity line, checked once per process before timing; anything but
-    "PKV_PAIR_PRODUCTION_V2 defs=none" raises Refusal (exit code EXIT_CODES["seam"])."""
-    if (identity_line or "").strip() != IDENTITY:
-        raise Refusal(f"79-7: pair executable identity {identity_line!r}, {IDENTITY!r} owed", "seam")
+def check_build_identity(identity_line, construction="production"):
+    """79-7: the pair executable's identity line, checked once per process before timing. Anything but the
+    construction's own line (CONSTRUCTION_IDENTITY; production's is "PKV_PAIR_PRODUCTION_V2 defs=none") raises Refusal
+    (exit code EXIT_CODES["seam"]): a seam build, or an executable that is not the construction it was run as
+    (D-SLM8466 (2))."""
+    owed = CONSTRUCTION_IDENTITY[construction]
+    if (identity_line or "").strip() != owed:
+        raise Refusal(f"79-7: pair executable identity {identity_line!r}, {owed!r} owed for {construction}", "seam")
     return None
 
 
@@ -481,13 +546,14 @@ def grade_row(processes):
                        "median_of_medians": statistics.median(medians), "bar": BAR}}
 
 
-def parse_process_output(text):
+def parse_process_output(text, construction="production"):
     """The pair executable's stdout: the identity line, then PAIR lines, then IDS, and optionally a RESERVE line (the
     paged arm's scatter-reserve construction: `RESERVE seed=<s> singles=<n> source=<header>`). Returns (identity,
-    pairs, ids). The RESERVE fields are read by parse_reserve."""
+    pairs, ids). The RESERVE fields are read by parse_reserve. The identity line must be the construction's own (79-7);
+    a construction without a paged arm (MA-1, MA-2) that prints an IDS line is refused the same way (D-SLM8466 (1))."""
     lines = text.splitlines()
     identity = lines[0] if lines else ""
-    check_build_identity(identity)  # 79-7, before any pair is read
+    check_build_identity(identity, construction)  # 79-7, before any pair is read
     pairs, ids = [], None
     for line in lines[1:]:
         fields = line.split()
@@ -501,10 +567,17 @@ def parse_process_output(text):
             except ValueError:
                 raise Refusal(f"malformed pair line {line!r}", "pairs") from None  # T-3203 N-8: never a raw crash
         elif fields[0] == "IDS":
+            if construction not in PAGED_ARM:
+                raise Refusal(f"79-7: {construction} has no paged arm, and its pair executable printed a page-id line "
+                              f"{line[:80]!r}: it is not the construction it claims to be", "seam")
             try:
                 ids = [int(x) for x in fields[1:]]
             except ValueError:
                 raise Refusal(f"INFRASTRUCTURE: malformed IDS line {line[:200]!r}") from None
+    if construction in PAGED_ARM and not ids:
+        # the mirror of the MA rule (T-3204): a paged construction's guard grades its page ids, so an executable that
+        # reports none is not the construction it claims to be (before, the row stood as NO RESULT, "id lists differ")
+        raise Refusal(f"79-7: {construction} has a paged arm, and its pair executable printed no page ids", "seam")
     return identity, pairs, ids
 
 
@@ -554,7 +627,10 @@ def main(argv=None):
     parser.add_argument("--lock", type=Path, default=LOCK_PATH)
     parser.add_argument("--page-positions", type=int, default=64, choices=(64, 16))
     parser.add_argument("--construction", default="production", choices=tuple(CONSTRUCTIONS))
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
+    # D-SLM8466 (2): the exact command the row ran, in the row record
+    driver_argv = [sys.executable, str(Path(__file__).resolve())] + argv
     if args.aggregate:
         return aggregate_main(args)
     if args.runs is not None:
@@ -610,7 +686,7 @@ def main(argv=None):
                         print(f"process {k}: the pair executable exited {done.returncode}; rerun whole\n"
                               f"{done.stderr[-2000:]}", file=sys.stderr)
                         continue
-                    identity, pairs, ids = parse_process_output(done.stdout)  # 79-7
+                    identity, pairs, ids = parse_process_output(done.stdout, args.construction)  # 79-7
                     reserve = parse_reserve(done.stdout)
                     median = process_statistic(pairs)  # 79-9, 79-8
                     boot_after = last_boot()
@@ -624,7 +700,7 @@ def main(argv=None):
                           "blob_sha256": sha(blob), "manifest_sha256": manifest_sha,
                           "model_sha256": sha(args.model), "restore": args.restore, "attempts": attempts,
                           "page_positions": args.page_positions, "construction": args.construction,
-                          "exe": str(exe_path), "exe_sha256": exe_sha, "reserve": reserve}
+                          "argv": command, "exe": str(exe_path), "exe_sha256": exe_sha, "reserve": reserve}
                 write_record(process_path(k), record)
                 processes.append({"status": "ok", "median": median})
                 id_lists.append(ids or [])
@@ -635,14 +711,18 @@ def main(argv=None):
             # and source, as the pair executable reported it (null where it reports none). D-SLM8464: the lock's
             # acquisition and any recovery are recorded here, never in the lock file.
             row = {"slot": args.slot, "restore": args.restore, "page_positions": args.page_positions,
-                   "construction": args.construction,
+                   "construction": args.construction, "argv": driver_argv, "identity": identity,
                    "processes": [process_path(k).name for k in range(1, PROCESSES_PER_ROW + 1)],
-                   "lock_recovered_from": lock["recovered_from"], "lock_acquired": lock["acquired"],
+                   "lock_recovered_from": lock["recovered_from"], "lock_recovered_reason": lock["reason"],
+                   "lock_acquired": lock["acquired"],
                    "rule_verdict": graded["verdict"],
                    "status": "STANDING", "exe": str(exe_path), "exe_sha256": exe_sha,
                    "reserve": reserves[0] if all(r == reserves[0] for r in reserves) else reserves}
             row.update(graded["record"] or {})
-            if not id_lists_agree(id_lists):
+            if args.construction not in PAGED_ARM:
+                # D-SLM8466 (1): no paged arm, no page order to grade; the row rule alone decides
+                row.update(guard=GUARD_NOT_APPLICABLE)
+            elif not id_lists_agree(id_lists):
                 row.update(verdict="NO RESULT", reason="the five measured-holder id lists differ (construction defect)")
             else:
                 ids = id_lists[0]

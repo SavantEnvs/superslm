@@ -21,6 +21,28 @@ namespace {
 using namespace pkv;
 using namespace pkv::bc;
 using clock_type = std::chrono::steady_clock;
+// The identity line each cell 7.9 construction prints first on stdout (D-SLM8466 (2)), so the driver's records show
+// which construction ran without trusting its --construction label. tools/run_paged_kv_rows.py's CONSTRUCTION_IDENTITY
+// holds the same strings and refuses any other (79-7). Production and 7.9-MR-OPT are this source's row79, built as
+// superslm_pkv_pair and as superslm_pkv_pair_mr_opt (PKV_PAIR_MR_OPT, against the mutant library). MA-1 and MA-2 are the
+// commissioning seat's constructions (plan section 23.8, T7): one executable for both, which prints kIdentityMa1 or
+// kIdentityMa2 for the construction its command line selects, then PAIR lines only (no RESERVE, no IDS: it has no
+// paged arm). The driver's module docstring states the whole contract.
+constexpr const char* kIdentityProduction = "PKV_PAIR_PRODUCTION_V2 defs=none";
+constexpr const char* kIdentityProductionProbe = "PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE";
+constexpr const char* kIdentityMrOpt = "PKV_PAIR_MR_OPT_V1 defs=none";
+[[maybe_unused]] constexpr const char* kIdentityMa1 = "PKV_PAIR_MA1_V1 defs=none";
+[[maybe_unused]] constexpr const char* kIdentityMa2 = "PKV_PAIR_MA2_V1 defs=none";
+// This build's own identity: row79's first line, and the `identity` mode's output.
+const char* BuildIdentity(){
+#if defined(PKV_C6_IDENTITY_PROBE)
+	return kIdentityProductionProbe;
+#elif defined(PKV_PAIR_MR_OPT)
+	return kIdentityMrOpt;
+#else
+	return kIdentityProduction;
+#endif
+}
 
 void Require(bool okay, const std::string& why) { if (!okay || State().failures) throw std::runtime_error(why); }
 int Number(const char* s) { size_t at=0; int v=std::stoi(s,&at); Require(at==std::string(s).size(),"invalid integer"); return v; }
@@ -170,12 +192,8 @@ void Row79(int argc,char** argv){
 		const sslm_status status=sslm_decode_step(fx.model,batch,1,&p,nullptr,&token);
 		const double ns=std::chrono::duration<double,std::nano>(clock_type::now()-begin).count();
 		Require(status==SSLM_OK&&token>=0,"one-call token decode failed");return {ns,token};};
-	// identity first: the driver checks it before it reads any pair (79-7)
-#if defined(PKV_C6_IDENTITY_PROBE)
-	std::cout<<"PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE\n";
-#else
-	std::cout<<"PKV_PAIR_PRODUCTION_V2 defs=none\n";
-#endif
+	// identity first: the driver checks it against the construction before it reads any pair (79-7, D-SLM8466)
+	std::cout<<BuildIdentity()<<'\n';
 	// the reserve the paged holder's ids are drawn over (T-3202 F-11): the driver records it in every process and row
 	std::cout<<"RESERVE seed="<<kScatterReserveSeed<<" singles="<<singles<<" source=tests/paged-kv/pkv_scatter_reserve.h\n";
 	for(int i=0;i<warmup;++i){one(paged);one(contiguous);}
@@ -193,11 +211,7 @@ void Row79(int argc,char** argv){
 int main(int argc,char** argv){
 	try{Require(argc>=2,"mode required");const std::string mode=argv[1];
 		if(mode=="identity") {Require(argc==2,"identity argument count");
-#if defined(PKV_C6_IDENTITY_PROBE)
-			std::cout<<"PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE\n";
-#else
-			std::cout<<"PKV_PAIR_PRODUCTION_V2 defs=none\n";
-#endif
+			std::cout<<BuildIdentity()<<'\n';
 		}
 		else if(mode=="prefill")Prefill(argc,argv);else if(mode=="pair79")Pairs(argc,argv,false);else if(mode=="pair79b")Pairs(argc,argv,true);else if(mode=="row79")Row79(argc,argv);else throw std::runtime_error("unknown mode");
 		return 0;

@@ -31,16 +31,30 @@ $PkvC6TimingLock = 'D:\_scratch\SuperSLM\pkv-c6-timing.lock'
 # (run_paged_kv_rows.py's timing_lock and run_paged_kv_pairs.py's PidLock are the others). The file holds the owner's
 # bare decimal pid. A fresh acquire moves a temporary file holding the pid into place without replacing, so the lock is
 # never visible empty. An existing file is recovered only under an exclusive non-blocking OS lock on it (one byte at
-# offset 1 MiB, the same byte the Python legs lock), then a pid liveness check (a live pid refuses), then an overwrite
-# with this pid; an empty file is stale, so a lock left empty by a crash recovers. A release removes the file when it
-# still holds this pid and never truncates it.
+# offset 1 MiB, the same byte the Python legs lock). Then a file modified before the system's last boot is stale
+# whatever pid it holds, since that pid may now name an unrelated process (D-SLM8466 (3)); otherwise a pid liveness
+# check (a live pid refuses). Then an overwrite with this pid. An empty file is stale, so a lock left empty by a crash
+# recovers. A release removes the file when it still holds this pid and never truncates it. A sharing conflict on the
+# recovery open (another process holding the file without write sharing) is retried, and refused by name when every
+# attempt meets one (T-3204 O-3).
 $PkvC6LockByte = 1048576
+$PkvC6LockAttempts = 3
+
+# The system's last boot (UTC): now less the uptime, as the Python legs read it (GetTickCount64, which counts sleep and
+# hibernation). [Environment]::TickCount64 needs PowerShell 7; Windows PowerShell falls back to the CIM boot time.
+function Get-PkvBootTimeUtc {
+    $ticks = $null
+    try { $ticks = [Environment]::TickCount64 } catch { $ticks = $null }
+    if ($null -ne $ticks) { return [DateTime]::UtcNow.AddMilliseconds(-[double]$ticks) }
+    return (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime()
+}
 
 function Enter-PkvTimingLock {
     param([string]$Path = $PkvC6TimingLock)
     $parent = Split-Path -Parent $Path
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
-    for ($attempt = 0; $attempt -lt 3; ++$attempt) {
+    $sharing = 0
+    for ($attempt = 0; $attempt -lt $PkvC6LockAttempts; ++$attempt) {
         $temp = "$Path.$PID.new"
         [IO.File]::WriteAllBytes($temp, [Text.Encoding]::ASCII.GetBytes("$PID"))
         try {
@@ -55,6 +69,11 @@ function Enter-PkvTimingLock {
             $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
         } catch [IO.FileNotFoundException], [UnauthorizedAccessException] {
             continue
+        } catch [IO.IOException] {
+            # a sharing conflict: another process has the file open without write sharing; retry shortly
+            ++$sharing
+            Start-Sleep -Milliseconds 50
+            continue
         }
         try {
             try { $stream.Lock($PkvC6LockByte, 1) }
@@ -62,12 +81,13 @@ function Enter-PkvTimingLock {
             try {
                 # Windows refuses to delete a file this stream holds open (no delete sharing), so the path still
                 # names this file.
+                $stale = [IO.File]::GetLastWriteTimeUtc($Path) -lt (Get-PkvBootTimeUtc)
                 $buffer = New-Object byte[] 4096
                 $read = $stream.Read($buffer, 0, $buffer.Length)
                 $text = [Text.Encoding]::ASCII.GetString($buffer, 0, $read).Trim()
-                if ($text) {
-                    $owner = 0
-                    if (-not [int]::TryParse($text, [ref]$owner)) { throw "torn C6 timing lock: $Path" }
+                if ($text -and -not $stale) {
+                    if ($text -notmatch '^[0-9]+$') { throw "torn C6 timing lock: $Path" }
+                    $owner = [int]$text
                     if (Get-Process -Id $owner -ErrorAction SilentlyContinue) { throw "second C6 timing runner refused: pid $owner" }
                 }
                 $bytes = [Text.Encoding]::ASCII.GetBytes("$PID")
@@ -78,6 +98,9 @@ function Enter-PkvTimingLock {
                 return $Path
             } finally { $stream.Unlock($PkvC6LockByte, 1) }
         } finally { $stream.Dispose() }
+    }
+    if ($sharing -eq $PkvC6LockAttempts) {
+        throw "second C6 timing runner refused: $Path was held open by another process (a sharing conflict) in each of $PkvC6LockAttempts attempts"
     }
     throw "cannot acquire C6 timing lock: $Path"
 }
