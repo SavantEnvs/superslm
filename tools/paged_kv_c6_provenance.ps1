@@ -27,33 +27,69 @@ $PkvC6RecordSchema = 'pkv-c6-leg/4'
 $PkvC6RecordKeys = @('Schema', 'Leg', 'Head', 'BinarySha256', 'SourceManifestSha256', 'Inputs', 'Commissioned', 'AssertEnv', 'HookState')
 $PkvC6TimingLock = 'D:\_scratch\SuperSLM\pkv-c6-timing.lock'
 
+# The box timing lock (D-SLM8464): one format and one protocol in every program that takes it
+# (run_paged_kv_rows.py's timing_lock and run_paged_kv_pairs.py's PidLock are the others). The file holds the owner's
+# bare decimal pid. A fresh acquire moves a temporary file holding the pid into place without replacing, so the lock is
+# never visible empty. An existing file is recovered only under an exclusive non-blocking OS lock on it (one byte at
+# offset 1 MiB, the same byte the Python legs lock), then a pid liveness check (a live pid refuses), then an overwrite
+# with this pid; an empty file is stale, so a lock left empty by a crash recovers. A release removes the file when it
+# still holds this pid and never truncates it.
+$PkvC6LockByte = 1048576
+
 function Enter-PkvTimingLock {
     param([string]$Path = $PkvC6TimingLock)
     $parent = Split-Path -Parent $Path
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
     for ($attempt = 0; $attempt -lt 3; ++$attempt) {
+        $temp = "$Path.$PID.new"
+        [IO.File]::WriteAllBytes($temp, [Text.Encoding]::ASCII.GetBytes("$PID"))
         try {
-            $file = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-            try {
-                $bytes = [Text.Encoding]::ASCII.GetBytes("$PID")
-                $file.Write($bytes, 0, $bytes.Length)
-            } finally { $file.Dispose() }
+            [IO.File]::Move($temp, $Path)   # no overwrite: fails when the lock exists
             return $Path
-        } catch [IO.IOException] {
-            if (-not (Test-Path -LiteralPath $Path)) { continue }
-            $owner = 0
-            if (-not [int]::TryParse((Get-Content -LiteralPath $Path -Raw).Trim(), [ref]$owner)) { throw "torn C6 timing lock: $Path" }
-            if (Get-Process -Id $owner -ErrorAction SilentlyContinue) { throw "second C6 timing runner refused: pid $owner" }
-            Remove-Item -LiteralPath $Path -Force
+        } catch [IO.IOException], [UnauthorizedAccessException] {
+            # an existing (or deleting) lock: recover it below
+        } finally {
+            if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
         }
+        try {
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+        } catch [IO.FileNotFoundException], [UnauthorizedAccessException] {
+            continue
+        }
+        try {
+            try { $stream.Lock($PkvC6LockByte, 1) }
+            catch [IO.IOException] { throw "second C6 timing runner refused: $Path is being recovered by another runner" }
+            try {
+                # Windows refuses to delete a file this stream holds open (no delete sharing), so the path still
+                # names this file.
+                $buffer = New-Object byte[] 4096
+                $read = $stream.Read($buffer, 0, $buffer.Length)
+                $text = [Text.Encoding]::ASCII.GetString($buffer, 0, $read).Trim()
+                if ($text) {
+                    $owner = 0
+                    if (-not [int]::TryParse($text, [ref]$owner)) { throw "torn C6 timing lock: $Path" }
+                    if (Get-Process -Id $owner -ErrorAction SilentlyContinue) { throw "second C6 timing runner refused: pid $owner" }
+                }
+                $bytes = [Text.Encoding]::ASCII.GetBytes("$PID")
+                $stream.SetLength(0)
+                $stream.Position = 0
+                $stream.Write($bytes, 0, $bytes.Length)
+                $stream.Flush()
+                return $Path
+            } finally { $stream.Unlock($PkvC6LockByte, 1) }
+        } finally { $stream.Dispose() }
     }
     throw "cannot acquire C6 timing lock: $Path"
 }
 
 function Exit-PkvTimingLock {
     param([string]$Path)
-    if ((Test-Path -LiteralPath $Path) -and (Get-Content -LiteralPath $Path -Raw).Trim() -eq "$PID") {
-        Remove-Item -LiteralPath $Path -Force
+    try {
+        if ([IO.File]::Exists($Path) -and ([IO.File]::ReadAllText($Path)).Trim() -eq "$PID") {
+            [IO.File]::Delete($Path)
+        }
+    } catch [IO.IOException], [UnauthorizedAccessException] {
+        # a reader holds it open: it keeps this pid, stale once this process exits
     }
 }
 

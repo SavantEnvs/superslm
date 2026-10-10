@@ -81,26 +81,111 @@ def live_load_state(record: Path) -> dict:
     return state
 
 
+_LOCK_BYTE = 1 << 20
+
+
+def _os_lock(fd: int) -> bool:
+    """The exclusive, non-blocking OS byte lock on `fd`, one byte far past any content; False when another process
+    holds it. The OS releases it when the holder exits, however it exits."""
+    os.lseek(fd, _LOCK_BYTE, os.SEEK_SET)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, _LOCK_BYTE)
+        return True
+    except OSError:
+        return False
+
+
+def _os_unlock(fd: int) -> None:
+    os.lseek(fd, _LOCK_BYTE, os.SEEK_SET)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.lockf(fd, fcntl.LOCK_UN, 1, _LOCK_BYTE)
+    except OSError:
+        pass
+
+
 class PidLock:
+    """The pid lock: the file holds the owner's bare decimal pid. D-SLM8464 gives the box timing lock one format and one
+    protocol in every program that takes it (run_paged_kv_rows.py's timing_lock and paged_kv_c6_provenance.ps1's
+    Enter-PkvTimingLock are the others): a fresh acquire moves a temporary file holding the pid into place without
+    replacing, so the lock is never visible empty; an existing file is recovered only under an exclusive non-blocking OS
+    lock on it, then a pid liveness check (a live pid refuses), then an overwrite with this pid, and an empty file is
+    stale; a release unlinks the file when it still holds this pid and never truncates it."""
+
+    ATTEMPTS = 3
+
     def __init__(self, path: Path):
-        self.path = path
-    def __enter__(self):
-        while True:
+        self.path = Path(path)
+
+    def _publish(self, pid: int) -> bool:
+        temp = self.path.with_name(f"{self.path.name}.{pid}.new")
+        temp.write_bytes(str(pid).encode("ascii"))
+        try:
+            if os.name == "nt":
+                os.rename(temp, self.path)  # MoveFileEx without MOVEFILE_REPLACE_EXISTING: fails when the lock exists
+            else:
+                os.link(temp, self.path)  # fails when the lock exists
+            return True
+        except (FileExistsError, PermissionError):
+            return False
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def _recover(self, pid: int) -> bool:
+        try:
+            fd = os.open(self.path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+        except (FileNotFoundError, PermissionError):
+            return False  # gone (or going): retry the fresh acquire
+        try:
+            if not _os_lock(fd):
+                raise Refusal(f"second runner refused: {self.path} is being recovered by another runner")
             try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                with os.fdopen(fd, "w") as out:
-                    out.write(str(os.getpid()))
-                return self
-            except FileExistsError:
                 try:
-                    owner = int(self.path.read_text())
-                except (OSError, ValueError):
-                    raise Refusal(f"torn pid lock: {self.path}") from None
-                if pid_live(owner):
-                    raise Refusal(f"second runner refused: pid {owner}")
-                self.path.unlink(missing_ok=True)
+                    if not os.path.samestat(os.fstat(fd), os.stat(self.path)):
+                        return False  # released and replaced after this open
+                except FileNotFoundError:
+                    return False
+                os.lseek(fd, 0, os.SEEK_SET)
+                text = os.read(fd, 4096).decode("ascii", "replace").strip()
+                if text:
+                    try:
+                        owner = int(text)
+                    except ValueError:
+                        raise Refusal(f"torn pid lock: {self.path}") from None
+                    if pid_live(owner):
+                        raise Refusal(f"second runner refused: pid {owner}")
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.ftruncate(fd, 0)
+                os.write(fd, str(pid).encode("ascii"))
+                return True
+            finally:
+                _os_unlock(fd)
+        finally:
+            os.close(fd)
+
+    def __enter__(self):
+        pid = os.getpid()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for _ in range(self.ATTEMPTS):
+            if self._publish(pid) or self._recover(pid):
+                return self
+        raise Refusal(f"second runner refused: {self.path} could not be acquired in {self.ATTEMPTS} attempts")
+
     def __exit__(self, *_):
-        self.path.unlink(missing_ok=True)
+        try:
+            if self.path.read_bytes().strip() == str(os.getpid()).encode("ascii"):
+                self.path.unlink()
+        except OSError:
+            pass  # a reader holds it open: it keeps this pid, stale once this process exits
 
 
 def production_library(exe: Path) -> tuple[str, str]:
@@ -328,6 +413,9 @@ def grade(values: list[float]) -> dict:
             "bar": "PASS" if hi <= .05 else "FAIL" if lo > .05 else "NO RESULT"}
 
 
+RUN_LIST_SLOTS = {"79b": "R3"}
+
+
 def read_result(path: Path, expected: dict) -> dict | None:
     record = load_record(path)
     if record is None or any(record.get(key) != value for key, value in expected.items()):
@@ -396,7 +484,11 @@ def run(args) -> dict:
                 load_qualified = False
     load_sha = sha(load_record) if load_record else None
     standing = receipt_bound and load_qualified
-    expected = {"kind": args.kind, "exe_sha256": exe_sha, "library_sha256": lib_sha,
+    # D-SLM8465: every pair-row record names its run-list slot; the 7.9b leg is row R3 (the 7.9 kind has no row of its
+    # own: the five-process driver, run_paged_kv_rows.py, grades 7.9's rows). In `expected` too, so an earlier record
+    # without its slot is rerun rather than reused.
+    slot = RUN_LIST_SLOTS.get(args.kind)
+    expected = {"kind": args.kind, "slot": slot, "exe_sha256": exe_sha, "library_sha256": lib_sha,
                 "source_manifest_sha256": source_manifest_sha,
                 "model_hashes": model_hashes, "manifest_hashes": manifest_hashes,
                 "pair_count": args.pairs, "seed": seed, "hook": hook, "load_sha256": load_sha,
@@ -454,7 +546,7 @@ def run(args) -> dict:
             stats["status"] = "MECHANISM_ONLY"
         elif standing:
             stats["status"] = "STANDING"
-        record = {"kind": args.kind, "complete": True, "exe_sha256": exe_sha, "library_sha256": lib_sha,
+        record = {"kind": args.kind, "slot": slot, "complete": True, "exe_sha256": exe_sha, "library_sha256": lib_sha,
                   "source_manifest_sha256": source_manifest_sha,
                   "model_hashes": model_hashes, "manifest_hashes": manifest_hashes,
                   "token_sha256": token_sha, "pairs_sha256": sha(pairs_file), "seed": seed,

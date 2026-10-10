@@ -7,18 +7,32 @@ the row rule: PASS when the largest of the five process medians is <= 0.05, FAIL
 NO RESULT otherwise. A row is graded only on five complete processes, only when their five measured-holder id
 lists agree, and only when the scatter guard admits those ids (M <= M99(n, P) at the n read after the run).
 
-Every refusal under the per-process rule has its own exit code, writes no record for the refused process and no
-row record, and leaves the row ungraded: 79-6 a blob or manifest mismatch (checked before each process restores
-the blob), 79-7 a seam-library pair executable (its identity line, checked once per process before any pair is
-read), 79-8 a token mismatch between the arms, 79-9 a process with other than 104 timed pairs. A process whose
-boot changed, or whose pair executable crashed, is discarded and rerun whole. The box-global C6 timing lock is
-held from the first process until the row record is published.
+Every refusal under the per-process rule has its own exit code, writes no record for the refused process, and leaves
+the row ungraded: 79-6 a blob or manifest mismatch (checked before each process restores the blob), 79-7 a
+seam-library pair executable (its identity line, checked once per process before any pair is read), 79-8 a token
+mismatch between the arms, 79-9 a process with other than 104 timed pairs. A refused row writes no row record at a
+fresh result path; where an earlier run's record already stands at that path, the refusal replaces it with a REFUSED
+record carrying the exit code and no verdict, so a refused run never leaves an earlier verdict standing there (T-3202
+F-12, D-SLM8461). Any other failure of the driver (an unparseable pair executable output, a driver fault) refuses
+the same way with EXIT_INFRASTRUCTURE, never as a raw crash (T-3203 N-8). A process whose boot changed, or whose pair
+executable crashed, is discarded and rerun whole. The box-global C6 timing lock (one format and protocol with the
+other legs that take it, D-SLM8464; see timing_lock) is held from the first process until the row record is published.
 
-Command line (main):
+Command lines (main):
     run_paged_kv_rows.py --pair-cmd JSON --manifest M --model F --restore N --slot S --result R
-                         [--lock L] [--page-positions 64|16]
---page-positions selects the guard's bound table: 64 for the production rows, 16 for 7.9-MR-OPT's (slot R79MR,
-whose rows are R2b, R4a and R4b; pass the row as --slot and --page-positions 16).
+                         [--lock L] [--page-positions 64|16] [--construction C]
+    run_paged_kv_rows.py --aggregate --slot R79A|R79MR --runs RECORD [RECORD ...] --result R
+--page-positions selects the guard's bound table: 64 for the production rows, 16 for 7.9-MR-OPT's (pass the row as
+--slot). --construction names what the row's pair command builds: production (the default), MA-1, MA-2 or 7.9-MR-OPT;
+it is recorded in the row record, and 7.9-MR-OPT runs at --page-positions 16, every other construction at 64.
+
+The aggregate mode (D-SLM8463) writes the slot record of R79A or R79MR, which run several constructions: one
+result.json with `slot`, `runs` (each run's row, construction, status, verdict, exe_sha256 and record path),
+`status` (STANDING only when every run is STANDING, REFUSED otherwise) and `exe_sha256`. It refuses, writing no
+aggregate (and superseding an existing record at R as above), when the runs' exe_sha256 differ or when the runs are
+not exactly the slot's set: R79A is MA-1 at R2b, R4a and R4b plus MA-2 at R4a; R79MR is 7.9-MR-OPT at R2b, R4a and
+R4b. The construction label is the run's command line's: the driver checks it against the page positions, and
+nothing in the pair executable's output tells MA-1 from MA-2.
 """
 
 from __future__ import annotations
@@ -37,6 +51,7 @@ import statistics
 import subprocess
 import sys
 import time
+import traceback
 
 
 class Refusal(RuntimeError):
@@ -54,15 +69,27 @@ WARMUP_TOKENS = 4
 BAR = 0.05
 LOCK_PATH = Path(r"D:\_scratch\SuperSLM\pkv-c6-timing.lock")
 
-# Rev 16.23 (T-3189 G-4): each refusal under the per-process rule has its own exit code, writes no timing record and
-# leaves the row ungraded: 79-6 a blob or manifest mismatch, 79-7 a seam-library build, 79-8 a token mismatch, 79-9 a
-# process with other than 104 timed pairs.
+# Rev 16.23 (T-3189 G-4): each refusal under the per-process rule has its own exit code, writes no record for the
+# refused process and leaves the row ungraded: 79-6 a blob or manifest mismatch, 79-7 a seam-library build, 79-8 a
+# token mismatch, 79-9 a process with other than 104 timed pairs (and a PAIR line that does not parse).
 EXIT_CODES = {"blob": 61, "seam": 62, "token": 63, "pairs": 64}
-# Not a per-process refusal: the row cannot run at all (bad arguments, the lock held by a live owner, a process that
-# crashed or changed boot more than RERUN_LIMIT times, a guard input outside the table). No record is written.
+# Not a per-process refusal: the row cannot run at all (the lock held by a live owner, a process that crashed or
+# changed boot more than RERUN_LIMIT times, a guard input outside the table, an IDS or RESERVE line that does not parse,
+# a driver fault), or an aggregate refused. Bad arguments are refused before anything is touched and write nothing.
+# Every other refusal writes no record at a fresh result path and replaces an existing one with a REFUSED record
+# (supersede_refused; T-3202 F-12, D-SLM8461).
 EXIT_INFRASTRUCTURE = 70
 RERUN_LIMIT = 3
 PROCESS_CAP_SECONDS = 3600
+
+# What a row's pair command builds (--construction), with the page positions it runs at (plan §23.8 commissioning:
+# MA-1 and MA-2 on the option arm at B = 64, 7.9-MR-OPT at B = 16).
+CONSTRUCTIONS = {"production": 64, "MA-1": 64, "MA-2": 64, "7.9-MR-OPT": 16}
+# D-SLM8463: each aggregate slot's exact set of (construction, row) runs.
+AGGREGATE_SLOTS = {
+    "R79A": (("MA-1", "R2b"), ("MA-1", "R4a"), ("MA-1", "R4b"), ("MA-2", "R4a")),
+    "R79MR": (("7.9-MR-OPT", "R2b"), ("7.9-MR-OPT", "R4a"), ("7.9-MR-OPT", "R4b")),
+}
 
 # Cell 7.9's tables (rev 16.21; probes/scatter_guard.py): slot -> {"n": mapped pages after the run, "P": pool pages,
 # "m99": the guard bound}, at B = 64.
@@ -196,20 +223,19 @@ def pid_live(pid):
         return False
 
 
-def _lock_owner(lock_path):
-    text = lock_path.read_text(encoding="utf-8").strip()
-    try:
-        value = json.loads(text)
-    except ValueError:
-        value = text
-    if isinstance(value, dict):
-        value = value.get("pid")
-    return int(value)
-
-
-# The OS lock that makes recovery atomic (T-3202 F-9): one byte far past any content, so a reader of the pid content
-# (run_paged_kv_pairs.py's PidLock, the 7.4 and lifecycle legs) is never blocked by it.
+# The box timing lock (D-SLM8464). One format, shared with run_paged_kv_pairs.py's PidLock and
+# paged_kv_c6_provenance.ps1's Enter-PkvTimingLock: the file holds the owner's bare decimal pid and nothing else (the
+# driver's own fields, such as the recovery, go into its row record). One protocol in all three programs:
+#   - a fresh acquire writes the pid to a temporary file and moves it into place without replacing, so the lock file is
+#     never visible empty or half-written;
+#   - a file that already exists is recovered only under an exclusive non-blocking OS lock on it, then a pid liveness
+#     check (any live pid refuses, the caller's own included), then an overwrite with the new owner's pid; an empty file
+#     is stale, so a lock left empty by a crash recovers;
+#   - a release unlinks the file when it still holds the releaser's pid, and never truncates it. A reader holding the
+#     file open at the release instant leaves the releaser's pid in place, which is stale once the releaser exits.
+# The OS lock is one byte far past any content, so a plain reader of the pid is never blocked by it.
 _LOCK_BYTE = 1 << 20
+LOCK_ATTEMPTS = 3
 
 
 def _os_lock(fd):
@@ -242,8 +268,8 @@ def _os_unlock(fd):
 
 
 def _read_owner(fd):
-    """The pid the lock's content names, None when the content is empty (a fresh or released file); raises ValueError
-    on content that is neither a pid nor a {"pid": ...} object."""
+    """The pid the lock's content names, None when the content is empty (stale). Reads the bare pid every leg writes,
+    and a {"pid": ...} object a driver before D-SLM8464 left; raises ValueError on anything else."""
     os.lseek(fd, 0, os.SEEK_SET)
     chunks = []
     while True:
@@ -260,54 +286,95 @@ def _read_owner(fd):
         value = text
     if isinstance(value, dict):
         value = value.get("pid")
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"lock content {text[:60]!r}")
     return int(value)
+
+
+def _publish_lock(lock_path, pid):
+    """Create `lock_path` holding `pid`, only when no lock file exists: True when this call created it."""
+    temp = lock_path.with_name(f"{lock_path.name}.{pid}.new")
+    temp.write_bytes(str(pid).encode("ascii"))
+    try:
+        if os.name == "nt":
+            os.rename(temp, lock_path)  # MoveFileEx without MOVEFILE_REPLACE_EXISTING: fails when the lock exists
+        else:
+            os.link(temp, lock_path)  # fails when the lock exists
+        return True
+    except (FileExistsError, PermissionError):
+        return False  # an existing (or deleting) lock file: recover it, or retry
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _recover_lock(lock_path, pid, result_path):
+    """Recover an existing lock file for `pid`: under the OS lock, a live owner refuses, and an empty or dead owner's
+    file is overwritten with `pid`. Returns {"recovered_from": the stale pid or None when the file was empty}, or None
+    when the file went away first (retry the fresh acquire)."""
+    try:
+        fd = os.open(lock_path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    except (FileNotFoundError, PermissionError):
+        return None
+    try:
+        if not _os_lock(fd):
+            raise Refusal(f"79-10: the C6 timing lock {lock_path} is being recovered by another runner; second runner "
+                          f"(result {result_path}) refused")
+        try:
+            try:
+                if not os.path.samestat(os.fstat(fd), os.stat(lock_path)):
+                    return None  # released and replaced after this open
+            except FileNotFoundError:
+                return None
+            try:
+                owner = _read_owner(fd)
+            except (OSError, ValueError, TypeError, UnicodeDecodeError):
+                raise Refusal(f"torn timing lock: {lock_path}") from None
+            if owner is not None and pid_live(owner):
+                raise Refusal(f"79-10: the C6 timing lock {lock_path} is held by live pid {owner}; second runner "
+                              f"(result {result_path}) refused")
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, str(pid).encode("ascii"))
+            return {"recovered_from": owner}
+        finally:
+            _os_unlock(fd)
+    finally:
+        os.close(fd)
+
+
+def _release_lock(lock_path, pid):
+    """Unlink the lock when it still holds `pid`; never truncate it. A file another process holds open keeps `pid`."""
+    try:
+        if lock_path.read_bytes().strip() == str(pid).encode("ascii"):
+            lock_path.unlink()
+    except OSError:
+        pass
 
 
 @contextlib.contextmanager
 def timing_lock(result_path, lock_path=LOCK_PATH):
-    """Context manager: the box-global C6 timing pid lock, independent of the result path. A live owner refuses a
-    second runner whatever its result path (79-10); a dead owner's lock is recovered, and the recovery recorded.
-
-    Recovery is atomic (T-3202 F-9): every runner opens the lock file and takes an exclusive OS byte lock on it before
-    it reads the owner, so of two runners that both find the same dead owner, exactly one holds the OS lock; the other
-    is refused. Only the OS-lock holder may judge the recorded owner dead and overwrite it. The pid content stays for
-    the legs that lock by exclusive create (run_paged_kv_pairs.py's PidLock): they see the file and its live pid."""
+    """Context manager: the box-global C6 timing pid lock, independent of the result path (D-SLM8464's protocol, above).
+    A live owner refuses a second runner whatever its result path (79-10); a dead owner's or an empty lock is
+    recovered, and the recovery is yielded for the row record ({"recovered_from", "acquired"})."""
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
-    if not _os_lock(fd):
-        os.close(fd)
-        raise Refusal(f"79-10: the C6 timing lock {lock_path} is held by a live runner; second runner "
-                      f"(result {result_path}) refused")
+    pid = os.getpid()
+    held = None
+    for _ in range(LOCK_ATTEMPTS):
+        if _publish_lock(lock_path, pid):
+            held = {"recovered_from": None}
+            break
+        held = _recover_lock(lock_path, pid, result_path)
+        if held is not None:
+            break
+    if held is None:
+        raise Refusal(f"79-10: the C6 timing lock {lock_path} could not be acquired in {LOCK_ATTEMPTS} attempts; "
+                      f"runner (result {result_path}) refused")
+    held["acquired"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     try:
-        try:
-            owner = _read_owner(fd)
-        except (OSError, ValueError, TypeError, UnicodeDecodeError):
-            raise Refusal(f"torn timing lock: {lock_path}") from None
-        if owner is not None and owner != os.getpid() and pid_live(owner):
-            raise Refusal(f"79-10: the C6 timing lock {lock_path} is held by live pid {owner}; second runner "
-                          f"(result {result_path}) refused")
-        recovered = owner if owner is not None and owner != os.getpid() else None
-        content = json.dumps({"pid": os.getpid(), "result": str(result_path), "recovered_from": recovered,
-                              "acquired": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}).encode("utf-8")
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.ftruncate(fd, 0)
-        os.write(fd, content)
-    except BaseException:
-        _os_unlock(fd)
-        os.close(fd)
-        raise
-    try:
-        yield {"recovered_from": recovered}
+        yield held
     finally:
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.ftruncate(fd, 0)
-        _os_unlock(fd)
-        os.close(fd)
-        try:
-            lock_path.unlink()
-        except OSError:
-            pass  # another runner has it open; its content is empty or its own
+        _release_lock(lock_path, pid)
 
 
 # ---- records -----------------------------------------------------------------------------------------------------
@@ -429,23 +496,33 @@ def parse_process_output(text):
         if fields[0] == "PAIR":
             if len(fields) != 5:
                 raise Refusal(f"malformed pair line {line!r}", "pairs")
-            pairs.append((float(fields[1]), float(fields[2]), int(fields[3]), int(fields[4])))
+            try:
+                pairs.append((float(fields[1]), float(fields[2]), int(fields[3]), int(fields[4])))
+            except ValueError:
+                raise Refusal(f"malformed pair line {line!r}", "pairs") from None  # T-3203 N-8: never a raw crash
         elif fields[0] == "IDS":
-            ids = [int(x) for x in fields[1:]]
+            try:
+                ids = [int(x) for x in fields[1:]]
+            except ValueError:
+                raise Refusal(f"INFRASTRUCTURE: malformed IDS line {line[:200]!r}") from None
     return identity, pairs, ids
 
 
 def parse_reserve(text):
     """The RESERVE line's fields ({"seed", "singles", "source"}), or None when the pair executable reports none
-    (T-3202 F-11: every 7.9 verdict is measured over one reserve permutation, and the records name it)."""
+    (T-3202 F-11: every 7.9 verdict is measured over one reserve permutation, and the records name it). A RESERVE line
+    whose seed or singles is not an integer raises Refusal (EXIT_INFRASTRUCTURE; T-3203 N-8)."""
     for line in text.splitlines():
         fields = line.split()
         if fields and fields[0] == "RESERVE":
             out = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
-            if "seed" in out:
-                out["seed"] = int(out["seed"])
-            if "singles" in out:
-                out["singles"] = int(out["singles"])
+            try:
+                if "seed" in out:
+                    out["seed"] = int(out["seed"])
+                if "singles" in out:
+                    out["singles"] = int(out["singles"])
+            except ValueError:
+                raise Refusal(f"INFRASTRUCTURE: malformed RESERVE line {line[:200]!r}") from None
             return out
     return None
 
@@ -462,18 +539,32 @@ def pair_executable(pair_cmd):
 
 
 def main(argv=None):
-    """The process loop, cell 7.9's driver, as a command (rev 16.23 G-4; T-3196 F-6). See the module docstring.
-    Returns the exit code, 0 for a graded row (its verdict PASS, FAIL or NO RESULT is in the row record)."""
+    """The process loop, cell 7.9's driver, as a command (rev 16.23 G-4; T-3196 F-6), and its aggregate mode
+    (D-SLM8463). See the module docstring. Returns the exit code: 0 for a graded row (its verdict PASS, FAIL or NO
+    RESULT is in the row record) and for a STANDING aggregate."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--pair-cmd", required=True, help="JSON list: the pair executable's command line")
-    parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--model", required=True, type=Path)
-    parser.add_argument("--restore", required=True, type=int)
+    parser.add_argument("--aggregate", action="store_true", help="write R79A's or R79MR's slot record from --runs")
+    parser.add_argument("--runs", nargs="+", type=Path, help="--aggregate: the row records the slot covers")
+    parser.add_argument("--pair-cmd", help="JSON list: the pair executable's command line")
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--model", type=Path)
+    parser.add_argument("--restore", type=int)
     parser.add_argument("--slot", required=True)
     parser.add_argument("--result", required=True, type=Path)
     parser.add_argument("--lock", type=Path, default=LOCK_PATH)
     parser.add_argument("--page-positions", type=int, default=64, choices=(64, 16))
+    parser.add_argument("--construction", default="production", choices=tuple(CONSTRUCTIONS))
     args = parser.parse_args(argv)
+    if args.aggregate:
+        return aggregate_main(args)
+    if args.runs is not None:
+        print("INFRASTRUCTURE: --runs is for --aggregate", file=sys.stderr)
+        return EXIT_INFRASTRUCTURE
+    missing = [name for name in ("pair_cmd", "manifest", "model", "restore") if getattr(args, name) is None]
+    if missing:
+        print(f"INFRASTRUCTURE: a row run needs {', '.join('--' + m.replace('_', '-') for m in missing)}",
+              file=sys.stderr)
+        return EXIT_INFRASTRUCTURE
     try:
         pair_cmd = json.loads(args.pair_cmd)
         if not isinstance(pair_cmd, list) or not pair_cmd or not all(isinstance(x, str) for x in pair_cmd):
@@ -484,6 +575,10 @@ def main(argv=None):
     result = args.result
     if args.slot not in _table(args.page_positions):
         print(f"INFRASTRUCTURE: slot {args.slot} has no row at B = {args.page_positions}", file=sys.stderr)
+        return EXIT_INFRASTRUCTURE
+    if CONSTRUCTIONS[args.construction] != args.page_positions:
+        print(f"INFRASTRUCTURE: construction {args.construction} runs at --page-positions "
+              f"{CONSTRUCTIONS[args.construction]}, not {args.page_positions}", file=sys.stderr)
         return EXIT_INFRASTRUCTURE
     stem = result.with_suffix("")
     process_path = lambda k: stem.with_name(f"{stem.name}.p{k}.json")  # noqa: E731
@@ -528,8 +623,8 @@ def main(argv=None):
                           "pairs": [list(p) for p in pairs], "ids": ids, "identity": identity, "boot": boot_before,
                           "blob_sha256": sha(blob), "manifest_sha256": manifest_sha,
                           "model_sha256": sha(args.model), "restore": args.restore, "attempts": attempts,
-                          "page_positions": args.page_positions, "exe": str(exe_path), "exe_sha256": exe_sha,
-                          "reserve": reserve}
+                          "page_positions": args.page_positions, "construction": args.construction,
+                          "exe": str(exe_path), "exe_sha256": exe_sha, "reserve": reserve}
                 write_record(process_path(k), record)
                 processes.append({"status": "ok", "median": median})
                 id_lists.append(ids or [])
@@ -537,10 +632,13 @@ def main(argv=None):
             graded = grade_row(processes)
             # D-SLM8461: STANDING exactly when the driver finished the row and wrote a verdict (PASS, FAIL or NO
             # RESULT); the verdict stays its own field. T-3202 F-11: the reserve the ids were read over, with its seed
-            # and source, as the pair executable reported it (null where it reports none).
+            # and source, as the pair executable reported it (null where it reports none). D-SLM8464: the lock's
+            # acquisition and any recovery are recorded here, never in the lock file.
             row = {"slot": args.slot, "restore": args.restore, "page_positions": args.page_positions,
+                   "construction": args.construction,
                    "processes": [process_path(k).name for k in range(1, PROCESSES_PER_ROW + 1)],
-                   "lock_recovered_from": lock["recovered_from"], "rule_verdict": graded["verdict"],
+                   "lock_recovered_from": lock["recovered_from"], "lock_acquired": lock["acquired"],
+                   "rule_verdict": graded["verdict"],
                    "status": "STANDING", "exe": str(exe_path), "exe_sha256": exe_sha,
                    "reserve": reserves[0] if all(r == reserves[0] for r in reserves) else reserves}
             row.update(graded["record"] or {})
@@ -559,19 +657,80 @@ def main(argv=None):
     except Refusal as refusal:
         print(f"REFUSED: {refusal}", file=sys.stderr)
         code = EXIT_CODES.get(refusal.kind, EXIT_INFRASTRUCTURE)
-        supersede_refused(result, args.slot, code, str(refusal), exe_path, exe_sha)
+        supersede_refused(result, args.slot, code, str(refusal), exe_path, exe_sha, args.construction,
+                          args.page_positions)
         return code
+    except Exception as fault:  # T-3203 N-8: a driver fault refuses through the driver's own code, never a raw crash
+        traceback.print_exc()
+        reason = f"INFRASTRUCTURE: driver fault {type(fault).__name__}: {fault}"
+        print(f"REFUSED: {reason}", file=sys.stderr)
+        supersede_refused(result, args.slot, EXIT_INFRASTRUCTURE, reason, exe_path, exe_sha, args.construction,
+                          args.page_positions)
+        return EXIT_INFRASTRUCTURE
 
 
-def supersede_refused(result, slot, code, reason, exe_path, exe_sha):
+def supersede_refused(result, slot, code, reason, exe_path, exe_sha, construction=None, page_positions=None):
     """T-3202 F-12 with D-SLM8461: a refused run never leaves an earlier run's row record standing at its path. Where a
     record exists at `result`, it is replaced by a REFUSED record carrying the exit code and no verdict; where none
     exists, none is written (a refused row has no row record, cell 7.9's per-process rule)."""
     if not Path(result).exists():
         return
     write_record(result, {"slot": slot, "status": "REFUSED", "exit_code": code, "reason": reason, "verdict": None,
+                          "construction": construction, "page_positions": page_positions,
                           "exe": str(exe_path) if exe_path else None, "exe_sha256": exe_sha,
                           "superseded": "the previous row record at this path"})
+
+
+# ---- the aggregate slot record (D-SLM8463) ------------------------------------------------------------------------
+
+def aggregate_runs(slot, run_paths):
+    """R79A's or R79MR's slot record from its runs' row records. Raises Refusal when a run record is missing or torn,
+    when the runs are not exactly the slot's set of (construction, row), when a run's page positions are not its
+    construction's, or when the runs' exe_sha256 differ (or one is missing). Otherwise returns the record: `status`
+    STANDING only when every run is STANDING, REFUSED otherwise."""
+    runs = []
+    for path in run_paths:
+        record = read_record(path)
+        if not isinstance(record, dict):
+            raise Refusal(f"aggregate {slot}: run record {path} is missing or torn")
+        construction, row, status = record.get("construction"), record.get("slot"), record.get("status")
+        if status not in ("STANDING", "REFUSED"):
+            raise Refusal(f"aggregate {slot}: run record {path} has status {status!r}")
+        if construction in CONSTRUCTIONS and record.get("page_positions") != CONSTRUCTIONS[construction]:
+            raise Refusal(f"aggregate {slot}: run record {path} ({construction}) at page positions "
+                          f"{record.get('page_positions')!r}, {CONSTRUCTIONS[construction]} owed")
+        runs.append({"row": row, "construction": construction, "status": status, "verdict": record.get("verdict"),
+                     "exe_sha256": record.get("exe_sha256"), "path": str(path)})
+    have = sorted((r["construction"] or "", r["row"] or "") for r in runs)
+    owed = sorted(AGGREGATE_SLOTS[slot])
+    if have != owed:
+        raise Refusal(f"aggregate {slot}: the runs are {have}, exactly {owed} owed")
+    hashes = {r["exe_sha256"] for r in runs}
+    if len(hashes) != 1 or None in hashes:
+        raise Refusal(f"aggregate {slot}: the runs' exe_sha256 differ ({sorted(map(str, hashes))})")
+    status = "STANDING" if all(r["status"] == "STANDING" for r in runs) else "REFUSED"
+    return {"slot": slot, "aggregate": True, "runs": runs, "status": status, "exe_sha256": hashes.pop()}
+
+
+def aggregate_main(args):
+    """--aggregate: write the slot record; 0 when it is STANDING, EXIT_INFRASTRUCTURE when it is REFUSED or refused."""
+    if args.slot not in AGGREGATE_SLOTS:
+        print(f"INFRASTRUCTURE: --aggregate takes slot {' or '.join(AGGREGATE_SLOTS)}, not {args.slot}",
+              file=sys.stderr)
+        return EXIT_INFRASTRUCTURE
+    if not args.runs:
+        print("INFRASTRUCTURE: --aggregate needs --runs", file=sys.stderr)
+        return EXIT_INFRASTRUCTURE
+    try:
+        record = aggregate_runs(args.slot, args.runs)
+    except Refusal as refusal:
+        print(f"REFUSED: {refusal}", file=sys.stderr)
+        supersede_refused(args.result, args.slot, EXIT_INFRASTRUCTURE, str(refusal), None, None)
+        return EXIT_INFRASTRUCTURE
+    write_record(args.result, record)
+    readings = ", ".join("{construction} {row} {status} {verdict}".format(**r) for r in record["runs"])
+    print(f"{args.slot}: {record['status']} ({readings})")
+    return 0 if record["status"] == "STANDING" else EXIT_INFRASTRUCTURE
 
 
 if __name__ == "__main__":

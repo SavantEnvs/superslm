@@ -1128,10 +1128,13 @@ install(FILES
 )
 
 # Paged-KV cell 7.9's must-reject mutant (SUPERSLM_MUTANT_PKV_MR_OPT: B = 16, unrotated) builds only as the
-# superslm_mr_opt target (tests/paged-kv/paged_kv.cmake). The production library refuses it here, at configure time,
-# wherever CMake can see a definition reach it: the superslm target's definitions and options, the directory's
-# definitions, and every configuration's C and C++ flags (T-3202 F-4). A definition CMake cannot see (the CL
-# environment variable) is refused at compile time by the #error in src/sslm_abi.cpp and include/superslm/forward_sites.h.
+# superslm_mr_opt target (tests/paged-kv/paged_kv.cmake). At configure time this checks four places for the text
+# SUPERSLM_MUTANT: the superslm target's COMPILE_DEFINITIONS and COMPILE_OPTIONS, the top directory's
+# COMPILE_DEFINITIONS, and CMAKE_C_FLAGS and CMAKE_CXX_FLAGS with every configuration's variants (T-3202 F-4). It does
+# not check the directory's COMPILE_OPTIONS (add_compile_options), definitions inherited through linked targets'
+# INTERFACE_COMPILE_DEFINITIONS, or anything CMake cannot see (the CL environment variable). The #error in
+# src/sslm_abi.cpp and include/superslm/forward_sites.h refuses every one of those at compile time unless
+# SUPERSLM_MUTANT_PKV_MR_OPT_TARGET, the superslm_mr_opt target's acknowledgement, is defined with it.
 get_target_property(_sslm_prod_defs superslm COMPILE_DEFINITIONS)
 get_target_property(_sslm_prod_opts superslm COMPILE_OPTIONS)
 get_directory_property(_sslm_dir_defs COMPILE_DEFINITIONS)
