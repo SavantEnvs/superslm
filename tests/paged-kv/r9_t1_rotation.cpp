@@ -163,7 +163,7 @@ void Cell66b() {
 	PKV_CHECK_MSG(e->ok && twin.fail.empty(), "flat twin at W = %lld: %s", static_cast<long long>(W), twin.fail.c_str());
 	// A legacy SSB5 save (GatherFlatBlock's fast loop), and chunked prefill across j = 64.
 	{
-		BlockPoolOf pool(fx.model, 1, y.block_bytes);
+		BlockPoolOf pool(fx.model, 1, y);
 		PKV_CHECK_EQ(pool.status, SSLM_OK);
 		sslm_seq s = nullptr;
 		if (pool.pool) PKV_CHECK_EQ(sslm_seq_create(fx.model, &pool.pool, &s), SSLM_OK);
@@ -279,8 +279,8 @@ bool MakeSide(int64_t pin, Side* s) {
 // `to`; its rows read through the peek at to's B, and its next 8 tokens, equal the source's.
 void CrossLayout(const char* name, Side& from, Side& to, int32_t budget) {
 	const Lay yf = LayoutOf(from.fx.geo, 1, from.B), yt = LayoutOf(to.fx.geo, 1, to.B);
-	BlockPoolOf pf(from.fx.model, 1, yf.block_bytes);
-	BlockPoolOf pt(to.fx.model, 1, yt.block_bytes);
+	BlockPoolOf pf(from.fx.model, 1, yf);
+	BlockPoolOf pt(to.fx.model, 1, yt);
 	PKV_CHECK_EQ(pf.status, SSLM_OK);
 	PKV_CHECK_EQ(pt.status, SSLM_OK);
 	if (!pf.pool || !pt.pool) return;

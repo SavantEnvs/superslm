@@ -153,10 +153,3 @@ endforeach()
 add_executable(superslm_pkv_r9_pin_link_probe EXCLUDE_FROM_ALL ${PKV_DIR}/pkv_r9_pin_link_probe.cpp)
 target_link_libraries(superslm_pkv_r9_pin_link_probe PRIVATE superslm)
 target_include_directories(superslm_pkv_r9_pin_link_probe PRIVATE ${PKV_DIR} include)
-
-# The routed §3.7 cell's pin minter (tests/paged-kv/pkv_r9_pinmaker.cpp): writes the v1.11.0 legacy
-# blob at pkv_odd only when its SHA-256 equals v1.11.0's recorded digest. Run once; the pin is committed.
-add_executable(superslm_pkv_r9_pinmaker EXCLUDE_FROM_ALL ${PKV_DIR}/pkv_r9_pinmaker.cpp)
-target_link_libraries(superslm_pkv_r9_pinmaker PRIVATE superslm_test_injection)
-target_include_directories(superslm_pkv_r9_pinmaker PRIVATE ${PKV_DIR} include src tests)
-target_compile_definitions(superslm_pkv_r9_pinmaker PRIVATE PKV_REFERENCE_DIR="${PKV_DIR}/reference")

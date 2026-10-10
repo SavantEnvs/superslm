@@ -15,9 +15,7 @@
 //   10.9/T2             admission at a non-dividing cap, the writes to the cap, save, adopt, state size
 //   4.13/T2:cap4100     4.2 (prefix lengths) whole on pkv_odd at B = 256
 //   6.7/T2:non-dividing contiguous option <-> page pool at cap 4,100, and a pin of 4 (needs T3's verb)
-//   3.7/T2:odd-legacy-save  (routed by the conductor from the T-3190 strike) a pinned v1.11.0 legacy save
-//                       at pkv_odd restores on the paged build, and the build's own legacy save of the
-//                       same state is byte-equal to it
+//   (rev 16.22: 2.4, 7.11, 9.2b and 9.3 at cap 4,100 are in r9_t2_saves.cpp)
 
 #include "pkv_r9.h"
 
@@ -50,7 +48,7 @@ void Cell44() {
 	for (const char* sc : kAllScenarios)
 		ExpectMatchesReference("v1.11.0", odd, sc, RunScenario(odd, sc), Compare::kTokensAndRows);
 	const RefRecord* saved = RefLookup(Reference("v1.11.0", odd), "persist", "saved");
-	BlockPoolOf pool(odd.model, 1, y.block_bytes);
+	BlockPoolOf pool(odd.model, 1, y);
 	PKV_CHECK_EQ(pool.status, SSLM_OK);
 	sslm_seq s = nullptr;
 	if (pool.pool) PKV_CHECK_EQ(sslm_seq_create(odd.model, &pool.pool, &s), SSLM_OK);
@@ -106,9 +104,12 @@ void Cell410NonDividing() {
 		PKV_CHECK_MSG(sslm_kv_page_positions(fx.model) == r.B, "D %u cap %lld: B = %lld, %lld owed", r.D,
 		              static_cast<long long>(r.cap), static_cast<long long>(sslm_kv_page_positions(fx.model)),
 		              static_cast<long long>(r.B));
-		PKV_CHECK_MSG(sslm_kv_block_size(fx.model) == y.block_bytes, "D %u cap %lld: block %zu, %lld pages of %zu is %zu",
-		              r.D, static_cast<long long>(r.cap), sslm_kv_block_size(fx.model), static_cast<long long>(r.pages),
-		              y.page_bytes, y.block_bytes);
+		PKV_CHECK_MSG(sslm_kv_block_size(fx.model) == y.block_bytes, "D %u cap %lld: block %zu, 1.11.0's %zu owed", r.D,
+		              static_cast<long long>(r.cap), sslm_kv_block_size(fx.model), y.block_bytes);
+		PKV_CHECK_MSG(sslm_kv_pool_overhead_size(fx.model, 1) == y.Overhead(1),
+		              "D %u cap %lld: overhead(1) %zu; %lld pages leave %lld slack positions, %zu owed", r.D,
+		              static_cast<long long>(r.cap), sslm_kv_pool_overhead_size(fx.model, 1),
+		              static_cast<long long>(r.pages), static_cast<long long>(r.slack), y.Overhead(1));
 		PKV_CHECK_MSG(RuleB(r.D, static_cast<uint64_t>(r.cap), 1, RuleMutant::kFallback) != r.B,
 		              "separation: the fallback gives the rule's B at D %u cap %lld", r.D, static_cast<long long>(r.cap));
 	}
@@ -226,9 +227,27 @@ void Cell29d() {
 	PKV_CHECK_MSG(ls == superslm::SslmModelStatus::Ok, "the loader refuses the 2.9d fixture: %s (%s)",
 	              superslm::SslmModelStatusName(ls), err.c_str());
 	PKV_CHECK_MSG(fx.ok, "the 2.9d fixture does not map (%s): BuildEngineCache needs WGT1 (model gap)", AbiStatusName(ms));
+	// Rev 16.22 (D-SLM8427): the block keeps 1.11.0's cap * q; the overhead carries 12 slack positions;
+	// the create refuses through blocks + overhead > 2^64 - 1; the overhead saturates from 343 blocks.
+	const uint64_t block = 4100ull * q, overhead1 = 8 + 32 + 12 * q;
+	PKV_CHECK_EQ(block, 18401787379712000000ull);
+	PKV_CHECK_EQ(overhead1, 53858889891840040ull);
+	PKV_CHECK(block + overhead1 < block);                                       // the sum wraps
+	PKV_CHECK_EQ(block + overhead1, 8902195894288424ull);                       // the unchecked-sum mutant's value
+	PKV_CHECK(343ull * 12 * q / q != 343ull * 12 || 343ull * 12 * q < 342ull * 12 * q);  // the slack product wraps at 343
+	PKV_CHECK(342ull * 12 * q / (12 * q) == 342ull);                            // and not at 342
 	if (!fx.ok) return;
-	PKV_CHECK_EQ(sslm_kv_block_size(fx.model), SIZE_MAX);
-	PKV_CHECK_EQ(TinyCreate(fx.model, 1), SSLM_INVALID_ARGUMENT);
+	PKV_CHECK_EQ(sslm_kv_block_size(fx.model), block);  // rev 16.21's grown block returns SIZE_MAX
+	PKV_CHECK_EQ(sslm_kv_pool_overhead_size(fx.model, 1), overhead1);
+	{
+		AlignedBuf small(4096);
+		sslm_kv_pool pool = nullptr;
+		// a buffer the create is told is SIZE_MAX bytes: only the overflow check can refuse it
+		PKV_CHECK_EQ(sslm_kv_pool_create(fx.model, small.p, SIZE_MAX, 1, &pool), SSLM_INVALID_ARGUMENT);
+		PKV_CHECK(pool == nullptr);
+	}
+	PKV_CHECK_EQ(sslm_kv_pool_overhead_size(fx.model, 343), SIZE_MAX);
+	PKV_CHECK(sslm_kv_pool_overhead_size(fx.model, 342) != SIZE_MAX);
 	PKV_CHECK_EQ(sslm_kv_page_size(fx.model), static_cast<size_t>(16 * q));
 }
 
@@ -256,7 +275,7 @@ void Cell109() {
 	}
 	// a legacy holder writes positions 0 to 4,099 and refuses 4,100; a save at width 4,099 restores
 	{
-		BlockPoolOf p(odd.model, 2, y.block_bytes);
+		BlockPoolOf p(odd.model, 2, y);
 		PKV_CHECK_EQ(p.status, SSLM_OK);
 		sslm_seq s = nullptr;
 		if (p.pool) PKV_CHECK_EQ(sslm_seq_create(odd.model, &p.pool, &s), SSLM_OK);
@@ -272,16 +291,13 @@ void Cell109() {
 				              "the save at width 4,099 restores with rows equal (read at B = 256)");
 				sslm_seq_release(r);
 			}
-			// The state size: the fixed part, the residual and the history, plus 17 pages. The fixed
-			// part and the residual are the same at pkv_def (same hidden size), so the cell grades the
-			// difference against the test's own block and history terms rather than reading either.
-			const Fixture& def = GetFixture("pkv_def");
-			const size_t odd_size = sslm_seq_state_size(odd.model), def_size = sslm_seq_state_size(def.model);
-			const size_t odd_tail = 4 * 4100 + 17 * y.page_bytes;
-			const size_t def_tail = 4 * 4096 + LayoutOf(def.geo, 1, RuleB(48, 4096, 1)).block_bytes;
-			PKV_CHECK_MSG(odd_size - odd_tail == def_size - def_tail,
-			              "sslm_seq_state_size at cap 4,100 is not the fixed part, residual and history plus 17 pages "
-			              "(%zu - %zu vs pkv_def's %zu - %zu)", odd_size, odd_tail, def_size, def_tail);
+			// The state size (rev 16.22, D-SLM8427): 180 + hidden_size 192 + 4 * 4,100 + the flat block
+			// 1,574,400 = 1,591,172, v1.11.0's 1,591,152 plus 20. Mutant: rev 16.21's grown block, 1,687,940.
+			const size_t odd_size = sslm_seq_state_size(odd.model);
+			PKV_CHECK_EQ(y.block_bytes, 1574400u);
+			PKV_CHECK_EQ(180u + 192u + 4u * 4100u + y.block_bytes, 1591172u);
+			PKV_CHECK_MSG(odd_size == 1591172u, "sslm_seq_state_size at cap 4,100 = %zu, 1,591,172 owed", odd_size);
+			PKV_CHECK(180u + 192u + 4u * 4100u + 17u * y.page_bytes == 1687940u);  // the mutant's value, separated
 			PKV_CHECK(blob.size() <= odd_size);
 			// the last row, then the cap
 			PKV_CHECK_EQ(PrefillAll(odd.model, s, Stream(42, 1, odd.vocab), 1), SSLM_OK);
@@ -294,6 +310,48 @@ void Cell109() {
 			PKV_CHECK_MSG(SeqRows(p.pool, s, odd.geo, 1, B, 4100, Rot::kRotated, &rows),
 			              "the table maps 17 pages: positions 4,096 to 4,099 are on the partial last page");
 			sslm_seq_release(s);
+		}
+	}
+	// Pool sizing (rev 16.22): the block is 1.11.0's 1,574,400; the overhead carries the slack
+	// (96,808 at one block, 193,584 at two; 1.11.0: 40 and 48); a create succeeds in exactly
+	// N * block + overhead(N) bytes and is refused one byte below and at N * block + 8N + 32.
+	PKV_CHECK_EQ(sslm_kv_block_size(odd.model), 1574400u);
+	PKV_CHECK_EQ(y.Overhead(1), 96808u);
+	PKV_CHECK_EQ(y.Overhead(2), 193584u);
+	PKV_CHECK_EQ(sslm_kv_pool_overhead_size(odd.model, 1), 96808u);
+	PKV_CHECK_EQ(sslm_kv_pool_overhead_size(odd.model, 2), 193584u);
+	for (uint32_t n : {1u, 2u}) {
+		const size_t exact = y.PoolBytes(n);  // 1,671,208 and 3,342,384: 17 and 34 pages plus 40 and 48
+		PKV_CHECK_EQ(exact, n == 1 ? 1671208u : 3342384u);
+		for (size_t size : {exact, exact - 1, n * y.block_bytes + 8 * n + 32}) {
+			AlignedBuf mem(size);
+			sslm_kv_pool pool = nullptr;
+			const sslm_status st = sslm_kv_pool_create(odd.model, mem.p, size, n, &pool);
+			const sslm_status want = size == exact ? SSLM_OK : SSLM_BUFFER_TOO_SMALL;
+			// kills: an overhead without the slack term (the create succeeds 96,768 bytes short of its pages)
+			PKV_CHECK_MSG(st == want, "%u block(s) in %zu bytes: %s, %s owed", n, size, AbiStatusName(st), AbiStatusName(want));
+			if (pool && size == exact) {
+				sslm_kv_pool_stats_out ps{};
+				ps.struct_size = sizeof ps;
+				PKV_CHECK_EQ(sslm_kv_pool_stats(pool, &ps), SSLM_OK);
+				PKV_CHECK_EQ(ps.page_count, 17 * n);
+				if (n == 2) {
+					// The block-index peek seam strides by the pages a block holds (17 * page_bytes): block 1
+					// reads what page 17 holds. Mutant: a stride of sslm_kv_block_size reads 96,768 bytes earlier.
+					sslm_seq a = nullptr, b = nullptr;
+					PKV_CHECK_EQ(sslm_seq_create(odd.model, &pool, &a), SSLM_OK);
+					PKV_CHECK_EQ(sslm_seq_create(odd.model, &pool, &b), SSLM_OK);
+					if (a) PrefillAll(odd.model, a, Stream(41, 300, odd.vocab), 64);
+					if (b) PrefillAll(odd.model, b, Stream(43, 300, odd.vocab), 64);
+					std::vector<uint8_t> via_block(y.page_bytes), via_page(y.page_bytes);
+					PKV_CHECK_EQ(sslm_g5_test_only_peek_kv_block_bytes(pool, 1, via_block.data(), via_block.size()), SSLM_OK);
+					PKV_CHECK_EQ(sslm_pkv_test_only_peek_page_bytes(pool, 17, via_page.data(), via_page.size()), SSLM_OK);
+					PKV_CHECK_MSG(via_block == via_page, "the block-index peek of block 1 is not page 17's bytes");
+					if (b) sslm_seq_release(b);
+					if (a) sslm_seq_release(a);
+				}
+			}
+			if (pool) sslm_kv_pool_destroy(pool);
 		}
 	}
 	// a share adopt at origin 4,000 maps 15 full pages and copies one
@@ -354,7 +412,7 @@ void Cell67NonDividing() {
 	const uint64_t csize = ContiguousSize(y, 2, &fits);
 	for (int64_t W : {int64_t{1}, int64_t{255}, int64_t{256}, int64_t{4099}, int64_t{4100}}) {
 		ContigPoolOf cp(odd.model, 2, static_cast<size_t>(csize));
-		BlockPoolOf pp(odd.model, 2, y.block_bytes);
+		BlockPoolOf pp(odd.model, 2, y);
 		PKV_CHECK_MSG(cp.status == SSLM_OK, "W %lld: the contiguous pool: %s", static_cast<long long>(W), AbiStatusName(cp.status));
 		PKV_CHECK_EQ(pp.status, SSLM_OK);
 		if (!cp.pool || !pp.pool) continue;
@@ -381,11 +439,37 @@ void Cell67NonDividing() {
 			sslm_seq_release(s);
 		}
 	}
+	// Rev 16.22 (D-SLM8427): the legacy blob saved at width 4,099 is byte-equal across pool kinds, and
+	// is 160 + hidden_size + 4 * history + the flat block. Mutant: a section sized by each pool's own
+	// reservation (cap * q in the option, 17 pages in the page pool) differs by 96,768 bytes.
+	{
+		bool f1 = false;
+		ContigPoolOf cp(odd.model, 1, static_cast<size_t>(ContiguousSize(y, 1, &f1)));
+		BlockPoolOf pp(odd.model, 1, y);
+		std::vector<uint8_t> blobs[2];
+		for (int k = 0; k < 2; ++k) {
+			sslm_kv_pool* pool = k == 0 ? &cp.pool : &pp.pool;
+			sslm_seq s = nullptr;
+			if (*pool && sslm_seq_create(odd.model, pool, &s) == SSLM_OK) {
+				PKV_CHECK_EQ(PrefillAll(odd.model, s, Stream(41, 4099, odd.vocab), 64), SSLM_OK);
+				blobs[k] = bc::Save(s);
+				sslm_seq_release(s);
+			}
+		}
+		PKV_CHECK_MSG(!blobs[0].empty() && blobs[0] == blobs[1],
+		              "the legacy saves of one state from the option (%zu bytes) and the page pool (%zu) differ",
+		              blobs[0].size(), blobs[1].size());
+		for (const auto& b : blobs)
+			if (!b.empty())
+				PKV_CHECK_MSG(b.size() == 160 + 192 + 4 * Le64(b, 112) + y.block_bytes,
+				              "a legacy save is %zu bytes; 160 + 192 + 4 * %llu + %zu owed", b.size(),
+				              static_cast<unsigned long long>(Le64(b, 112)), y.block_bytes);
+	}
 	// the restoring legacy holder reserves ceil(cap/B) = 17 pages: a 17-page page pool takes exactly one
 	{
 		PagePoolOf p(odd.model, 17, y.page_bytes);
 		PKV_CHECK_EQ(p.status, SSLM_OK);
-		BlockPoolOf src(odd.model, 1, y.block_bytes);
+		BlockPoolOf src(odd.model, 1, y);
 		sslm_seq s = nullptr, r = nullptr;
 		if (src.pool && sslm_seq_create(odd.model, &src.pool, &s) == SSLM_OK) {
 			PrefillAll(odd.model, s, Stream(41, 300, odd.vocab), 64);
@@ -406,8 +490,8 @@ void Cell67NonDividing() {
 		if (MakeVariant(odd, v, &o4)) {
 			PKV_CHECK_EQ(KvPagesTestPinPagePositions(o4.model, 4), SSLM_OK);
 			const Lay y4 = LayoutOf(o4.geo, 1, 4);
-			BlockPoolOf src(o4.model, 1, y4.block_bytes);
-			BlockPoolOf dst(odd.model, 1, y.block_bytes);
+			BlockPoolOf src(o4.model, 1, y4);
+			BlockPoolOf dst(odd.model, 1, y);
 			sslm_seq s = nullptr, r = nullptr;
 			if (src.pool && sslm_seq_create(o4.model, &src.pool, &s) == SSLM_OK) {
 				PKV_CHECK_EQ(PrefillAll(o4.model, s, Stream(41, 4099, o4.vocab), 64), SSLM_OK);
@@ -416,7 +500,7 @@ void Cell67NonDividing() {
 				// on the pinned twin's identity: map a second copy of the twin unpinned
 				Fixture o4u;
 				if (MakeVariant(odd, v, &o4u)) {
-					BlockPoolOf d2(o4u.model, 1, y.block_bytes);
+					BlockPoolOf d2(o4u.model, 1, y);
 					PKV_CHECK_EQ(sslm_seq_restore(o4u.model, &d2.pool, blob.data(), blob.size(), &r), SSLM_OK);
 					if (r) {
 						std::vector<uint8_t> rows, brows;
@@ -432,57 +516,6 @@ void Cell67NonDividing() {
 	}
 }
 
-// 3.7 [T2], routed by the conductor (T-3190 strike, FRACTURE): §3.7's writer promise ("a legacy
-// holder's blob is byte-equal to the blob 1.9.0 would write for the same state") and its reader
-// promise ("readers accept 1.9.0's SSB5"), at a cap the page size does not divide. The pin is
-// v1.11.0's own legacy blob of persist/saved at pkv_odd (v1.11.0 and 1.9.0 write the same SSB5;
-// tests/paged-kv/pkv_r9_pinmaker.cpp minted it only on a SHA-256 match with v1.11.0's recorded
-// digest). The paged build must restore it, decode on as the reference does, and save that state, and
-// a fresh holder brought to the same state, as bytes equal to the pin.
-// The cell's subject is a paged legacy holder at the partial last page, so it first requires
-// pkv_odd to run at the rule's B = 256 (red on 2ebe5e3, where B is the cap). Its save assertions are
-// green on 2ebe5e3, which writes v1.11.0's one-page block; they turn red on a T2 build whose legacy
-// blob is sized by the 17-page block (the strike's +96,768 bytes).
-void Cell37OddLegacySave() {
-	const Fixture& odd = GetFixture("pkv_odd");
-	if (!odd.ok) return;
-	RequireOddB(odd);
-	std::vector<uint8_t> enc, pin;
-	const std::string path = std::string(PKV_REFERENCE_DIR) + "/pins/v1.11.0_pkv_odd_persist_saved.zrl";
-	PKV_CHECK_MSG(ReadAll(path, &enc) && ZrlDecode(enc, &pin), "pin %s missing or malformed", path.c_str());
-	const RefRecord* rec = RefLookup(Reference("v1.11.0", odd), "persist", "saved");
-	const RefRecord* cont = RefLookup(Reference("v1.11.0", odd), "persist", "restored+continuation8");
-	if (pin.empty() || !rec || !cont) return;
-	PKV_CHECK_MSG(Sha(pin.data(), pin.size()) == rec->blob_sha, "the pin is not v1.11.0's recorded blob");
-	PKV_CHECK(IsMagic(pin, "SSB5"));
-	const Lay y = LayoutOf(odd.geo, 1, OddB());
-	BlockPoolOf pool(odd.model, 2, y.block_bytes);
-	PKV_CHECK_EQ(pool.status, SSLM_OK);
-	if (!pool.pool) return;
-	// The paged build restores the pinned blob, and its re-save of that state is the pin's bytes.
-	sslm_seq r = nullptr;
-	PKV_CHECK_MSG(sslm_seq_restore(odd.model, &pool.pool, pin.data(), pin.size(), &r) == SSLM_OK,
-	              "the paged build refuses v1.11.0's legacy blob at cap 4,100 (%zu bytes)", pin.size());
-	if (r) {
-		const std::vector<uint8_t> resaved = bc::Save(r);
-		PKV_CHECK_MSG(resaved == pin, "re-save of the restored state: %zu bytes, the pin is %zu; not byte-equal",
-		              resaved.size(), pin.size());
-		PKV_CHECK(bc::DecodeN(odd.model, r, 8) == cont->tokens);
-		sslm_seq_release(r);
-	}
-	// A fresh legacy holder brought to the same state saves the pin's bytes.
-	sslm_seq s = nullptr;
-	PKV_CHECK_EQ(sslm_seq_create(odd.model, &pool.pool, &s), SSLM_OK);
-	if (s) {
-		PKV_CHECK_EQ(PrefillAll(odd.model, s, Stream(31, 100, odd.vocab), 64), SSLM_OK);
-		bc::DecodeN(odd.model, s, 4);
-		const std::vector<uint8_t> own = bc::Save(s);
-		PKV_CHECK_MSG(own == pin, "the paged build's own legacy save: %zu bytes, v1.11.0's is %zu; not byte-equal",
-		              own.size(), pin.size());
-		sslm_seq_release(s);
-	}
-}
-
 PKV_CELL("4.4/T2", "T2", Cell44);
 PKV_CELL("4.10/T2:non-dividing", "T2", Cell410NonDividing);
 PKV_CELL("4.12/T2:cap4100", "T2", Cell412Cap4100);
@@ -493,6 +526,5 @@ PKV_CELL("2.9d/T2", "T2", Cell29d);
 PKV_CELL("10.9/T2", "T2", Cell109);
 PKV_CELL("4.13/T2:cap4100", "T2", Cell413Cap4100);
 PKV_CELL("6.7/T2:non-dividing", "T2", Cell67NonDividing);
-PKV_CELL("3.7/T2:odd-legacy-save", "T2", Cell37OddLegacySave);
 
 }  // namespace

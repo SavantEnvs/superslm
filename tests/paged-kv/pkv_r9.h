@@ -69,6 +69,9 @@ sslm_status sslm_kv_pool_create_contiguous(sslm_model model, void* buf, size_t b
 // divides the cap nor is the cap, B <= 0, B > cap, a pin after a pool exists on the model).
 sslm_status KvPagesTestPinPagePositions(sslm_model model, int64_t page_positions);
 
+// G19's block-index peek (src/sslm_abi.cpp, every library build): n raw bytes of block `block_index`.
+sslm_status sslm_g5_test_only_peek_kv_block_bytes(sslm_kv_pool pool, uint32_t block_index, uint8_t* out_buf, size_t n);
+
 }  // extern "C"
 
 namespace pkv {
@@ -151,10 +154,17 @@ inline int64_t Reservation(int64_t budget, int64_t cap, int64_t B) {
 }
 
 // The page geometry the test derives for a model: element width from CFG1, B by the rule (or a pin).
+// Rev 16.22 (D-SLM8427) separates two quantities. The flat block, `block_bytes`, is 1.11.0's
+// L*cap*H_kv*D*2*elem at every cap: sslm_kv_block_size and the legacy save's K/V section. A legacy
+// holder's ceil(cap/B) pages hold `slack` positions more, and sslm_kv_pool_overhead_size carries them:
+// Overhead(N) = 8N + 32 + N * slack * q. So N blocks need N * pool_block_bytes + 8N + 32 bytes.
 struct Lay {
 	int64_t cap = 0, B = 0, pages = 0, slack = 0;
 	uint32_t runs = 0;
-	size_t elem = 1, bytes_per_position = 0, page_bytes = 0, block_bytes = 0, contiguous_block_bytes = 0;
+	size_t elem = 1, bytes_per_position = 0, page_bytes = 0, block_bytes = 0, pool_block_bytes = 0,
+	       contiguous_block_bytes = 0;
+	size_t Overhead(uint64_t n) const { return static_cast<size_t>(8 * n + 32 + n * slack * bytes_per_position); }
+	size_t PoolBytes(uint64_t n) const { return static_cast<size_t>(n * block_bytes) + Overhead(n); }
 };
 
 inline Lay LayoutOf(const Geometry& g, size_t elem, int64_t B) {
@@ -167,8 +177,9 @@ inline Lay LayoutOf(const Geometry& g, size_t elem, int64_t B) {
 	y.elem = elem;
 	y.bytes_per_position = size_t{g.layers} * 2u * g.kv_heads * g.head_dim * elem;
 	y.page_bytes = y.bytes_per_position * static_cast<size_t>(B);
-	y.block_bytes = y.page_bytes * static_cast<size_t>(y.pages);  // §21.1: ceil(cap/B) * page_bytes
-	y.contiguous_block_bytes = y.bytes_per_position * static_cast<size_t>(g.context_cap);
+	y.block_bytes = y.bytes_per_position * static_cast<size_t>(g.context_cap);  // 1.11.0's block (D-SLM8427)
+	y.pool_block_bytes = y.page_bytes * static_cast<size_t>(y.pages);          // ceil(cap/B) pages
+	y.contiguous_block_bytes = y.block_bytes;
 	return y;
 }
 
@@ -413,13 +424,14 @@ struct PagePoolOf {
 	}
 };
 
-// A legacy block pool of `blocks` blocks sized from the test's block bytes (§21.1: ceil(cap/B) pages).
+// A legacy block pool of `blocks` blocks in exactly the bytes the test computes for it:
+// N * block + Overhead(N) (rev 16.22: the pages ceil(cap/B) * page_bytes per block, plus 8N + 32).
 struct BlockPoolOf {
 	AlignedBuf mem;
 	sslm_kv_pool pool = nullptr;
 	sslm_status status = SSLM_INVALID_ARGUMENT;
-	BlockPoolOf(sslm_model model, uint32_t blocks, size_t block_bytes, uint8_t fill = 0) {
-		mem.Reset(block_bytes * blocks + sslm_kv_pool_overhead_size(model, blocks), fill);
+	BlockPoolOf(sslm_model model, uint32_t blocks, const Lay& y, uint8_t fill = 0) {
+		mem.Reset(y.PoolBytes(blocks), fill);
 		status = sslm_kv_pool_create(model, mem.p, mem.n, blocks, &pool);
 	}
 	~BlockPoolOf() {

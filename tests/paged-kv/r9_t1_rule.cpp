@@ -187,10 +187,13 @@ void Cell410Boundary() {
 		PKV_CHECK_EQ(y.slack, r.slack);
 		PKV_CHECK_MSG(sslm_kv_page_positions(fx.model) == B, "cap %d: B = %lld, the rule gives %lld", r.cap,
 		              static_cast<long long>(sslm_kv_page_positions(fx.model)), static_cast<long long>(B));
-		// pages and slack through the block (§21.1: ceil(cap/B) * page_bytes)
-		PKV_CHECK_MSG(sslm_kv_block_size(fx.model) == y.block_bytes,
-		              "cap %d: sslm_kv_block_size = %zu, %lld pages of %zu bytes is %zu", r.cap,
-		              sslm_kv_block_size(fx.model), static_cast<long long>(y.pages), y.page_bytes, y.block_bytes);
+		// The block stays 1.11.0's; pages and slack show in the overhead (rev 16.22, D-SLM8427).
+		PKV_CHECK_MSG(sslm_kv_block_size(fx.model) == y.block_bytes, "cap %d: sslm_kv_block_size = %zu, 1.11.0's %zu owed",
+		              r.cap, sslm_kv_block_size(fx.model), y.block_bytes);
+		PKV_CHECK_MSG(sslm_kv_pool_overhead_size(fx.model, 1) == y.Overhead(1),
+		              "cap %d: sslm_kv_pool_overhead_size(1) = %zu; 40 + %lld slack positions of %zu bytes is %zu", r.cap,
+		              sslm_kv_pool_overhead_size(fx.model, 1), static_cast<long long>(y.slack), y.bytes_per_position,
+		              y.Overhead(1));
 		// A budget-1 holder reserves min(ceil(1/B) + 1, pages): graded by admission in a 4-page pool.
 		{
 			PagePoolOf pool(fx.model, 4, y.page_bytes);
@@ -204,7 +207,7 @@ void Cell410Boundary() {
 		}
 		// A whole-cap holder writes to the cap and is refused at it.
 		{
-			BlockPoolOf pool(fx.model, 1, y.block_bytes);
+			BlockPoolOf pool(fx.model, 1, y);
 			PKV_CHECK_EQ(pool.status, SSLM_OK);
 			sslm_seq s = nullptr;
 			if (pool.pool) PKV_CHECK_EQ(sslm_seq_create(fx.model, &pool.pool, &s), SSLM_OK);
@@ -285,8 +288,8 @@ void Cell410Extremes() {
 		              static_cast<long long>(r.want));
 		if (r.kills != RuleMutant::kNone) Separates(r.kills, r.D, static_cast<uint64_t>(r.cap), elem, r.want, "its row");
 		if (r.cap == 4097)
-			PKV_CHECK_MSG(sslm_kv_block_size(a.fx.model) == LayoutOf(a.fx.geo, 1, 128).page_bytes * 33,
-			              "cap 4,097: the block is 33 pages of 128 positions");
+			PKV_CHECK_MSG(sslm_kv_pool_overhead_size(a.fx.model, 1) == LayoutOf(a.fx.geo, 1, 128).Overhead(1),
+			              "cap 4,097: 33 pages of 128 positions, so the overhead carries 127 slack positions");
 	}
 	// The 32-bit product wraps at D = 2^31 (the hostile row, model gap below); its separation:
 	Separates(RuleMutant::kU32Product, uint64_t{1} << 31, 4096, 1, 16, "D = 2^31");

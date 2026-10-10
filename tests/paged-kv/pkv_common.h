@@ -318,28 +318,35 @@ inline const RefRecord* RefLookup(const RefFile& ref, const std::string& scenari
 // against the blob= digest of its own record ("<scenario> <stage>" in <tag>_pkv_def.ref): a pin that
 // does not match its reference is a failed check here, before any cell restores it. The decoded bytes
 // are returned either way, so the cell's own comparison still reports what the corrupt pin does.
-inline std::vector<uint8_t> Pin(const char* tag, const char* scenario, const char* stage) {
+// PinFor takes the fixture stem (rev 16.22 §24.6: cell 9.2b reads pkv_odd's pins); Pin is pkv_def's.
+inline std::vector<uint8_t> PinFor(const char* tag, const char* stem, const char* scenario, const char* stage) {
 	std::vector<uint8_t> enc, out;
-	const std::string path = std::string(PKV_REFERENCE_DIR) + "/pins/" + tag + "_pkv_def_" + scenario + "_" + stage + ".zrl";
+	const std::string path =
+	    std::string(PKV_REFERENCE_DIR) + "/pins/" + tag + "_" + stem + "_" + scenario + "_" + stage + ".zrl";
 	const bool ok = ReadAll(path, &enc) && ZrlDecode(enc, &out);
 	PKV_CHECK_MSG(ok, "pinned blob %s missing or malformed", path.c_str());
 	if (!ok) return out;
-	const Fixture& fx = GetFixture("pkv_def");
+	const Fixture& fx = GetFixture(stem);
 	const RefRecord* rec = RefLookup(Reference(tag, fx), scenario, stage);
 	if (!rec) return out;
 	const std::string got = Sha(out.data(), out.size());
 	// kills: a corrupt or substituted pin read as the reference (caught only by a later replay)
-	PKV_CHECK_MSG(got == rec->blob_sha, "pinned blob %s does not match its reference: sha256 %s, the %s_pkv_def.ref record "
-	              "'%s %s' has blob=%s", path.c_str(), got.c_str(), tag, scenario, stage, rec->blob_sha.c_str());
+	PKV_CHECK_MSG(got == rec->blob_sha, "pinned blob %s does not match its reference: sha256 %s, the %s_%s.ref record "
+	              "'%s %s' has blob=%s", path.c_str(), got.c_str(), tag, stem, scenario, stage, rec->blob_sha.c_str());
 	return out;
+}
+
+inline std::vector<uint8_t> Pin(const char* tag, const char* scenario, const char* stage) {
+	return PinFor(tag, "pkv_def", scenario, stage);
 }
 
 // Runs one of pkv_scenarios.h's scenarios on the build under test (legacy verbs only) and returns
 // its records. A scenario failure is a failed check.
-inline std::vector<Record> RunScenario(const Fixture& fx, const char* scenario) {
+inline std::vector<Record> RunScenario(const Fixture& fx, const char* scenario, int pool_fill = -1) {
 	Driver d;
 	d.model = fx.model;
 	d.geo = fx.geo;
+	d.pool_fill = pool_fill;
 	size_t n = 0;
 	const Scenario* sc = Scenarios(&n);
 	for (size_t i = 0; i < n; ++i)
