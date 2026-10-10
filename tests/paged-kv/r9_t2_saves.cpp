@@ -208,7 +208,34 @@ void Cell711() {
 	PKV_CHECK_EQ(160u + 192u + LayoutOf(Geometry{2, 2, 48, 4100}, 1, 256).block_bytes, 1574752u);
 }
 
+// 9.3 [T2], the pkv_odd restore side (rev 16.22): the paged build's legacy save of persist saved,
+// written for the OLD reader (tests/paged-kv/r9_old_reader.ps1 builds tests/paged-kv/r9_old_reader.cpp
+// against the frozen v1.11.0 library, restores this file and continues it). The release's reader checks
+// `n <` only, so it cannot see a grown section; 9.2b's digest is the separating assertion, and this
+// cell's own digest check repeats it on the file it hands over.
+void Cell93Write() {
+	const Fixture& odd = GetFixture("pkv_odd");
+	if (!odd.ok) return;
+	AtRuleB(odd);
+	const char* out_dir = std::getenv("SUPERSLM_PAGED_KV_R9_OUT");
+	PKV_CHECK_MSG(out_dir && *out_dir, "SUPERSLM_PAGED_KV_R9_OUT is not set (tests/paged-kv/r9_old_reader.ps1 sets it)");
+	if (!out_dir || !*out_dir) return;
+	const RefRecord* rec = RefLookup(Reference("v1.11.0", odd), "persist", "saved");
+	VerbSizedPool pool(odd.model, 1);
+	sslm_seq s = nullptr;
+	if (!pool.pool || sslm_seq_create(odd.model, &pool.pool, &s) != SSLM_OK) return;
+	PKV_CHECK_EQ(PrefillAll(odd.model, s, Stream(31, 100, odd.vocab), 64), SSLM_OK);
+	bc::DecodeN(odd.model, s, 4);
+	const std::vector<uint8_t> blob = bc::Save(s);
+	sslm_seq_release(s);
+	PKV_CHECK_MSG(rec && Sha(blob.data(), blob.size()) == rec->blob_sha, "the paged save of persist saved is not v1.11.0's blob");
+	std::ofstream f(std::string(out_dir) + "/pkv_odd_persist_saved_paged.ssb", std::ios::binary | std::ios::trunc);
+	f.write(reinterpret_cast<const char*>(blob.data()), static_cast<std::streamsize>(blob.size()));
+	PKV_CHECK_MSG(static_cast<bool>(f), "the blob could not be written to %s", out_dir);
+}
+
 PKV_CELL("9.2b/T2", "T2", Cell92b);
+PKV_CELL("9.3/T2:write", "T2", Cell93Write);
 PKV_CELL("2.4/T2", "T2", Cell24);
 PKV_CELL("7.11/T2", "T2", Cell711);
 
