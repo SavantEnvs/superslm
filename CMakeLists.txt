@@ -151,6 +151,21 @@ else()
 	target_compile_options(sha256_portable_forced_tests PRIVATE -Wall -Wextra -ffp-contract=off)
 endif()
 add_test(NAME sha256_portable_forced_tests COMMAND sha256_portable_forced_tests)
+
+# Paged-KV plan (rev 16.1) step G2: the GPU K/V page-table addressing, checked on the host. CPU-only:
+# it runs src/gpu/shaders/kv_page_addr_model.h (the C++ transliteration of site_common.hlsli's
+# KvRowAddrGpu and of the page-run loop bounds) against the pre-G2 flat layout, the CPU engine's own
+# KvPageView accessors and the uint ceiling, and checks the transliteration reads as the shader text.
+add_executable(gpu_kv_page_addr_tests tests/gpu_kv_page_addr_tests.cpp)
+target_link_libraries(gpu_kv_page_addr_tests PRIVATE superslm)
+target_include_directories(gpu_kv_page_addr_tests PRIVATE src)
+target_compile_definitions(gpu_kv_page_addr_tests PRIVATE SSLM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+if(MSVC)
+	target_compile_options(gpu_kv_page_addr_tests PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(gpu_kv_page_addr_tests PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+add_test(NAME gpu_kv_page_addr_tests COMMAND gpu_kv_page_addr_tests)
 endif()
 
 # The §13 item 7 independent converter verifier (S-HARDEN-3, F13): loads a

@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "d3d12_harness.h"
+#include "shaders/kv_page_addr_model.h"
 
 #include <shlwapi.h>  // PathIsRelativeW (shader-directory override validation)
 #pragma comment(lib, "shlwapi.lib")
@@ -1549,6 +1550,31 @@ void ClearT2169ChunkRecordingTailBadAllocFaultInjection() {
 }
 #endif  // SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION
 
+// Paged-KV plan (rev 16.1) §4 item 2, step G2: the one constant table entry every one-page view
+// shares (the legacy dedicated sequences' "context-wide one-entry table {0}"), and the view itself.
+namespace {
+constexpr uint32_t kGpuOnePageTable[1] = {0u};
+}  // namespace
+
+superslm::KvPageView GpuOnePageView(uint8_t* workspace, size_t workspace_size, int64_t context_cap) {
+	return superslm::KvPageView{workspace, kGpuOnePageTable, 1u, context_cap, workspace_size};
+}
+
+namespace {
+// Paged-KV plan §4 item 6, step G2: the host's byte offset of (layer, half, kv_head, position) in the
+// buffer a view addresses -- the shaders' KvRowAddrGpu (site_common.hlsli) instantiated at size_t
+// (src/gpu/shaders/kv_page_addr_model.h), so the decode and chunk readback offset builders and
+// KeyRowGpu/ValueRowGpu read exactly the bytes the dispatches write. For the one-page view it is the
+// pre-G2 flat offset. The caller has the position inside the mapped pages (the ladder's coverage
+// guard).
+size_t KvViewRowOffset(const superslm::KvPageView& view, uint32_t layer, size_t half, size_t num_kv_heads,
+                       size_t head_dim, size_t kv_head, int64_t position) {
+	return kv_page_addr_model::KvRowAddrGpu<size_t>(
+	    view.page_table, view.page_bytes, static_cast<size_t>(view.page_positions), static_cast<size_t>(layer), half,
+	    num_kv_heads, head_dim, kv_head, static_cast<size_t>(position));
+}
+}  // namespace
+
 // T-2113 (B5, design Sec4.2/Sec6.2/Sec10 B5): the full definition of the opaque token
 // gpu_port.h forward-declares. Every field is FINISH-phase-only state that only exists
 // once Submit has recorded and closed the command list -- see gpu_port.h's own comment
@@ -1892,7 +1918,12 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
     superslm::SequenceLayerState& seq, const superslm::LayerWeights* layers,
     uint32_t num_hidden_layers, uint32_t layer_budget, size_t hidden_size, size_t head_dim,
     size_t num_key_value_heads, size_t intermediate_size, int64_t context_cap,
-    const superslm::SslmTensorManifest& rope_tables, uint8_t* workspace, size_t workspace_size,
+    const superslm::SslmTensorManifest& rope_tables,
+    // Paged-KV plan (rev 16.1) §4 items 1, 2 and 6a: the K/V page view over the host mirror
+    // (`pool_base` is the mirror, `page_table` the table the shaders read as KvPageTable), and the
+    // mirror's size in bytes -- the size of the device K/V buffer the view addresses. A legacy caller
+    // passes GpuOnePageView(workspace, workspace_size, context_cap) and workspace_size.
+    const superslm::KvPageView& kv_view, size_t kv_host_bytes,
     ID3D12Resource* external_kv_resident, bool* io_external_kv_needs_resume_barrier,
     ID3D12Resource* external_weights_resident, ID3D12Resource* external_rope_cos_resident,
     ID3D12Resource* external_rope_sin_resident, bool external_rope_has,
@@ -1992,17 +2023,27 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 	// overflowing product returns CPU's own InvalidContextCap, never
 	// silently wrapping into a workspace_size comparison that could pass on
 	// a wrapped-small value.
+	//
+	// Paged-KV plan §4 item 6a (G2): guard 5's view meaning, the CPU's (§3.2 item 2, `RunLayerLoopImpl`
+	// (`forward_sites.cpp`)). The product is the PER-PAGE K/V size,
+	// `num_hidden_layers * page_positions * num_key_value_heads * head_dim * 2`, checked against the
+	// view's `page_bytes`; a page size below one position is refused with the overflow branch's own
+	// InvalidContextCap, and a null pool or table with WorkspaceTooSmall. For a legacy sequence's
+	// one-page view `page_positions` is its own cap and `page_bytes` its own buffer size, so the product,
+	// the statuses and their order are exactly the pre-G2 ones. A pool smaller than one whole-cap block is
+	// therefore not refused here (§4 item 6a). The page-size test rides inside the overflow branch's one
+	// return rather than adding a second.
 	{
 		size_t kv_bytes_needed = static_cast<size_t>(num_hidden_layers);
-		const size_t kv_factors[] = {static_cast<size_t>(context_cap), num_key_value_heads, head_dim, 2u};
+		const size_t kv_factors[] = {static_cast<size_t>(kv_view.page_positions), num_key_value_heads, head_dim, 2u};
 		for (size_t factor : kv_factors) {
-			if (factor != 0 && kv_bytes_needed > SIZE_MAX / factor) {
+			if (kv_view.page_positions < 1 || (factor != 0 && kv_bytes_needed > SIZE_MAX / factor)) {
 				return superslm::SslmForwardStatus::InvalidContextCap;  // WorkspaceSizeOrOverflow (overflow branch)
 			}
 			kv_bytes_needed *= factor;
 		}
-		if (workspace == nullptr) return superslm::SslmForwardStatus::WorkspaceTooSmall;  // WorkspaceSizeOrOverflow
-		if (workspace_size < kv_bytes_needed) return superslm::SslmForwardStatus::WorkspaceTooSmall;  // WorkspaceSizeOrOverflow
+		if (kv_view.pool_base == nullptr || kv_view.page_table == nullptr) return superslm::SslmForwardStatus::WorkspaceTooSmall;  // WorkspaceSizeOrOverflow
+		if (kv_view.page_bytes < kv_bytes_needed) return superslm::SslmForwardStatus::WorkspaceTooSmall;  // WorkspaceSizeOrOverflow
 	}
 	// HiddenCodesNull (the null-hidden_codes guard in `RunLayerLoopImpl`
 	// (`forward_sites.cpp`)) --
@@ -2027,15 +2068,16 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 		return superslm::SslmForwardStatus::KvCapacityExhausted;  // KvCapacityExhausted
 	}
 	// KvPageUnmapped (the coverage guard in `RunLayerLoopImpl` (`forward_sites.cpp`), paged-KV
-	// plan §3.2 item 5): the twin over this sequence's constant one-page view (`mapped_pages = 1`,
-	// `page_positions` = the sequence's own cap). KvCapacityExhausted above implies it, so it cannot
-	// fire until the GPU slice binds it to the sequence's page table (plan steps G2/G3).
-	{
-		const int64_t mapped_pages = 1;
-		const int64_t page_positions = context_cap;
-		if (seq.context_length + 1 > mapped_pages * page_positions) {
-			return superslm::SslmForwardStatus::KvPageUnmapped;  // KvPageUnmapped
-		}
+	// plan §3.2 items 4-5): from G2 the twin evaluates the call's real view (§4 item 6a) -- the row this
+	// call writes, `context_length`, must lie in a mapped logical page, `context_length / page_positions
+	// < mapped_pages` (the CPU's own form: no product to overflow; `context_length >= 0` and
+	// `page_positions >= 1` are established above). Checked before any recording, so a view one page
+	// short is refused before any dispatch and before the shaders could read a table entry past the
+	// mapped ones. For a legacy sequence's one-page view (one page of B = its own cap)
+	// KvCapacityExhausted above already implies it.
+	if (static_cast<uint64_t>(seq.context_length) / static_cast<uint64_t>(kv_view.page_positions) >=
+	    kv_view.mapped_pages) {
+		return superslm::SslmForwardStatus::KvPageUnmapped;  // KvPageUnmapped
 	}
 	static_assert(static_cast<int>(superslm_gpu::GpuLayerLoopGuard::kCount) == 10,
 	              "RunLayerLoopGpu's own guard ladder above must implement exactly as many guards "
@@ -2340,8 +2382,8 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 	const bool kv_fast_hit = !external_kv && !fresh_sequence &&
 	                          SameModelFastPathAllowed(model_generation, fresh_sequence, g_resident_kv.generation) &&
 	                          g_resident_kv.valid &&
-	                          g_resident_kv.src_workspace == workspace &&
-	                          g_resident_kv.src_size == workspace_size;
+	                          g_resident_kv.src_workspace == kv_view.pool_base &&
+	                          g_resident_kv.src_size == kv_host_bytes;
 	g_last_kv_upload_was_skipped = kv_fast_hit;
 
 	// T-2039/T-2049 (N6, Claude/Poirot/34ef30f-gpu-serial-port-confirmation-
@@ -2672,6 +2714,14 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 		g_resident_rope.generation = model_generation;  // (T-2577)
 	}
 	scratch_layout_buf = dev.Upload(scratch_layout_bytes.data(), scratch_layout_bytes.size());
+	// Paged-KV plan §4 items 1-2 (G2): the K/V page table the shaders read as KvPageTable (t10) -- the
+	// view's `mapped_pages` entries, one uint physical page each. Uploaded per call on the same
+	// UPLOAD-heap idiom as every other per-call SRV above and kept alive to the fence the same way
+	// (`upload_keep_alive`). A legacy dedicated sequence's view is the one-page view, whose table is
+	// the one constant entry {0} (GpuOnePageView), so its addresses are the pre-G2 flat ones.
+	Microsoft::WRL::ComPtr<ID3D12Resource> kv_page_table_buf =
+	    dev.Upload(kv_view.page_table, static_cast<size_t>(kv_view.mapped_pages) * sizeof(uint32_t));
+	upload_keep_alive.push_back(kv_page_table_buf);
 	seq_uav = MakeInitializedUav(dev, seq_bytes, upload_keep_alive);
 	// T-2101: no host content -- see the header comment at `kv_fast_hit`'s own declaration above.
 	scratch_uav = dev.MakeBuffer(scratch_layout.total, D3D12_HEAP_TYPE_DEFAULT,
@@ -2715,12 +2765,15 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 		kv_resume_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 		dev.list->ResourceBarrier(1, &kv_resume_barrier);
 	} else {
-		std::vector<uint8_t> kv_bytes(workspace, workspace + workspace_size);
+		// Paged-KV plan §4 item 2 (G2): this pre-1.0 process-wide path uploads the whole host buffer the
+		// view addresses (for its one-page view, the caller's flat workspace, as before) and is addressed
+		// through the same table as every other path.
+		std::vector<uint8_t> kv_bytes(kv_view.pool_base, kv_view.pool_base + kv_host_bytes);
 		kv_uav = MakeInitializedUav(dev, kv_bytes, upload_keep_alive);
 		g_resident_kv.kv_buf = kv_uav;
 		g_resident_kv.valid = true;
-		g_resident_kv.src_workspace = workspace;
-		g_resident_kv.src_size = workspace_size;
+		g_resident_kv.src_workspace = kv_view.pool_base;
+		g_resident_kv.src_size = kv_host_bytes;
 		g_resident_kv.generation = model_generation;  // (T-2577)
 	}
 	// T-2039: WorkScratch is transient, per-dispatch scratch -- every byte is
@@ -2833,6 +2886,20 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 	    13, (adapter_bridge ? adapter_bridge->lora_ab_resident : model_const_buf.Get())->GetGPUVirtualAddress());
 	dev.list->SetComputeRootShaderResourceView(
 	    14, (adapter_bridge ? adapter_bridge->fold_resident : model_const_buf.Get())->GetGPUVirtualAddress());
+	// Paged-KV plan §4 item 1 (G2): the page table (t10) and the two page constants (b1), call-constant
+	// like every binding above, so set once here. `page_positions` is at most the cap (one page) and
+	// fits a uint as the cap does; `page_bytes` is the stride, read only through a nonzero table entry,
+	// and a pool whose bytes pass 2^32 is refused at create (§4 item 3), so the clamp below changes
+	// nothing a shader reads (a one-page view's table entry is 0).
+	dev.list->SetComputeRootShaderResourceView(harness::Device::kComposedRootParamKvPageTable,
+	                                           kv_page_table_buf->GetGPUVirtualAddress());
+	{
+		const uint32_t page_constants[harness::Device::kComposedPageConstantCount] = {
+		    static_cast<uint32_t>(kv_view.page_positions),
+		    static_cast<uint32_t>(std::min<size_t>(kv_view.page_bytes, UINT32_MAX))};
+		dev.list->SetComputeRoot32BitConstants(harness::Device::kComposedRootParamKvPageConstants,
+		                                       harness::Device::kComposedPageConstantCount, page_constants, 0);
+	}
 
 	out_state->H = H;
 	out_state->HD = HD;
@@ -3023,10 +3090,14 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 	// the sibling does.
 	const bool kv_resume_barrier_entry_value =
 	    io_external_kv_needs_resume_barrier != nullptr && *io_external_kv_needs_resume_barrier;
+	// Paged-KV plan §4 items 2 and 6 (G2): this flat-workspace entry (every legacy dedicated sequence
+	// and every pre-1.0 caller) binds the one-page view of its workspace; the ladder, the shaders and
+	// the readback offsets below all address K/V through it.
+	const superslm::KvPageView kv_view = GpuOnePageView(workspace, workspace_size, context_cap);
 	try {
 	const superslm::SslmForwardStatus prep_status = PrepareGpuLayerLoopChunkOpenState(
 	    dev, seq, layers, num_hidden_layers, layer_budget, hidden_size, head_dim, num_key_value_heads,
-	    intermediate_size, context_cap, rope_tables, workspace, workspace_size, external_kv_resident,
+	    intermediate_size, context_cap, rope_tables, kv_view, workspace_size, external_kv_resident,
 	    io_external_kv_needs_resume_barrier, external_weights_resident, external_rope_cos_resident,
 	    external_rope_sin_resident, external_rope_has, external_rope_cos_elems,
 	    external_rope_sin_elems, adapter_bridge, &state, q_width, model_generation);
@@ -3113,23 +3184,18 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 	// this call issued wrote at most one new K row and one new V row per (layer, kv_head) it
 	// processed, at `position_u32` (`kv_proj_site.hlsl`'s own write; `rope_guard_site.hlsl`'s own
 	// in-place K rotation touches the SAME row, never a different one) -- the identical
-	// `KvHalfOffsetGpu`/`KvRowOffsetWithinHalfGpu` addressing `KeyRowGpu`/`ValueRowGpu` below use
-	// host-side, so every offset computed here is exact, not an approximation of what changed. ---
+	// page-table addressing (site_common.hlsli KvRowAddrGpu, through this call's view; paged-KV
+	// plan §4 item 6) `KeyRowGpu`/`ValueRowGpu` below use host-side, so every offset computed here is
+	// exact, not an approximation of what changed. ---
 	seq_readback = dev.MakeBuffer(SeqTotalSize(H), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
 	                                    D3D12_RESOURCE_STATE_COPY_DEST);
+	// Paged-KV plan §4 item 6 (G2): through the call's page view, by the shaders' own formula.
 	kv_row_offsets.reserve(static_cast<size_t>(layers_to_record) * NH * 2u);
 	for (uint32_t i = 0; i < layers_to_record; ++i) {
 		const uint32_t l = start_layer + i;
-		const size_t half_off = static_cast<size_t>(l) * static_cast<size_t>(context_cap) *
-		                         static_cast<size_t>(NH) * static_cast<size_t>(HD) * 2u;
-		const size_t k_store_size =
-		    static_cast<size_t>(context_cap) * static_cast<size_t>(NH) * static_cast<size_t>(HD);
 		for (uint32_t h = 0; h < NH; ++h) {
-			const size_t row_off = static_cast<size_t>(h) * static_cast<size_t>(context_cap) *
-			                            static_cast<size_t>(HD) +
-			                        static_cast<size_t>(position_u32) * static_cast<size_t>(HD);
-			kv_row_offsets.push_back(half_off + row_off);                 // K row
-			kv_row_offsets.push_back(half_off + k_store_size + row_off);  // V row
+			kv_row_offsets.push_back(KvViewRowOffset(kv_view, l, 0u, NH, HD, h, position_u32));  // K row
+			kv_row_offsets.push_back(KvViewRowOffset(kv_view, l, 1u, NH, HD, h, position_u32));  // V row
 		}
 	}
 	const size_t kv_readback_bytes = kv_row_offsets.size() * static_cast<size_t>(HD);
@@ -3539,10 +3605,13 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 	// resume-barrier read/write cycle) and this correctly captures `true`.
 	const bool kv_resume_barrier_entry_value =
 	    io_external_kv_needs_resume_barrier != nullptr && *io_external_kv_needs_resume_barrier;
+	// Paged-KV plan §4 items 2 and 6 (G2): as `RunLayerLoopGpuSubmit` -- the one-page view of the
+	// flat workspace, for the ladder, the shaders and the chunk's readback offsets.
+	const superslm::KvPageView kv_view = GpuOnePageView(workspace, workspace_size, context_cap);
 	try {
 	const superslm::SslmForwardStatus prep_status = PrepareGpuLayerLoopChunkOpenState(
 	    dev, seq, layers, num_hidden_layers, /*layer_budget=*/num_hidden_layers, hidden_size, head_dim,
-	    num_key_value_heads, intermediate_size, context_cap, rope_tables, workspace, workspace_size,
+	    num_key_value_heads, intermediate_size, context_cap, rope_tables, kv_view, workspace_size,
 	    external_kv_resident, io_external_kv_needs_resume_barrier, external_weights_resident,
 	    external_rope_cos_resident, external_rope_sin_resident, external_rope_has,
 	    external_rope_cos_elems, external_rope_sin_elems, adapter_bridge, &state, q_width,
@@ -3650,17 +3719,11 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 		// RunLayerLoopGpuSubmit's own readback section) to this token's own record-time
 		// position, growing `kv_row_offsets` to `admit_count * num_hidden_layers * NH * 2`
 		// entries across the whole chunk.
+		// Paged-KV plan §4 item 6 (G2): through the call's page view, by the shaders' own formula.
 		for (uint32_t l = 0; l < N; ++l) {
-			const size_t half_off = static_cast<size_t>(l) * static_cast<size_t>(context_cap) *
-			                         static_cast<size_t>(NH) * static_cast<size_t>(HD) * 2u;
-			const size_t k_store_size =
-			    static_cast<size_t>(context_cap) * static_cast<size_t>(NH) * static_cast<size_t>(HD);
 			for (uint32_t h = 0; h < NH; ++h) {
-				const size_t row_off = static_cast<size_t>(h) * static_cast<size_t>(context_cap) *
-				                            static_cast<size_t>(HD) +
-				                        static_cast<size_t>(position_u32) * static_cast<size_t>(HD);
-				kv_row_offsets.push_back(half_off + row_off);                 // K row
-				kv_row_offsets.push_back(half_off + k_store_size + row_off);  // V row
+				kv_row_offsets.push_back(KvViewRowOffset(kv_view, l, 0u, NH, HD, h, position_u32));  // K row
+				kv_row_offsets.push_back(KvViewRowOffset(kv_view, l, 1u, NH, HD, h, position_u32));  // V row
 			}
 		}
 	}
@@ -4435,25 +4498,29 @@ std::vector<double> LastCallPerDispatchTimingsMs() { return g_last_call_per_disp
 
 const int8_t* KeyRowGpu(const uint8_t* workspace, uint32_t layer, int64_t context_cap,
                          size_t num_kv_heads, size_t head_dim, size_t kv_head, int64_t position) {
-	// T-2032: the KV cache twin's own addressing, bit-exact against
-	// superslm::KeyRow (forward_sites.cpp's S3.7 accessor block) -- real once
-	// RunLayerLoopGpu (above) has written it; site_common.hlsli's
-	// KvHalfOffsetGpu/KvRowOffsetWithinHalfGpu are the SAME formula, ported.
-	const size_t half_off = static_cast<size_t>(layer) * static_cast<size_t>(context_cap) * num_kv_heads *
-	                             head_dim * 2u;
-	const size_t row_off =
-	    kv_head * static_cast<size_t>(context_cap) * head_dim + static_cast<size_t>(position) * head_dim;
-	return reinterpret_cast<const int8_t*>(workspace) + half_off + row_off;
+	// T-2032: the KV cache twin's own addressing, bit-exact against superslm::KeyRow
+	// (forward_sites.cpp). Paged-KV plan §4 item 6 (G2): the flat form is the one-page view of
+	// `workspace`, addressed by the shaders' own KvRowAddrGpu formula (below).
+	return KeyRowGpu(GpuOnePageView(const_cast<uint8_t*>(workspace), 0, context_cap), layer, num_kv_heads, head_dim,
+	                 kv_head, position);
 }
 
 const int8_t* ValueRowGpu(const uint8_t* workspace, uint32_t layer, int64_t context_cap,
                            size_t num_kv_heads, size_t head_dim, size_t kv_head, int64_t position) {
-	const size_t half_off = static_cast<size_t>(layer) * static_cast<size_t>(context_cap) * num_kv_heads *
-	                             head_dim * 2u;
-	const size_t k_store_size = static_cast<size_t>(context_cap) * num_kv_heads * head_dim;
-	const size_t row_off =
-	    kv_head * static_cast<size_t>(context_cap) * head_dim + static_cast<size_t>(position) * head_dim;
-	return reinterpret_cast<const int8_t*>(workspace) + half_off + k_store_size + row_off;
+	return ValueRowGpu(GpuOnePageView(const_cast<uint8_t*>(workspace), 0, context_cap), layer, num_kv_heads,
+	                   head_dim, kv_head, position);
+}
+
+const int8_t* KeyRowGpu(const superslm::KvPageView& view, uint32_t layer, size_t num_kv_heads, size_t head_dim,
+                         size_t kv_head, int64_t position) {
+	return reinterpret_cast<const int8_t*>(view.pool_base) +
+	       KvViewRowOffset(view, layer, 0u, num_kv_heads, head_dim, kv_head, position);
+}
+
+const int8_t* ValueRowGpu(const superslm::KvPageView& view, uint32_t layer, size_t num_kv_heads, size_t head_dim,
+                           size_t kv_head, int64_t position) {
+	return reinterpret_cast<const int8_t*>(view.pool_base) +
+	       KvViewRowOffset(view, layer, 1u, num_kv_heads, head_dim, kv_head, position);
 }
 
 // ===========================================================================
