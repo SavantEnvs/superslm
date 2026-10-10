@@ -1,5 +1,3 @@
-// RED STAGE: the snapshot written in place without its lock (1.8.0's tail); the green
-// implementation replaces this file.
 // GPU paged-KV plan (rev 16), step G3, decision 80: the finish tail's "last call" timing snapshot
 // (§4.4, *The not-ready poll*, *The finishing tail's shared state*). D3D12-free.
 //
@@ -63,8 +61,14 @@ private:
 		std::vector<double> per_dispatch_ms;
 	};
 	// The old block is released after the lock (it leaves with `fresh`).
-	void Swap(std::shared_ptr<const Block>& fresh) { current_.swap(fresh); }
-	std::shared_ptr<const Block> Load() const { return current_; }
+	void Swap(std::shared_ptr<const Block>& fresh) {
+		std::lock_guard<std::mutex> lock(mu_);
+		current_.swap(fresh);
+	}
+	std::shared_ptr<const Block> Load() const {
+		std::lock_guard<std::mutex> lock(mu_);
+		return current_;
+	}
 
 	mutable std::mutex mu_;
 	std::shared_ptr<const Block> current_;

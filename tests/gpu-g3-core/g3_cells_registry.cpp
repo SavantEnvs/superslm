@@ -70,8 +70,7 @@ RegraceResult RunRegrace(bool poll, long iters) {
 			FakeHandle* h = handed.exchange(nullptr);
 			if (!h) return false;
 			if (poll) {
-				while (!Ready(h, /*block=*/false)) {
-				}
+				while (!Ready(h, /*block=*/false)) std::this_thread::yield();
 			} else {
 				std::lock_guard<std::mutex> g(serial);
 				(void)Ready(h, /*block=*/true);
@@ -79,14 +78,25 @@ RegraceResult RunRegrace(bool poll, long iters) {
 			++res.readies;
 			return true;
 		};
-		while (!stop.load()) (void)take();
+		while (!stop.load()) {
+			if (!take()) std::this_thread::yield();  // idle: let a descheduled maker run (oversubscribed runners)
+		}
 		while (take()) {
 		}
 	});
 	for (long i = 0; i < iters; ++i) {
-		while (handed.load() != nullptr) NonSubmitting(&Y, &sink);
+		// Waiting for T2, the maker walks its own list at the return of non-submitting calls beside
+		// the finisher (the race the lock closes); each wait step yields, so an oversubscribed runner
+		// does not spin against a descheduled finisher.
+		while (handed.load() != nullptr) {
+			NonSubmitting(&Y, &sink);
+			std::this_thread::yield();
+		}
 		FakeHandle* x = &X[i & 1];
-		while (x->state.load() == St::Submitted) NonSubmitting(&Y, &sink);  // T2 still finishing it
+		while (x->state.load() == St::Submitted) {  // T2 still finishing it
+			NonSubmitting(&Y, &sink);
+			std::this_thread::yield();
+		}
 		{
 			// The stash first (its walk drains it, observing a value above X's), then the decode.
 			std::unique_lock<std::mutex> g(serial, std::defer_lock);
@@ -146,7 +156,10 @@ void CellChurn() {
 	std::atomic<long> sink{0};
 	const uint64_t r0 = Reports();
 	std::thread other([&] {
-		while (!stop.load()) NonSubmitting(&B, &sink);  // an unrelated walker
+		while (!stop.load()) {  // an unrelated walker
+			NonSubmitting(&B, &sink);
+			std::this_thread::yield();
+		}
 	});
 	long busy = 0, unfinished = 0;
 	for (long i = 0; i < n; ++i) {

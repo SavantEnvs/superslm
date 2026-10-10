@@ -1,5 +1,3 @@
-// RED STAGE: moves without re-registering, destruction and move-assignment without draining; the
-// green implementation replaces this file.
 // GPU paged-KV plan (rev 16), step G3: GpuInFlightToken, the RAII in-flight token (§4.4, *Three
 // states*, *The finish made structural*). D3D12-free.
 //
@@ -76,6 +74,7 @@ public:
 	// Drains the record this token still holds, first; then carries `other`'s.
 	BasicGpuInFlightToken& operator=(BasicGpuInFlightToken&& other) noexcept {
 		if (this != &other) {
+			if (payload_) DrainAndFreeNoThrow();
 			payload_ = other.payload_;
 			other.payload_ = nullptr;
 			Adopt();
@@ -120,10 +119,14 @@ public:
 	void ReregisterOnLowering() noexcept { Adopt(); }
 
 private:
-	void Adopt() noexcept {}
+	void Adopt() noexcept {
+		if (payload_ && payload_->submission_.rec_) inflight::Reregister(payload_->submission_.rec_, this);
+	}
 	void DrainAndFreeNoThrow() noexcept {
-		delete payload_;
+		GpuInFlightPayload* p = payload_;
 		payload_ = nullptr;
+		p->submission_.DrainNoThrow();
+		delete p;
 	}
 	void DrainFromWalk() noexcept override {
 		if (payload_) DrainAndFreeNoThrow();

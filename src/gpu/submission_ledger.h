@@ -1,5 +1,3 @@
-// RED STAGE: the API with placeholder bodies (no ledger values kept, no check, no drain); the green
-// implementation replaces this file.
 // GPU paged-KV plan (rev 16), step G3: the submission ledger (§4.4, *The submission ledger*), the
 // reset-site check PoolSubmitAssert, the device's submission surface (BeginRecording(), Submit(),
 // Wait(v), Poll(v), Drain()) over abstract fence and queue primitives, and GpuSubmission, the
@@ -97,10 +95,20 @@ private:
 
 	// The compare-and-swap maximum. A failed exchange reloads `cur`, so a higher value that landed
 	// in between is kept and the loop ends.
-	void RaiseObserved(uint64_t) noexcept {}
-	void MarkUnsignaled() noexcept {}
-	void MarkSignaled(uint64_t) noexcept {}
-	void MarkLost() noexcept {}
+	void RaiseObserved(uint64_t v) noexcept {
+		uint64_t cur = observed_.load();
+#if defined(SUPERSLM_LEDGER_YIELD_HOOK)
+		if (LedgerYieldHookFn hook = LedgerYieldHookForTest().load()) hook(v);
+#endif
+		while (v > cur && !observed_.compare_exchange_weak(cur, v)) {
+		}
+	}
+	void MarkUnsignaled() noexcept { unsignaled_.store(true); }
+	void MarkSignaled(uint64_t v) noexcept {
+		submitted_.store(v);
+		unsignaled_.store(false);
+	}
+	void MarkLost() noexcept { lost_.store(true); }
 
 	std::atomic<uint64_t> submitted_{0};
 	std::atomic<uint64_t> observed_{0};
@@ -111,7 +119,15 @@ private:
 // The check, inside BeginRecording() before the reset. It reads host-side values only and never
 // queries the fence, so whether it fires does not depend on GPU timing: it fires if and only if the
 // host has not observed the last submission complete, or the ledger is stranded.
-inline void PoolSubmitAssert(const SubmissionLedger&) {}
+inline void PoolSubmitAssert(const SubmissionLedger& ledger) {
+	if (ledger.Stranded()) {
+		throw GpuSubmissionStrandedError("D3D12 device's submission ledger is stranded; no reset is made");
+	}
+	if (ledger.Unobserved()) {
+		throw PoolSubmitContractError(
+		    "reset while the device's last submission is unobserved (P1's precondition broken); no reset is made");
+	}
+}
 
 class GpuSubmission;
 template <class Record>
@@ -128,7 +144,17 @@ public:
 	// The boundary guard check, then PoolSubmitAssert, then the allocator's and the list's reset.
 	// Throws GpuSubmissionStrandedError (stranded ledger) or PoolSubmitContractError (unobserved
 	// ledger, or a C ABI call that passed no EntrySubmitGuard) before the reset.
-	void BeginRecording() { ResetAllocatorAndList(); }
+	void BeginRecording() {
+		if (ledger_.Stranded()) {
+			throw GpuSubmissionStrandedError("D3D12 device's submission ledger is stranded; no reset is made");
+		}
+		if (inflight::BoundaryGuardCheckRefuses()) {
+			throw PoolSubmitContractError(
+			    "boundary guard check: a C ABI call reached a reset without passing EntrySubmitGuard; no reset is made");
+		}
+		PoolSubmitAssert(ledger_);
+		ResetAllocatorAndList();
+	}
 
 	// ExecuteCommandLists, unsignaled_ set, Signal at a fresh value; see the definition below.
 	[[nodiscard]] GpuSubmission Submit(bool retry = true);
@@ -136,9 +162,21 @@ public:
 	// Today's fence wait: returns without arming the event when the fence is already at `v`.
 	// Raises observed_ to `v` only once the fence has reached it. A wait that cannot be armed or
 	// confirmed sets lost_ and throws GpuSubmissionStrandedError.
-	void Wait(uint64_t) {}
-	bool Poll(uint64_t v) noexcept { return CompletedFenceValue() >= v; }
-	void Drain() {}
+	void Wait(uint64_t v) {
+		if (!WaitNoThrow(v)) throw GpuSubmissionStrandedError("D3D12 fence wait could not be confirmed");
+	}
+	// Today's completed-value read: true, with observed_ raised to `v`, once the fence has reached
+	// `v`. Never waits. Exempt from P1's serialisation (a poller).
+	bool Poll(uint64_t v) noexcept {
+		if (CompletedFenceValue() < v) return false;
+		ledger_.RaiseObserved(v);
+		return true;
+	}
+	// Wait(submitted_); on a stranded ledger it throws GpuSubmissionStrandedError.
+	void Drain() {
+		if (ledger_.Stranded()) throw GpuSubmissionStrandedError("D3D12 device's submission ledger is stranded");
+		Wait(ledger_.submitted());
+	}
 
 	const SubmissionLedger& ledger() const noexcept { return ledger_; }
 
@@ -170,7 +208,18 @@ private:
 
 	// The non-throwing drain every token's destructor uses: false when the wait strands, with
 	// lost_ set.
-	bool WaitNoThrow(uint64_t) noexcept { return true; }
+	bool WaitNoThrow(uint64_t v) noexcept {
+		if (CompletedFenceValue() >= v) {
+			ledger_.RaiseObserved(v);
+			return true;
+		}
+		if (!WaitFenceEvent(v)) {
+			ledger_.MarkLost();
+			return false;
+		}
+		ledger_.RaiseObserved(v);
+		return true;
+	}
 
 	SubmissionLedger ledger_;
 	uint64_t fence_val_ = 0;
@@ -187,16 +236,21 @@ public:
 	GpuSubmission() noexcept = default;
 	GpuSubmission(GpuSubmission&& other) noexcept : rec_(other.rec_) {
 		other.rec_ = nullptr;
+		if (rec_) inflight::Reregister(rec_, this);
 	}
 	// A move-assignment into a submission that still holds a record drains that record first.
 	GpuSubmission& operator=(GpuSubmission&& other) noexcept {
 		if (this != &other) {
+			if (rec_) DrainNoThrow();
 			rec_ = other.rec_;
 			other.rec_ = nullptr;
+			if (rec_) inflight::Reregister(rec_, this);
 		}
 		return *this;
 	}
-	~GpuSubmission() { delete rec_; }
+	~GpuSubmission() {
+		if (rec_) DrainNoThrow();
+	}
 
 	bool holds() const noexcept { return rec_ != nullptr; }
 	uint64_t fence_value() const noexcept { return rec_ ? rec_->fence_value() : 0; }
@@ -208,8 +262,7 @@ public:
 	// that cannot be confirmed the ledger is stranded (lost_), the record is freed, and
 	// GpuSubmissionStrandedError is thrown.
 	void Wait() {
-		delete rec_;
-		rec_ = nullptr;
+		if (rec_ && !DrainNoThrow()) throw GpuSubmissionStrandedError("D3D12 fence wait could not be confirmed");
 	}
 	// The non-throwing drain: false when the wait strands (lost_ set). Frees the record and empties
 	// the token either way.
@@ -243,13 +296,43 @@ private:
 // throws GpuSubmissionStrandedError (rule 0). Without `retry` a failed Signal is stranded at once.
 // The record and this thread's registry list are allocated before ExecuteCommandLists, so an
 // allocation failure submits nothing.
-inline GpuSubmission SubmissionDevice::Submit(bool) {
+inline GpuSubmission SubmissionDevice::Submit(bool retry) {
+	inflight::ReserveRegistration();
 	inflight::InFlightRecord* rec = new inflight::InFlightRecord(this);
-	ExecuteRecordedList();
-	int32_t failure = 0;
-	rec->value_ = ++fence_val_;
-	(void)SignalFence(rec->value_, &failure);
-	return GpuSubmission(rec);
+	try {
+		ExecuteRecordedList();
+	} catch (...) {
+		delete rec;
+		throw;
+	}
+	ledger_.MarkUnsignaled();
+	int32_t first_failure = 0;
+	const uint64_t first_value = ++fence_val_;
+	if (SignalFence(first_value, &first_failure)) {
+		ledger_.MarkSignaled(first_value);
+		rec->value_ = first_value;
+		return GpuSubmission(rec);
+	}
+	if (!retry) {
+		delete rec;
+		throw GpuSubmissionStrandedError("D3D12 fence Signal failed after ExecuteCommandLists");
+	}
+	int32_t retry_failure = 0;
+	const uint64_t retry_value = ++fence_val_;
+	if (!SignalFence(retry_value, &retry_failure)) {
+		delete rec;
+		throw GpuSubmissionStrandedError("D3D12 fence Signal and its retry both failed after ExecuteCommandLists");
+	}
+	ledger_.MarkSignaled(retry_value);
+	rec->value_ = retry_value;
+	{
+		GpuSubmission recovered(rec);
+		recovered.Wait();
+	}
+	ThrowSignalFailure(first_failure);
+	// ThrowSignalFailure is [[noreturn]]; an override that returned anyway leaves the first failure
+	// unreported, so the call still fails.
+	throw GpuSubmissionStrandedError("D3D12 fence Signal failed; its failure could not be rethrown");
 }
 
 }  // namespace harness
