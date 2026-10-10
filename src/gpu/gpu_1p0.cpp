@@ -583,8 +583,9 @@ struct SslmGpuKvPoolHandle {
 	// Item 4: true once a pooled submission's readback left `pool_buf` in COPY_SOURCE; read and
 	// consumed by the next pooled submission's resume barrier, with 1.8.0's restore-on-failure.
 	bool kv_needs_resume_barrier = false;
-	// Sequences drawn from this pool and not yet released; destroy refuses while nonzero.
-	int64_t live_refs = 0;
+	// Sequences drawn from this pool and not yet released; destroy refuses while nonzero. Atomic, as
+	// the CPU twin's is (review-g23 nit: the arc verbs change it beside other threads' calls).
+	std::atomic<int64_t> live_refs{0};
 
 	SslmGpuKvPoolHandle() = default;
 	SslmGpuKvPoolHandle(const SslmGpuKvPoolHandle&) = delete;
@@ -593,12 +594,13 @@ struct SslmGpuKvPoolHandle {
 		if (pages) superslm::kv_pages::PoolDestroy(pages);
 	}
 	// The pooled handle of this pool that is Submitted, or null. No guard reads it (§4 item 4).
-	const SslmGpuSequenceHandle* submitted() const { return submitted_; }
+	const SslmGpuSequenceHandle* submitted() const { return submitted_.load(std::memory_order_acquire); }
 
 private:
 	friend void SetGpuSeqState(SslmGpuSequenceHandle*, superslm_gpu::SslmSequenceGpuState,
 	                           const SslmGpuAdapterHandle*);
-	SslmGpuSequenceHandle* submitted_ = nullptr;
+	// Atomic (review-g23 F3): a poller's lowering clears it while a sibling's submission may set it.
+	std::atomic<SslmGpuSequenceHandle*> submitted_{nullptr};
 };
 
 // T-2113 (B3, design Sec5.3/Sec10 B3): the real SslmGpuSequenceHandle. Owns a
@@ -675,17 +677,8 @@ struct SslmGpuSequenceHandle final : public superslm_gpu::inflight::InFlightHand
 	// outermost call's return passes its record while this handle is Submitted.
 	superslm_gpu::GpuInFlightToken in_flight{this};
 
-	// T-2124 (D-SLM3446 P0-3): the adapter bound at this handle's own currently-in-flight
-	// submission, null when no adapter was bound or nothing is in flight -- set in
-	// SubmitOneSequenceDecode alongside `in_flight` above, cleared and used to decrement the
-	// adapter's own `submitted_sequences` count in sslm_gpu_ready the instant this sequence
-	// collapses back to Idle. An adapter is a per-CALL argument (sslm_decode_step_gpu's own
-	// `adapter_or_null`), never state a sequence handle otherwise retains, so this is the one
-	// place a submitted call's own adapter binding needs remembering between Submit and Finish.
-	const SslmGpuAdapterHandle* in_flight_adapter = nullptr;
-
 	// T-2243 (S2, design plan Sec6.1): the adapter this sequence is currently bound to, across
-	// calls -- set by `sslm_gpu_seq_bind_adapter`, distinct from `in_flight_adapter` above
+	// calls -- set by `sslm_gpu_seq_bind_adapter`, distinct from `in_flight_adapter` below
 	// (which answers "which adapter did THIS in-flight call use" and is cleared the instant
 	// that call's own window closes). The two G5 bridge choke points
 	// (`DriveGpuSeqToFullDepthForG5Bridge`, `SubmitAdmittedChunkForG5Bridge`) read this field
@@ -763,13 +756,6 @@ struct SslmGpuSequenceHandle final : public superslm_gpu::inflight::InFlightHand
 	uint32_t armed_view_fault = 0;
 	superslm::SslmForwardStatus last_ladder_status = superslm::SslmForwardStatus::Ok;
 
-	// SetGpuSeqState's record of which counts its last move to Submitted raised, so the move out
-	// lowers exactly those (§4.4, *Three states*). Written only by the accessor.
-	bool raised_process = false;
-	bool raised_pooled = false;
-	SslmGpuModelHandle* raised_model = nullptr;
-	const SslmGpuAdapterHandle* raised_adapter = nullptr;
-
 	// T-2114 (S2): see SslmGpuModelHandle's own comment on its `destroyed` field
 	// (gpu_1p0.cpp) -- identical disposition here.
 	bool destroyed = false;
@@ -777,6 +763,22 @@ struct SslmGpuSequenceHandle final : public superslm_gpu::inflight::InFlightHand
 private:
 	friend void SetGpuSeqState(SslmGpuSequenceHandle*, superslm_gpu::SslmSequenceGpuState,
 	                           const SslmGpuAdapterHandle*);
+	// Private, so only the accessor can write them (review-g23 nit).
+	//
+	// T-2124 (D-SLM3446 P0-3): the adapter bound at this handle's own currently-in-flight
+	// submission, null when no adapter was bound or nothing is in flight -- set in
+	// SubmitOneSequenceDecode alongside `in_flight` above, cleared and used to decrement the
+	// adapter's own `submitted_sequences` count in sslm_gpu_ready the instant this sequence
+	// collapses back to Idle. An adapter is a per-CALL argument (sslm_decode_step_gpu's own
+	// `adapter_or_null`), never state a sequence handle otherwise retains, so this is the one
+	// place a submitted call's own adapter binding needs remembering between Submit and Finish.
+	const SslmGpuAdapterHandle* in_flight_adapter = nullptr;
+	// SetGpuSeqState's record of which counts its last move to Submitted raised, so the move out
+	// lowers exactly those (§4.4, *Three states*). Written only by the accessor.
+	bool raised_process = false;
+	bool raised_pooled = false;
+	SslmGpuModelHandle* raised_model = nullptr;
+	const SslmGpuAdapterHandle* raised_adapter = nullptr;
 	std::atomic<superslm_gpu::SslmSequenceGpuState> state_{superslm_gpu::SslmSequenceGpuState::Idle};
 };
 
@@ -808,8 +810,8 @@ void SetGpuSeqState(SslmGpuSequenceHandle* seq, superslm_gpu::SslmSequenceGpuSta
 			seq->raised_pooled = true;
 			// The process scope admits at most one Submitted pooled handle (§4 item 4), so the
 			// pool records no other holder here (a G3 code-review item).
-			assert(seq->pool->submitted_ == nullptr);
-			seq->pool->submitted_ = seq;
+			assert(seq->pool->submitted_.load(std::memory_order_acquire) == nullptr);
+			seq->pool->submitted_.store(seq, std::memory_order_release);
 		}
 		seq->in_flight_adapter = adapter;
 		if (adapter != nullptr) {
@@ -817,6 +819,13 @@ void SetGpuSeqState(SslmGpuSequenceHandle* seq, superslm_gpu::SslmSequenceGpuSta
 			seq->raised_adapter = adapter;
 		}
 	} else if (was_submitted && !now_submitted) {
+		// The pool's holder pointer is cleared before any count drops (review-g23 F3): the counts
+		// admit the next pooled submission, so a sibling the lowered counts admit never finds the
+		// pointer still held.
+		if (seq->raised_pooled && seq->pool != nullptr) {
+			SslmGpuSequenceHandle* expected = seq;
+			seq->pool->submitted_.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+		}
 		if (seq->raised_process && GpuSubmittedCounts::process_ > 0) {
 			GpuSubmittedCounts::process_ -= 1;
 		}
@@ -827,7 +836,6 @@ void SetGpuSeqState(SslmGpuSequenceHandle* seq, superslm_gpu::SslmSequenceGpuSta
 		seq->raised_model = nullptr;
 		if (seq->raised_pooled) {
 			if (GpuSubmittedCounts::pooled_ > 0) GpuSubmittedCounts::pooled_ -= 1;
-			if (seq->pool != nullptr && seq->pool->submitted_ == seq) seq->pool->submitted_ = nullptr;
 		}
 		seq->raised_pooled = false;
 		if (seq->raised_adapter != nullptr && seq->raised_adapter->submitted_sequences_ > 0) {
@@ -909,7 +917,7 @@ Microsoft::WRL::ComPtr<ID3D12Resource> UploadResidentBufferSyncTo(
 	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	dev.list->ResourceBarrier(1, &barrier);
 	dev.CloseListOrThrow();
-	dev.Submit(/*retry=*/false).Wait();
+	dev.SubmitAndWaitKeepingAlive(/*retry=*/false, upload, resident);  // kept alive if it strands (F1)
 	return resident;
 }
 
@@ -1036,8 +1044,9 @@ void ZeroFillResidentUavBufferSync(superslm_gpu::harness::Device& dev, const Zer
 	dev.list->ResourceBarrier(1, &barrier);
 	dev.CloseListOrThrow();
 	// ---- end of the recording window ----
-	// The ledger's submission and wait (G3): Submit(no retry), as before, then its Wait().
-	dev.Submit(/*retry=*/false).Wait();
+	// The ledger's submission and wait (G3): Submit(no retry), as before, then its Wait(); both
+	// buffers kept alive if either strands (review-g23 F1).
+	dev.SubmitAndWaitKeepingAlive(/*retry=*/false, b.staging, b.resident);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1104,7 +1113,11 @@ SslmGpuStatus ClassifyHandleFault(superslm_gpu::harness::Device* dev) {
 // GpuSubmissionStrandedError (rule 0). From G3 all of it is the ledger's (plan §4.4, *The ledger on
 // the fault paths*): Submit() makes the fresh-value retry and, recovered, drains it before it
 // rethrows the first failure; the submission's own Wait() is the success path's wait.
-void ExecuteSignalAndWait(superslm_gpu::harness::Device& dev) { dev.Submit().Wait(); }
+// `keep...` are the call's resources, kept alive if the submission strands (review-g23 F1).
+template <class... T>
+void ExecuteSignalAndWait(superslm_gpu::harness::Device& dev, const Microsoft::WRL::ComPtr<T>&... keep) {
+	dev.SubmitAndWaitKeepingAlive(/*retry=*/true, keep...);
+}
 
 void TransitionBuffer(ID3D12GraphicsCommandList* list, ID3D12Resource* r, D3D12_RESOURCE_STATES before,
                 D3D12_RESOURCE_STATES after) {
@@ -1240,7 +1253,7 @@ SslmGpuStatus CreateDeviceLogitsBuffers(SslmGpuContext* ctx, const int8_t* head_
 		TransitionBuffer(dev.list.Get(), out->head.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
 		           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		dev.CloseListOrThrow();
-		ExecuteSignalAndWait(dev);
+		ExecuteSignalAndWait(dev, staging, out->head, out->x_upload, out->x, out->out, out->readback);
 		return SSLM_OK;
 	} catch (const std::bad_alloc&) {
 		throw;
@@ -1300,7 +1313,7 @@ SslmGpuStatus RunDeviceLogits(SslmGpuContext* ctx, const DeviceLogitsBuffers& b,
 		TransitionBuffer(list, b.x.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
 		           D3D12_RESOURCE_STATE_COPY_DEST);
 		dev.CloseListOrThrow();
-		ExecuteSignalAndWait(dev);
+		ExecuteSignalAndWait(dev, b.head, b.x_upload, b.x, b.out, b.readback);
 		std::memcpy(wide_out, b.readback_ptr, static_cast<size_t>(b.V) * 8);
 #if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION)
 		ApplyReadbackOverrideSeam(wide_out, b.V);
@@ -2180,17 +2193,20 @@ SslmGpuStatus sslm_gpu_seq_releaseImpl(SslmGpuContext* ctx, SslmGpuSequenceHandl
 	}
 	// Paged-KV plan §4 item 6b, step G3: a pooled sequence's release touches only its own table and
 	// reserve (its pages back to the pool, a freed dirty page poisoned in the pool's host mirror by
-	// kv_pages) and fills nothing, so no neighbour's rows change. The holder is released before any
-	// count moves, so a refusal leaves the handle as it was.
+	// kv_pages) and fills nothing, so no neighbour's rows change. HolderRelease consumes the holder
+	// whatever it returns (review-g23 F2), so the release is finished either way and a non-OK status
+	// (a refcount underflow, cell 11.3's class) is reported at the end, as the CPU twin does
+	// (ReleaseHolder, sslm_abi.cpp).
+	SslmGpuStatus holder_status = SSLM_OK;
 	if (seq->pool != nullptr) {
 		if (seq->holder != nullptr) {
 			const superslm::kv_pages::PageStatus ps = superslm::kv_pages::HolderRelease(seq->holder);
-			if (ps != superslm::kv_pages::PageStatus::kOk) {
-				return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;  // a refcount underflow (cell 11.3's class)
-			}
-			seq->holder = nullptr;
+			seq->holder = nullptr;  // freed by HolderRelease on every return
+			if (ps != superslm::kv_pages::PageStatus::kOk) holder_status = SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 		}
-		if (seq->pool->live_refs > 0) seq->pool->live_refs -= 1;
+		int64_t refs = seq->pool->live_refs.load();
+		while (refs > 0 && !seq->pool->live_refs.compare_exchange_weak(refs, refs - 1)) {
+		}
 		seq->pool = nullptr;
 	}
 	if (seq->model && seq->model->live_sequences > 0) {
@@ -2209,7 +2225,7 @@ SslmGpuStatus sslm_gpu_seq_releaseImpl(SslmGpuContext* ctx, SslmGpuSequenceHandl
 	}
 	seq->destroyed = true;
 	delete seq;
-	return SSLM_OK;
+	return holder_status;
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -2360,7 +2376,7 @@ SslmGpuStatus sslm_gpu_seq_create_budgetedImpl(SslmGpuContext* ctx, SslmGpuModel
 	h->bind_eligible = true;
 	SetGpuSeqState(h.get(), superslm_gpu::SslmSequenceGpuState::Idle, nullptr);  // a fresh handle: Idle, no count
 	h->live_state.hidden_codes = h->hidden_codes.data();
-	pool->live_refs += 1;
+	pool->live_refs.fetch_add(1);
 	model->live_sequences += 1;
 	ctx->live_handles += 1;
 	*out_seq = h.release();
@@ -3652,6 +3668,7 @@ SslmGpuStatus sslm_gpu_seq_resetImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle*
 	if (!superslm_gpu::CallProceedsOrBusy_SeqReset(is_submitted)) {
 		return SSLM_BUSY;  // design Sec4.2's own state table, unchanged policy.
 	}
+	SslmGpuStatus reset_status = SSLM_OK;
 	std::fill(seq->hidden_codes.begin(), seq->hidden_codes.end(), 0);
 	seq->hidden_scale = superslm::CarriedScale{};
 	seq->layer_index = 0;
@@ -3670,9 +3687,11 @@ SslmGpuStatus sslm_gpu_seq_resetImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle*
 		// would erase every neighbour's rows. A pooled reset touches only its own table and reserve
 		// (its pages back to its reserve, kv_pages) and fills nothing; no read goes past a holder's
 		// live width, so stale rows are never observed. The table changed, so it is re-uploaded.
+		// HolderUnmapAll completes the unmap whatever it returns, so a non-OK status (a refcount
+		// underflow) finishes the reset and is reported at the end (review-g23 nit).
 		if (seq->holder != nullptr) {
 			const superslm::kv_pages::PageStatus ps = superslm::kv_pages::HolderUnmapAll(seq->holder);
-			if (ps != superslm::kv_pages::PageStatus::kOk) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+			if (ps != superslm::kv_pages::PageStatus::kOk) reset_status = SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 		}
 		seq->table_dirty = true;
 		// Paged-KV plan §3.4's reset row (G4): origin := 0, so the limit is the declared budget's
@@ -3696,7 +3715,7 @@ SslmGpuStatus sslm_gpu_seq_resetImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle*
 	seq->ready_for_logits = false;
 	seq->prefill_hidden_valid = false;  // prefill snapshot writer: reset
 	seq->bind_eligible = true;
-	return SSLM_OK;
+	return reset_status;
 }
 
 // T-2113 (B3): the bench-only accessor bodies declared in gpu_1p0_bench_bridge.h -- B5
@@ -6082,6 +6101,15 @@ void ArmGpuPoolZeroFillCloseFaultForTest(uint32_t consecutive_failures) noexcept
 	superslm_gpu::harness::GpuTestSeamState& seam = superslm_gpu::harness::TestSeamState();
 	std::lock_guard<std::mutex> lock(seam.mutex);
 	seam.pool_zero_fill_close_failures = consecutive_failures;  // 0 disarms
+}
+
+// review-g23 F2's pin: a refcount underflow at the pooled sequence's release.
+bool ZeroGpuPooledSeqReservePageRefcountForTest(SslmGpuSequenceHandle* seq) noexcept {
+	if (seq == nullptr || seq->pool == nullptr || seq->holder == nullptr || seq->holder->reserve.empty()) return false;
+	superslm::kv_pages::PagePool* pages = seq->pool->pages;
+	std::lock_guard<superslm::kv_pages::CountingMutex> lock(pages->mutex);
+	pages->refcount[seq->holder->reserve.front()] = 0;
+	return true;
 }
 
 uint32_t SslmGpuAllocCountForTest() noexcept {
