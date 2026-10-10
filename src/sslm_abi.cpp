@@ -248,10 +248,11 @@ superslm::GemmThreading MatvecThreading(const sslm_workspace_s* ws) {
 
 // C1/C3. A caller-owned KV region. Paged-KV plan (rev 16.1) §3.6, step C4: the region is a page
 // pool (src/kv_pages.h) of `block_count * cap_pages` pages of `page_bytes` bytes, B positions each
-// (§3.1), in the same buffer the block pool used: B divides the cap, so `block_count` blocks are
-// exactly that many pages. The page module owns the free list, the refcounts and the pool mutex.
-// `block_count` and `block_size` keep their old meaning for sslm_kv_block_size's callers and the
-// block-index peek seam. `live_refs` is the SSLM_POOL_HAS_LIVE_HANDLES guard's own bookkeeping
+// (§3.1), in the buffer the block pool used: a block is ceil(cap/B) pages, which exceed 1.11.0's flat
+// block by the last page's slack where B does not divide the cap, and sslm_kv_pool_overhead_size
+// carries that slack (rev 16.22, D-SLM8427). The page module owns the free list, the refcounts and the
+// pool mutex. `block_size` keeps 1.11.0's meaning (the flat block: the legacy save's K/V section and
+// adopt's cap guard); `block_count` bounds the block-index peek seam, which strides by cap_pages pages. `live_refs` is the SSLM_POOL_HAS_LIVE_HANDLES guard's own bookkeeping
 // (design Sec6): one per live holder (sequence or prefix) drawn from this pool.
 struct sslm_kv_pool_s {
 	// C2 (Claude/Poirot/2c18dab-t2139-abi-build-review.md): the owning model, bound at
@@ -678,23 +679,23 @@ size_t KvElementBytes(superslm::SslmKvPrecision p) {
 // a cap below one rule page takes B = cap (a holder is then one page, D-SLM8412). CFG1's kv_block_size is
 // validated nonzero at load and no longer selects B. The product is formed in 64 bits: D is a u32 and
 // elem at most 2, so B * D * elem < 2^14 * 2^32 * 2 before the loop stops at S <= 2^13.
-// R9 step T1: at a cap the rule's B does not divide, the page is still the whole cap (one page per
-// sequence, 1.11.0's block). The partial last page that replaces this fallback is step T2 (§21.1,
-// D-SLM8396), which also brings the overhead's slack term and the u32 threshold on ceil(cap/B).
+// At a cap B does not divide, B is still the rule's: a whole-cap holder has ceil(cap/B) pages and its last
+// page carries ceil(cap/B) * B - cap positions of slack, never addressed, because KvCapacityExhausted fires
+// at the cap (§21.1, D-SLM8396; the one-page fallback is removed).
 int64_t PageRuleB(uint64_t head_dim, uint64_t context_cap, uint64_t elem) {
 	const uint64_t target = (head_dim <= 64 && context_cap <= 4096) ? 4096 : 8192;
 	uint64_t B = 16;
 	while (B * head_dim * elem < target) B *= 2;
 	if (B > context_cap) B = context_cap;
-	if (B != 0 && context_cap % B != 0) B = context_cap;  // T1: the one-page fallback, removed at T2
 	return static_cast<int64_t>(B);
 }
 
 // The page geometry of a config (§3.1), the one function every geometry and sizing verb, the pool
 // creates and the geometry seam compute through. `pinned` is the test-only pin's B (0: none), which
 // replaces the rule's B and is only ever a value the pin admitted (it divides the cap). page_bytes =
-// L * 2 * H_kv * B * D * elem; cap_pages = cap / B, exact because B divides the cap; runs = L * 2 * H_kv,
-// the slots rotation reduces by. `ok` is false on a zero cap or an overflowing product.
+// L * 2 * H_kv * B * D * elem; cap_pages = ceil(cap / B), a whole-cap holder's pages (the last one partial
+// where B does not divide the cap); runs = L * 2 * H_kv, the slots rotation reduces by. `ok` is false on a
+// zero cap or an overflowing product.
 struct PageGeometry {
 	bool ok = false;
 	int64_t page_positions = 0;
@@ -708,7 +709,8 @@ PageGeometry ComputePageGeometry(const superslm::SslmModelConfig& c, int64_t pin
 	if (c.context_cap == 0) return g;
 	const int64_t B = pinned > 0 ? pinned
 	                             : PageRuleB(c.head_dim, c.context_cap, KvElementBytes(c.kv_precision));
-	if (B <= 0 || static_cast<uint64_t>(B) > c.context_cap || c.context_cap % static_cast<uint64_t>(B) != 0) return g;
+	if (B <= 0 || static_cast<uint64_t>(B) > c.context_cap) return g;
+	if (pinned > 0 && c.context_cap % static_cast<uint64_t>(pinned) != 0) return g;  // the pin's domain (§3.1)
 	size_t v = static_cast<size_t>(c.num_hidden_layers);
 	for (size_t f : {size_t{2}, static_cast<size_t>(c.num_key_value_heads), static_cast<size_t>(B),
 	                 static_cast<size_t>(c.head_dim), KvElementBytes(c.kv_precision)}) {
@@ -722,7 +724,7 @@ PageGeometry ComputePageGeometry(const superslm::SslmModelConfig& c, int64_t pin
 	g.ok = true;
 	g.page_positions = B;
 	g.page_bytes = v;
-	g.cap_pages = static_cast<uint32_t>(c.context_cap / static_cast<uint64_t>(B));
+	g.cap_pages = static_cast<uint32_t>((uint64_t{c.context_cap} + static_cast<uint64_t>(B) - 1) / static_cast<uint64_t>(B));
 	g.runs = static_cast<uint32_t>(runs);
 	return g;
 }
@@ -758,8 +760,12 @@ size_t FlatBlockSize(const superslm::SslmModelConfig& c) {
 // The block pool's sizing for `block_count` blocks of a config: what sslm_kv_block_size,
 // sslm_kv_pool_overhead_size and sslm_kv_pool_create read, and what the geometry seam reports, from one
 // computation. `page_count_fits`: block_count * cap_pages <= UINT32_MAX (page indices are u32; exactly
-// UINT32_MAX is admissible, decision 24). `overhead`: a free-list slot and a refcount slot per block plus a
-// 32-byte header, SIZE_MAX wherever the page count does not fit or the sum cannot be represented.
+// UINT32_MAX is admissible, decision 24). `overhead`: a free-list slot and a refcount slot per block, a
+// 32-byte header, and each block's slack, N * (ceil(cap/B) * B - cap) * q bytes with q = L * 2 * H_kv * D *
+// elem (rev 16.22, D-SLM8427: the flat block stays 1.11.0's, so the pages beyond it are charged here);
+// formed with checked arithmetic, and SIZE_MAX wherever the page count does not fit or any product or sum
+// cannot be represented. block_count * block_size + overhead is then exactly block_count * ceil(cap/B)
+// pages plus 1.11.0's 8 * block_count + 32.
 // `requirement_fits`: block_count * block_size + overhead is representable (overhead not saturated).
 struct PoolSizing {
 	PageGeometry geo;
@@ -777,10 +783,17 @@ PoolSizing ComputePoolSizing(const superslm::SslmModelConfig& c, int64_t pinned,
 	s.page_count_fits =
 	    s.geo.ok && static_cast<uint64_t>(block_count) * s.geo.cap_pages <= static_cast<uint64_t>(UINT32_MAX);
 	if (s.page_count_fits) {
+		const uint64_t slack = uint64_t{s.geo.cap_pages} * static_cast<uint64_t>(s.geo.page_positions) - c.context_cap;
+		size_t q = 0, slack_bytes = 0;  // q: one position's K/V bytes, page_bytes / B
+		const bool slack_ok = CheckedMulSizeT(s.geo.page_bytes / static_cast<size_t>(s.geo.page_positions),
+		                                      static_cast<size_t>(slack), &q) &&
+		                      CheckedMulSizeT(q, static_cast<size_t>(block_count), &slack_bytes);
 		SaturatingAccumulator acc;
 		acc.AddProduct(static_cast<size_t>(block_count), sizeof(uint32_t) * 2);
-		size_t total = 0;
-		if (!acc.overflowed && CheckedAddSizeT(acc.value, 32, &total)) s.overhead = total;
+		size_t total = 0, with_slack = 0;
+		if (slack_ok && !acc.overflowed && CheckedAddSizeT(acc.value, 32, &total) &&
+		    CheckedAddSizeT(total, slack_bytes, &with_slack))
+			s.overhead = with_slack;
 	}
 	size_t blocks_bytes = 0;
 	s.requirement_fits = s.overhead != kSizeMax &&
@@ -1085,8 +1098,10 @@ extern "C" size_t sslm_workspace_size(sslm_model model, const sslm_config* confi
 // CORRECTED to the ruled unit (design Sec7.2, Brunel T-2139 Sec4, design commit fab235c1c6): a
 // "block" is one sequence's KV footprint at the full cap across every layer -- exactly the byte
 // count RunLayerLoop's own flat workspace/workspace_size parameter needs for one sequence. Since
-// 1.12.0 (paged-KV plan Sec3.1) the pool stores K/V in pages of B positions and a block is
-// exactly ceil(cap/B) of them: the unit a no-budget holder reserves, not a unit of storage. CFG1's own `kv_block_size` field (SslmModelConfig, a
+// 1.12.0 (paged-KV plan Sec3.1) the pool stores K/V in pages of B positions; a no-budget holder
+// reserves ceil(cap/B) of them, this block plus the last page's slack where B does not divide the cap,
+// and sslm_kv_pool_overhead_size carries the slack (rev 16.22, D-SLM8427), so this value stays 1.11.0's
+// at every cap and keeps sizing the legacy save and sslm_seq_state_size. CFG1's own `kv_block_size` field (SslmModelConfig, a
 // tokens-per-page count) plays NO role in this formula under the ruling; this function's own
 // name is now a slight misnomer relative to that unrelated CFG1 field, which the ruling itself
 // notes is model metadata this ABI's block unit does not consume.
@@ -4630,7 +4645,8 @@ extern "C" sslm_status sslm_g5_test_only_apply_mask_and_argmax(const int32_t* lo
 // WHY THIS EXISTS: T-2132's leak guard (Sec7 dim1: "no content from the PRIOR sequence survives
 // release") needs a read path that does not run through a live holder, so a test can observe the
 // release-time poison fill directly rather than trust the source. It reads `n` raw bytes of the
-// pool's backing buffer at `block_index * block_size`.
+// pool's backing buffer at `block_index * cap_pages * page_bytes` (rev 16.22, D-SLM8427: the flat block
+// is not a pool stride where B does not divide the cap; a block's pages are ceil(cap/B) * page_bytes).
 //
 // Paged-KV plan (rev 16.1) §3.6, step C4: the buffer is now a page pool -- block `i` is pages
 // [i*cap_pages, (i+1)*cap_pages) -- and a page is poisoned with 0xCD on release iff it was mapped
@@ -4644,9 +4660,9 @@ extern "C" sslm_status sslm_g5_test_only_peek_kv_block_bytes(sslm_kv_pool pool,
                                                                size_t n) {
 	if (!pool || !out_buf) return SSLM_INVALID_ARGUMENT;
 	if (block_index >= pool->block_count) return SSLM_INVALID_ARGUMENT;
-	if (n > pool->block_size) return SSLM_INVALID_ARGUMENT;
-	const uint8_t* src =
-	    static_cast<const uint8_t*>(pool->buf) + static_cast<size_t>(block_index) * pool->block_size;
+	const size_t stride = static_cast<size_t>(pool->cap_pages) * pool->page_bytes;
+	if (n > stride) return SSLM_INVALID_ARGUMENT;
+	const uint8_t* src = static_cast<const uint8_t*>(pool->buf) + static_cast<size_t>(block_index) * stride;
 	std::memcpy(out_buf, src, n);
 	return SSLM_OK;
 }

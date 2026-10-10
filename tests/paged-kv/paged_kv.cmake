@@ -23,7 +23,7 @@ set(PKV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests/paged-kv)
 #     C4, C5 and R0 cells' pkv_odd fallback assertions retire (plan §26.5's table), and Fixture::B() reads the rule's
 #     256 for pkv_odd.
 option(SUPERSLM_PKV_T1_ROTATED_LAYOUT "Paged-KV tests address pages rotated (R9 T1, D-SLM8449)" ON)
-option(SUPERSLM_PKV_T2_FALLBACK_RETIRED "Paged-KV tests retire pkv_odd's one-page fallback cells (R9 T2, D-SLM8448)" OFF)
+option(SUPERSLM_PKV_T2_FALLBACK_RETIRED "Paged-KV tests retire pkv_odd's one-page fallback cells (R9 T2, D-SLM8448)" ON)
 
 function(superslm_pkv_target name)
 	cmake_parse_arguments(PKV "" "LIBRARY" "SOURCES" ${ARGN})

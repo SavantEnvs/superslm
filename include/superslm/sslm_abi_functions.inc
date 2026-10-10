@@ -85,10 +85,13 @@ SUPERSLM_API sslm_status sslm_detokenize_stream(sslm_model model, sslm_detok_sta
  * A pool is pages of B positions (sslm_kv_page_positions). B is a function of the model's head_dim
  * (D), context cap and K/V element width: the smallest power of two of at least 16 whose page run,
  * B * D * element bytes, reaches 4 KiB (when D <= 64 and the cap is at most 4,096) or 8 KiB
- * (otherwise); the cap itself when that is larger than the cap or does not divide it. The CFG1
- * kv_block_size field does not select B. A holder made by a no-budget verb (sslm_seq_create,
- * sslm_prefix_begin, or a restore of a no-budget blob) reserves ceil(cap/B) pages, one old block,
- * and behaves as in 1.11.0. A budget holder declares 1 <= budget <= cap positions it may write
+ * (otherwise); the cap itself when that is larger than the cap. The CFG1 kv_block_size field does
+ * not select B. Where B does not divide the cap, a holder's last page is partial: its slack positions
+ * are never addressed, since writes stop at the cap. A holder made by a no-budget verb
+ * (sslm_seq_create, sslm_prefix_begin, or a restore of a no-budget blob) reserves ceil(cap/B) pages,
+ * one old block plus that slack, and behaves as in 1.11.0; sslm_kv_block_size stays 1.11.0's value,
+ * and sslm_kv_pool_overhead_size carries each block's slack, so a pool sized as
+ * N * sslm_kv_block_size + sslm_kv_pool_overhead_size(N) admits N such holders. A budget holder declares 1 <= budget <= cap positions it may write
  * itself and reserves R(budget) = min(ceil(budget/B) + 1, ceil(cap/B)) pages
  * (sslm_kv_pages_for_budget) when it is created; prefill and decode then map pages only from that
  * reserve, never from the pool. Its writes stop at limit = min(origin + budget, cap): below the
