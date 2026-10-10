@@ -97,25 +97,17 @@ void Cell42Legacy() {
 	                       Compare::kTokensRowsAndBlob);
 }
 
-// 4.4 [C4 legacy]. The B fallback (§3.1): pkv_odd is pkv_def re-emitted at cap 4100, which 16 does
-// not divide, so B = cap and a legacy holder has one page, today's block. Every R0 scenario's
-// legacy outputs equal v1.11.0's, blob included, and the one page holds the rows at B = 4,100 (the
-// one-page identity: the paged address formula with B = cap is today's flat layout).
+// 4.4 [C4 legacy]. pkv_odd is pkv_def re-emitted at cap 4100, which the rule's B does not divide. Every R0
+// scenario's legacy outputs equal v1.11.0's, blob included, and three blocks admit three legacy holders. Until T2 this
+// cell also asserted the one-page fallback (B = cap, one page a block, the rows at B = 4,100); that half retired with
+// the fallback (D-SLM8448; T-3189 §13), and 4.4/T2 asserts pkv_odd's 256-position pages and rows.
 void Cell44Legacy() {
 	const Fixture& fx = GetFixture("pkv_odd");
 	if (!fx.ok) return;
-#if !defined(PKV_T2_FALLBACK_RETIRED)  // D-SLM8448: retires at T2 with the one-page fallback (PKV_T2_FALLBACK_RETIRED, SUPERSLM_PKV_T2_FALLBACK_RETIRED); 4.4/T2 carries the rows at 256
-	PKV_CHECK_EQ(fx.B(), 4100);
-	PKV_CHECK_EQ(fx.CapPages(), 1);
-	PKV_CHECK_EQ(fx.PageBytes(), sslm_kv_block_size(fx.model));  // one page is one block
-#endif
 	// kills: B = kv_block_size taken without the divisibility test (257 pages a reservation,
 	// 256.25 pages a block: the scenarios' pools refuse their creates)
 	for (const char* sc : kAllScenarios)
 		ExpectMatchesReference("v1.11.0", fx, sc, RunScenario(fx, sc), Compare::kTokensRowsAndBlob);
-#if !defined(PKV_T2_FALLBACK_RETIRED)
-	PagesHoldReferenceRows(fx, fx.B(), fx);
-#endif
 	LegacyPool pool(fx.model, 3);
 	PKV_CHECK_EQ(pool.status, SSLM_OK);
 	if (pool.pool) PKV_CHECK_EQ(CountLegacyCreates(fx.model, &pool.pool), 3);  // N blocks admit N handles (§3.5)

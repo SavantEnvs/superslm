@@ -15,6 +15,10 @@ Cells (cell 7.9's text; the 79-series rows of the instrument table):
           manifest chain, the model binding; refused before restore, its own exit code, no record, row ungraded
   79-7    a seam-library build, checked once per process before timing
   per-process refusals: each kind its own non-zero exit code; a row is never graded on four processes
+  T6      (T-3202 remedies, SuperSLM 1478be7; class T6Remedies) F-1 the row record's status and exe_sha256, NO RESULT
+          standing, a missing pair executable; F-12 a refused run supersedes an existing record, the rerun limit too;
+          F-2 a crash after a seam identity is rerun, a transient crash is rerun; F-11 the RESERVE line recorded; F-9 an
+          OS-lock holder mid-recovery refuses a second runner
   loop    (T-3196 F-6) 79-6 to 79-9 through the driver's process loop, as a process: five processes against a
           stand-in pair executable, each refusal injected into process 3 (a blob changed after process 2, a seam
           identity line, a token mismatch at pair 57, 103 pairs); the exit status is EXIT_CODES[kind], the refused
@@ -314,12 +318,20 @@ at = int(at) if at else 0
 with open(os.environ["PKV_STANDIN_LOG"], "a") as log:
     log.write(f"{a.process}\n")
 mine = a.process == at
-print("PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE" if kind == "seam" and mine else "PKV_PAIR_PRODUCTION_V2 defs=none")
+print("PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE" if kind in ("seam", "crash-seam") and mine else "PKV_PAIR_PRODUCTION_V2 defs=none")
+if os.environ.get("PKV_STANDIN_RESERVE"):
+    print(os.environ["PKV_STANDIN_RESERVE"])
 for i in range(a.pairs - 1 if kind == "pairs" and mine else a.pairs):
     print(f"PAIR 1010000 1000000 7 {8 if kind == 'token' and mine and i == 57 else 7}")
 print("IDS " + " ".join(str(i) for i in json.loads(os.environ["PKV_STANDIN_IDS"])))
 if kind == "blob" and a.process == at - 1:
     Path(a.blob).write_bytes(Path(a.blob).read_bytes() + b"changed")
+if mine and kind in ("crash", "crash-seam"):
+    sys.exit(5)
+once = Path(os.environ["PKV_STANDIN_LOG"] + ".once")
+if mine and kind == "crash-once" and not once.exists():
+    once.write_text("crashed")
+    sys.exit(5)
 """
 
 
@@ -338,10 +350,11 @@ class Loop(unittest.TestCase):
         self.out.mkdir()
         self.result = self.out / "R2a-run1.json"
 
-    def run_row(self, inject=""):
+    def run_row(self, inject="", ids=None, reserve="", pair_cmd=None):
         env = dict(os.environ, PKV_STANDIN_INJECT=inject, PKV_STANDIN_LOG=str(self.log),
-                   PKV_STANDIN_IDS=json.dumps(proto_shuffle(64)[:21]))
-        cmd = [sys.executable, "-I", str(SCRIPT), "--pair-cmd", json.dumps([sys.executable, "-I", str(self.standin)]),
+                   PKV_STANDIN_IDS=json.dumps(ids if ids is not None else proto_shuffle(64)[:21]),
+                   PKV_STANDIN_RESERVE=reserve)
+        cmd = [sys.executable, "-I", str(SCRIPT), "--pair-cmd", json.dumps(pair_cmd or [sys.executable, "-I", str(self.standin)]),
                "--manifest", str(self.manifest), "--model", str(self.model), "--restore", "1200", "--slot", "R2a",
                "--result", str(self.result), "--lock", str(self.root / "pkv-c6-timing.lock")]
         done = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
@@ -387,6 +400,124 @@ class Loop(unittest.TestCase):
                     self.assertEqual(ran, [1, 2], "the blob check ran after the restore, or not per process")
                 else:
                     self.assertIn(3, ran)
+
+
+# ---- T-3202 (code review) remedies, SuperSLM 1478be7: one pin cell per landed remedy. Each fails with that remedy
+# reverted (the test author's record, T-3189 §12, runs each revert) and passes on the built driver.
+RESERVE_LINE = "RESERVE seed=1 singles=63 source=tests/paged-kv/pkv_scatter_reserve.h"
+
+
+class T6Remedies(unittest.TestCase):
+    setUp = Loop.setUp
+    run_row = Loop.run_row
+
+    def record(self, path=None):
+        return json.loads((path or self.result).read_text(encoding="utf-8"))
+
+    # F-1 (D-SLM8461): the row record carries status STANDING and the driver's own hash of the pair executable,
+    # the verdict in its own field; every process record carries the hash too.
+    def test_f1_row_record_status_and_exe_sha256(self):
+        done, _ = self.run_row()
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        rec = self.record()
+        exe = Path(sys.executable).resolve()
+        self.assertEqual(rec.get("status"), "STANDING")
+        self.assertEqual(rec.get("verdict"), "PASS")
+        self.assertEqual(rec.get("exe_sha256"), sha(exe))
+        self.assertEqual(Path(rec.get("exe", "")).resolve(), exe)
+        for k in range(1, 6):
+            self.assertEqual(self.record(self.out / f"R2a-run1.p{k}.json").get("exe_sha256"), sha(exe), f"process {k}")
+
+    # F-1 (D-SLM8461): a NO RESULT row stands as a reading of no result.
+    def test_f1_no_result_row_stands(self):
+        done, _ = self.run_row(ids=list(range(21)))  # ascending: the guard rejects, so the row reads NO RESULT
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        rec = self.record()
+        self.assertEqual((rec.get("status"), rec.get("verdict")), ("STANDING", "NO RESULT"))
+
+    # F-1: a pair executable that does not exist refuses (exit 70) before any run, writing nothing.
+    def test_f1_missing_pair_executable_refuses(self):
+        done, ran = self.run_row(pair_cmd=[str(self.root / "no-such-pair.exe")])
+        self.assertEqual(done.returncode, 70, done.stderr[-2000:])
+        self.assertEqual(ran, [])
+        self.assertFalse(self.result.exists())
+
+    # F-12 (with D-SLM8461): a refused run replaces an earlier row record at its path with a REFUSED record.
+    def test_f12_refused_run_supersedes_an_existing_record(self):
+        self.assertEqual(self.run_row()[0].returncode, 0)
+        self.assertEqual(self.record().get("status"), "STANDING")
+        self.log.unlink()
+        done, _ = self.run_row("seam@3")
+        self.assertEqual(done.returncode, 62, done.stderr[-2000:])
+        rec = self.record()
+        self.assertEqual((rec.get("status"), rec.get("exit_code"), rec.get("verdict")), ("REFUSED", 62, None))
+        self.assertIn("superseded", rec)
+        self.assertEqual(rec.get("exe_sha256"), sha(Path(sys.executable).resolve()))
+
+    # F-12: the rerun limit is a refusal, so it supersedes too.
+    def test_f12_rerun_limit_supersedes(self):
+        self.assertEqual(self.run_row()[0].returncode, 0)
+        self.log.unlink()
+        done, ran = self.run_row("crash@3")
+        self.assertEqual(done.returncode, 70, done.stderr[-2000:])
+        self.assertEqual(ran.count(3), 3)
+        rec = self.record()
+        self.assertEqual((rec.get("status"), rec.get("exit_code"), rec.get("verdict")), ("REFUSED", 70, None))
+
+    # F-2: the exit status is read before the identity. A process that prints a seam identity and then crashes is
+    # rerun whole (three attempts, then 70), never graded 62; a transient crash is rerun and the row is graded.
+    def test_f2_crash_after_a_seam_identity_is_rerun_not_graded(self):
+        done, ran = self.run_row("crash-seam@3")
+        self.assertEqual(done.returncode, 70, done.stderr[-2000:])
+        self.assertEqual(ran.count(3), 3)
+
+    def test_f2_transient_crash_is_rerun(self):
+        done, ran = self.run_row("crash-once@3")
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertEqual(ran.count(3), 2)
+        self.assertEqual(self.record().get("status"), "STANDING")
+
+    # F-11: the RESERVE line is recorded in every process record and in the row record; absent, it records null.
+    def test_f11_reserve_recorded(self):
+        done, _ = self.run_row(reserve=RESERVE_LINE)
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        want = {"seed": 1, "singles": 63, "source": "tests/paged-kv/pkv_scatter_reserve.h"}
+        for k in range(1, 6):
+            self.assertEqual(self.record(self.out / f"R2a-run1.p{k}.json").get("reserve"), want, f"process {k}")
+        self.assertEqual(self.record().get("reserve"), want)
+        self.setUp()
+        self.assertEqual(self.run_row()[0].returncode, 0)
+        rec = self.record()
+        self.assertIn("reserve", rec)
+        self.assertIsNone(rec["reserve"])
+
+    # F-9: the lock is taken by an OS byte lock before the owner is read. A runner that holds the byte lock while the
+    # content still names a dead owner (mid-recovery) refuses a second runner, which must not also recover.
+    def test_f9_os_lock_holder_refuses_a_second_recovery(self):
+        lock = self.root / "pkv-c6-timing.lock"
+        dead = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
+        dead.wait()
+        holder_src = (
+            "import msvcrt, os, sys, time\n"
+            "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_BINARY, 0o600)\n"
+            "os.write(fd, ('{\"pid\": %s}' % sys.argv[2]).encode())\n"
+            "os.lseek(fd, 1 << 20, os.SEEK_SET)\n"
+            "msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)\n"
+            "print('held', flush=True)\n"
+            "time.sleep(60)\n") if os.name == "nt" else (
+            "import fcntl, os, sys, time\n"
+            "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+            "os.write(fd, ('{\"pid\": %s}' % sys.argv[2]).encode())\n"
+            "fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 1 << 20)\n"
+            "print('held', flush=True)\n"
+            "time.sleep(60)\n")
+        holder = subprocess.Popen([sys.executable, "-I", "-c", holder_src, str(lock), str(dead.pid)],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (holder.kill(), holder.wait(), holder.stdout.close()))
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        with self.assertRaises(rows.Refusal):
+            with rows.timing_lock(self.root / "b.json", lock_path=lock):
+                pass
 
 
 class Process(unittest.TestCase):
