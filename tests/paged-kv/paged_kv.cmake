@@ -79,8 +79,10 @@ endif()
 # Cell 7.9's must-reject, 7.9-MR-OPT (plan rev 16.21, D-SLM8423; slot R79MR): a mutant build of the production sources
 # in which ComputePageGeometry yields B = 16 and the slot ignores the logical page (SUPERSLM_MUTANT_PKV_MR_OPT, read by
 # src/sslm_abi.cpp and include/superslm/forward_sites.h), and the production pair executable built from the same source
-# against it. The pair carries no definition of its own, so its identity line is "defs=none" and it runs through the
-# C6 driver (tools/run_paged_kv_rows.py --page-positions 16) as production's pair does. Box-owed; EXCLUDE_FROM_ALL.
+# against it. The pair is built with PKV_PAIR_MR_OPT, so it prints 7.9-MR-OPT's own identity line,
+# "PKV_PAIR_MR_OPT_V1 defs=none" (D-SLM8466 (2)), and runs through the C6 driver as
+# `tools/run_paged_kv_rows.py --construction 7.9-MR-OPT --page-positions 16`, which refuses any other identity (79-7).
+# Box-owed; EXCLUDE_FROM_ALL.
 add_library(superslm_mr_opt STATIC EXCLUDE_FROM_ALL ${SUPERSLM_CORE_SOURCES})
 target_include_directories(superslm_mr_opt PUBLIC include)
 # SUPERSLM_MUTANT_PKV_MR_OPT_TARGET acknowledges the mutant: the sources #error on the mutant definition without it

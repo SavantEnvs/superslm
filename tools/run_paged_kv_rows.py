@@ -13,8 +13,8 @@ Every refusal under the per-process rule has its own exit code, writes no record
 the row ungraded: 79-6 a blob or manifest mismatch (checked before each process restores the blob), 79-7 a pair
 executable that is not the construction it was run as (its identity line is not the construction's own, checked once
 per process before any pair is read: a seam library, or another construction's build; an MA run that printed an IDS
-page-id line; or a production or 7.9-MR-OPT run that printed none), 79-8 a token
-mismatch between the arms, 79-9 a process with other than 104 timed pairs. A refused row writes no row record at a
+page-id line or a RESERVE line; or a production or 7.9-MR-OPT run that printed no page ids), 79-8 a token mismatch
+between the arms, 79-9 a process with other than 104 timed pairs. A refused row writes no row record at a
 fresh result path; where an earlier run's record already stands at that path, the refusal replaces it with a REFUSED
 record carrying the exit code and no verdict, so a refused run never leaves an earlier verdict standing there (T-3202
 F-12, D-SLM8461). Any other failure of the driver (an unparseable pair executable output, a driver fault) refuses
@@ -52,9 +52,10 @@ An MA executable is invoked as `<--pair-cmd ...> --blob B --model F --process K 
 the driver appends to every pair command); it restores the blob into both of its contiguous-option arms, times W
 warm-up tokens per arm untimed and then N pairs, the order of each pair drawn from its seed and K as row79 does, and
 prints, in order: its identity line first; then one `PAIR <arm_a_ns> <arm_b_ns> <arm_a_token> <arm_b_token>` line per
-timed pair, arm_a in the paged column (the statistic is tau_a / tau_b - 1); and no IDS line (an IDS line from an MA
-run is refused, 79-7) and no RESERVE line. It exits 0. MA-1 and MA-2 share one executable (R79A's runs share one
-exe_sha256, D-SLM8463), selecting the construction from its own command line, and each prints its own identity line.
+timed pair, arm_a in the paged column (the statistic is tau_a / tau_b - 1); and no IDS line and no RESERVE line (either
+from an MA run is refused, 79-7: both belong to a paged arm). It exits 0. MA-1 and MA-2 share one executable (R79A's
+runs share one exe_sha256, D-SLM8463), selecting the construction from its own command line, and each prints its own
+identity line.
 """
 
 from __future__ import annotations
@@ -92,8 +93,10 @@ BAR = 0.05
 LOCK_PATH = Path(r"D:\_scratch\SuperSLM\pkv-c6-timing.lock")
 
 # Rev 16.23 (T-3189 G-4): each refusal under the per-process rule has its own exit code, writes no record for the
-# refused process and leaves the row ungraded: 79-6 a blob or manifest mismatch, 79-7 a seam-library build, 79-8 a
-# token mismatch, 79-9 a process with other than 104 timed pairs (and a PAIR line that does not parse).
+# refused process and leaves the row ungraded: 79-6 a blob or manifest mismatch, 79-7 a pair executable that is not
+# the construction it was run as (an identity line not the construction's own: a seam library or another
+# construction's build; an IDS or RESERVE line from an MA run; a paged run with no page ids), 79-8 a token
+# mismatch, 79-9 a process with other than 104 timed pairs (and a PAIR line that does not parse).
 EXIT_CODES = {"blob": 61, "seam": 62, "token": 63, "pairs": 64}
 # Not a per-process refusal: the row cannot run at all (the lock held by a live owner, a process that crashed or
 # changed boot more than RERUN_LIMIT times, a guard input outside the table, an IDS or RESERVE line that does not parse,
@@ -269,11 +272,17 @@ def pid_live(pid):
 #     before the system's last boot is stale whatever pid it holds, since that pid may now name an unrelated process
 #     (D-SLM8466 (3)); otherwise a pid liveness check (any live pid refuses, the caller's own included); then an
 #     overwrite with the new owner's pid. An empty file is stale, so a lock left empty by a crash recovers;
+#   - content other than ASCII digits naming a pid from 1 to LOCK_PID_MAX is torn and refused, in every holder;
 #   - a release unlinks the file when it still holds the releaser's pid, and never truncates it. A reader holding the
 #     file open at the release instant leaves the releaser's pid in place, which is stale once the releaser exits.
 # The OS lock is one byte far past any content, so a plain reader of the pid is never blocked by it.
 _LOCK_BYTE = 1 << 20
 LOCK_ATTEMPTS = 3
+# T-3206 N-4: the format's pid is a process id, 1 to 2**31 - 1 (POSIX pid_t, and the Int32 PowerShell's Get-Process
+# takes; every Windows pid is in range). The three holders read one content the same way: ASCII decimal digits naming a
+# pid in that range is a pid (live refuses, dead is stale); empty is stale; anything else, zero and an out-of-range
+# number included, is torn and refused by name.
+LOCK_PID_MAX = 2**31 - 1
 
 
 def _os_lock(fd):
@@ -307,7 +316,8 @@ def _os_unlock(fd):
 
 def _read_owner(fd):
     """The pid the lock's content names, None when the content is empty (stale). The content is the bare decimal pid
-    every leg writes (D-SLM8464); anything else raises ValueError (torn), as in the other two legs (T-3204 N-2)."""
+    every leg writes (D-SLM8464): ASCII digits only, naming a pid from 1 to LOCK_PID_MAX. Anything else raises
+    ValueError (torn), as in the other two legs (T-3204 N-2; T-3206 N-4, O-3)."""
     os.lseek(fd, 0, os.SEEK_SET)
     chunks = []
     while True:
@@ -318,9 +328,10 @@ def _read_owner(fd):
     text = b"".join(chunks).decode("utf-8").strip()
     if not text:
         return None
-    if not text.isdigit():
+    value = int(text) if text.isascii() and text.isdigit() else 0
+    if not 1 <= value <= LOCK_PID_MAX:
         raise ValueError(f"lock content {text[:60]!r}")
-    return int(text)
+    return value
 
 
 def boot_epoch():
@@ -550,7 +561,8 @@ def parse_process_output(text, construction="production"):
     """The pair executable's stdout: the identity line, then PAIR lines, then IDS, and optionally a RESERVE line (the
     paged arm's scatter-reserve construction: `RESERVE seed=<s> singles=<n> source=<header>`). Returns (identity,
     pairs, ids). The RESERVE fields are read by parse_reserve. The identity line must be the construction's own (79-7);
-    a construction without a paged arm (MA-1, MA-2) that prints an IDS line is refused the same way (D-SLM8466 (1))."""
+    a construction without a paged arm (MA-1, MA-2) that prints an IDS line (D-SLM8466 (1)) or a RESERVE line (T-3206
+    N-2) is refused the same way, and so is a paged construction that prints no page ids."""
     lines = text.splitlines()
     identity = lines[0] if lines else ""
     check_build_identity(identity, construction)  # 79-7, before any pair is read
@@ -566,6 +578,10 @@ def parse_process_output(text, construction="production"):
                 pairs.append((float(fields[1]), float(fields[2]), int(fields[3]), int(fields[4])))
             except ValueError:
                 raise Refusal(f"malformed pair line {line!r}", "pairs") from None  # T-3203 N-8: never a raw crash
+        elif fields[0] == "RESERVE" and construction not in PAGED_ARM:
+            # T-3206 N-2: a reserve is the paged arm's; an MA construction has none to report (79-7, as for IDS)
+            raise Refusal(f"79-7: {construction} has no paged arm, and its pair executable printed a RESERVE line "
+                          f"{line[:80]!r}: it is not the construction it claims to be", "seam")
         elif fields[0] == "IDS":
             if construction not in PAGED_ARM:
                 raise Refusal(f"79-7: {construction} has no paged arm, and its pair executable printed a page-id line "
