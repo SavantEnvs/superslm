@@ -26,6 +26,11 @@ Cells (cell 7.9's text; the 79-series rows of the instrument table):
           record's construction and page positions; N-8 a malformed PAIR line exits 64, a malformed IDS or RESERVE line
           70, an unexpected driver fault 70 (never a raw crash), each superseding an existing record and writing none
           on a fresh path; D-SLM8465 (class R3Slot) the 7.9b record names slot R3 and an unslotted record is rerun
+  T8      (T-3204 remedies, D-SLM8466, SuperSLM 4156b30; class T8Remedies) the stand-in prints each construction's own
+          identity, and no IDS line for MA-1 or MA-2; an MA run printing page ids refuses 62; a paged run (production,
+          7.9-MR-OPT) with no ids, or an empty IDS line, refuses 62; every construction refuses every other's identity
+          (62); MA rows record guard "not applicable (no paged arm)" and grade by the row rule, R79A's aggregate over
+          the four standing; argv and identity in every row and process record
   loop    (T-3196 F-6) 79-6 to 79-9 through the driver's process loop, as a process: five processes against a
           stand-in pair executable, each refusal injected into process 3 (a blob changed after process 2, a seam
           identity line, a token mismatch at pair 57, 103 pairs); the exit status is EXIT_CODES[kind], the refused
@@ -309,8 +314,10 @@ class Refusals(unittest.TestCase):
         self.assertEqual((g["graded"], g["verdict"]), (False, None))
 
 
-# The stand-in pair executable: prints the identity line, 104 timed pairs (slowdown 1%, tokens equal) and the
-# measured holder's ids; PKV_STANDIN_INJECT="<kind>@<k>" injects one refusal into process k. A "blob" injection
+# The stand-in pair executable: prints its construction's identity line (D-SLM8466 (2); PKV_STANDIN_CONSTRUCTION,
+# default production; PKV_STANDIN_IDENTITY overrides it), 104 timed pairs (slowdown 1%, tokens equal) and, for the
+# constructions with a paged arm only (D-SLM8466 (1)), the measured holder's ids (PKV_STANDIN_IDS_MODE: print, none or
+# empty overrides that); PKV_STANDIN_INJECT="<kind>@<k>" injects one refusal into process k. A "blob" injection
 # changes the blob's bytes at the end of process k - 1, so process k's pre-restore check is what must see it.
 STANDIN = r"""
 import argparse, json, os, sys
@@ -321,12 +328,17 @@ for flag in ("--blob", "--model", "--warmup"):
 ap.add_argument("--process", type=int)
 ap.add_argument("--pairs", type=int)
 a = ap.parse_args()
+IDENTITY = {"production": "PKV_PAIR_PRODUCTION_V2 defs=none", "7.9-MR-OPT": "PKV_PAIR_MR_OPT_V1 defs=none",
+            "MA-1": "PKV_PAIR_MA1_V1 defs=none", "MA-2": "PKV_PAIR_MA2_V1 defs=none"}
+construction = os.environ.get("PKV_STANDIN_CONSTRUCTION") or "production"
+identity = os.environ.get("PKV_STANDIN_IDENTITY") or IDENTITY[construction]
+ids_mode = os.environ.get("PKV_STANDIN_IDS_MODE") or ("print" if construction in ("production", "7.9-MR-OPT") else "none")
 kind, _, at = os.environ.get("PKV_STANDIN_INJECT", "").partition("@")
 at = int(at) if at else 0
 with open(os.environ["PKV_STANDIN_LOG"], "a") as log:
     log.write(f"{a.process}\n")
 mine = a.process == at
-print("PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE" if kind in ("seam", "crash-seam") and mine else "PKV_PAIR_PRODUCTION_V2 defs=none")
+print("PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE" if kind in ("seam", "crash-seam") and mine else identity)
 if os.environ.get("PKV_STANDIN_RESERVE"):
     print(os.environ["PKV_STANDIN_RESERVE"])
 for i in range(a.pairs - 1 if kind == "pairs" and mine else a.pairs):
@@ -338,7 +350,10 @@ if kind == "undecodable" and mine:
     sys.stdout.flush()
     sys.stdout.buffer.write(bytes([78, 79, 84, 69, 32, 0x81, 0x8d, 10]))
     sys.stdout.buffer.flush()
-print("IDS " + " ".join(str(i) for i in json.loads(os.environ["PKV_STANDIN_IDS"])))
+if ids_mode == "print":
+    print("IDS " + " ".join(str(i) for i in json.loads(os.environ["PKV_STANDIN_IDS"])))
+elif ids_mode == "empty":
+    print("IDS")
 if kind == "blob" and a.process == at - 1:
     Path(a.blob).write_bytes(Path(a.blob).read_bytes() + b"changed")
 if mine and kind in ("crash", "crash-seam"):
@@ -368,7 +383,8 @@ class Loop(unittest.TestCase):
     def run_row(self, inject="", ids=None, reserve="", pair_cmd=None):
         env = dict(os.environ, PKV_STANDIN_INJECT=inject, PKV_STANDIN_LOG=str(self.log),
                    PKV_STANDIN_IDS=json.dumps(ids if ids is not None else proto_shuffle(64)[:21]),
-                   PKV_STANDIN_RESERVE=reserve)
+                   PKV_STANDIN_RESERVE=reserve, PKV_STANDIN_CONSTRUCTION="production", PKV_STANDIN_IDENTITY="",
+                   PKV_STANDIN_IDS_MODE="")
         cmd = [sys.executable, "-I", str(SCRIPT), "--pair-cmd", json.dumps(pair_cmd or [sys.executable, "-I", str(self.standin)]),
                "--manifest", str(self.manifest), "--model", str(self.model), "--restore", "1200", "--slot", "R2a",
                "--result", str(self.result), "--lock", str(self.root / "pkv-c6-timing.lock")]
@@ -573,11 +589,12 @@ class T7Remedies(unittest.TestCase):
 
     @classmethod
     def drive(cls, root, row, result, construction="production", positions=None, inject="", ids=None, reserve="",
-              drop=(), log=None, extra=()):
+              drop=(), log=None, extra=(), identity="", ids_mode=""):
         positions = POSITIONS[construction] if positions is None else positions
         env = dict(os.environ, PKV_STANDIN_INJECT=inject, PKV_STANDIN_LOG=str(log or root / "standin.log"),
                    PKV_STANDIN_IDS=json.dumps(ids if ids is not None else ids_for(row, POSITIONS[construction])),
-                   PKV_STANDIN_RESERVE=reserve)
+                   PKV_STANDIN_RESERVE=reserve, PKV_STANDIN_CONSTRUCTION=construction, PKV_STANDIN_IDENTITY=identity,
+                   PKV_STANDIN_IDS_MODE=ids_mode)
         flags = {"--pair-cmd": json.dumps([sys.executable, "-I", str(cls.standin)]), "--manifest": str(cls.manifest),
                  "--model": str(cls.model), "--restore": "1200", "--slot": row, "--result": str(result),
                  "--lock": str(root / "pkv-c6-timing.lock"), "--page-positions": str(positions),
@@ -800,6 +817,108 @@ class T7Remedies(unittest.TestCase):
     def test_n8_driver_fault_exits_70_not_1(self):
         done, rec = self.refusal(70, inject="undecodable@1")
         self.assertIn("driver fault", rec.get("reason", ""))
+
+
+# ---- T-3204 (second confirmation review) remedies, D-SLM8466, SuperSLM 4156b30: one pin cell per landed remedy. Each
+# fails with its remedy reverted (the test author's record, T-3189 §15, runs each revert) and passes on the built driver.
+# The identity strings and the paged-arm set are written here literally, never read from the driver under test.
+IDENTITIES = {"production": "PKV_PAIR_PRODUCTION_V2 defs=none", "7.9-MR-OPT": "PKV_PAIR_MR_OPT_V1 defs=none",
+              "MA-1": "PKV_PAIR_MA1_V1 defs=none", "MA-2": "PKV_PAIR_MA2_V1 defs=none"}
+WITH_PAGED_ARM = ("production", "7.9-MR-OPT")
+NOT_APPLICABLE = "not applicable (no paged arm)"
+ROW_FOR = {"production": "R2a", "7.9-MR-OPT": "R2b", "MA-1": "R2b", "MA-2": "R4a"}
+
+
+class T8Remedies(unittest.TestCase):
+    setUpClass = T7Remedies.__dict__["setUpClass"]
+    tearDownClass = T7Remedies.__dict__["tearDownClass"]
+    drive = T7Remedies.__dict__["drive"]
+    setUp = T7Remedies.setUp
+    ran = T7Remedies.ran
+    record = T7Remedies.record
+    runs = T7Remedies.runs
+    aggregate = T7Remedies.aggregate
+
+    def refused_62(self, construction, why, **kw):
+        """The run refuses 79-7 (62) in process 1, before any record: none on a fresh path."""
+        result = self.root / "fresh.json"
+        result.unlink(missing_ok=True)
+        self.log.unlink(missing_ok=True)
+        done = self.drive(self.root, ROW_FOR[construction], result, construction, log=self.log, **kw)
+        self.assertEqual(done.returncode, 62, f"{why}: exit {done.returncode}\n{done.stderr[-1500:]}")
+        self.assertIn("79-7", done.stderr)
+        self.assertFalse(result.exists(), f"{why}: a record was written")
+        self.assertEqual(self.ran(), [1], f"{why}: the refusal was not in process 1")
+        return done
+
+    # D-SLM8466 (1): MA-1 and MA-2 have no paged arm; a page-id line from one is refused (62)
+    def test_t8_ma_run_printing_ids_refuses(self):
+        for construction in ("MA-1", "MA-2"):
+            with self.subTest(construction=construction):
+                done = self.refused_62(construction, f"{construction} with an IDS line", ids_mode="print")
+                self.assertIn("page-id line", done.stderr)
+
+    # D-SLM8466 (1), the mirror: a construction with a paged arm that prints no ids, or an empty IDS line, refuses (62)
+    def test_t8_paged_run_without_ids_refuses(self):
+        for construction in WITH_PAGED_ARM:
+            for mode in ("none", "empty"):
+                with self.subTest(construction=construction, ids=mode):
+                    done = self.refused_62(construction, f"{construction} with ids {mode}", ids_mode=mode)
+                    self.assertIn("no page ids", done.stderr)
+
+    # D-SLM8466 (2): each construction's identity line is its own; any other construction's refuses (62), so a
+    # production-shaped run cannot be labelled MA-1 (the casebook's owed case) and MR-OPT cannot pass as production
+    def test_t8_identity_must_be_the_constructions_own(self):
+        for construction in IDENTITIES:
+            for other, line in IDENTITIES.items():
+                if other == construction:
+                    continue
+                with self.subTest(construction=construction, prints=other):
+                    # the ids follow the label, so only the identity is wrong
+                    done = self.refused_62(construction, f"{construction} printing {other}'s identity", identity=line)
+                    self.assertIn("identity", done.stderr)
+        with self.subTest(case="production-shaped run labelled MA-1"):
+            self.refused_62("MA-1", "production's identity and ids under MA-1", identity=IDENTITIES["production"],
+                            ids_mode="print")
+
+    # D-SLM8466 (1): MA rows record the guard as not applicable and grade by the row rule alone; the paged rows keep the
+    # guard; R79A's aggregate over the four MA runs stands
+    def test_t8_ma_rows_guard_not_applicable_and_r79a_stands(self):
+        for (construction, row), rec in self.built.items():
+            with self.subTest(construction=construction, row=row):
+                self.assertEqual(rec.get("status"), "STANDING")
+                if construction in WITH_PAGED_ARM:
+                    self.assertIsInstance(rec.get("guard"), dict)
+                    self.assertEqual(set(rec["guard"]), {"n", "M", "M99", "admits"})
+                else:
+                    self.assertEqual(rec.get("guard"), NOT_APPLICABLE)
+                    self.assertEqual(rec.get("verdict"), "PASS")  # five medians at 1%: the row rule's PASS
+                    self.assertNotIn("reason", rec)
+        result = self.root / "R79A.json"
+        done = self.aggregate("R79A", self.runs(R79A_RUNS), result)
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertEqual(self.record(result).get("status"), "STANDING")
+
+    # D-SLM8466 (2): argv and identity in every row and process record. The row's argv is the driver's own command line;
+    # each process's is the exact pair command it ran
+    def test_t8_argv_and_identity_recorded(self):
+        root = Path(self.shared.name)
+        for (construction, row), rec in self.built.items():
+            with self.subTest(construction=construction, row=row):
+                self.assertEqual(rec.get("identity"), IDENTITIES[construction])
+                argv = rec.get("argv")
+                self.assertIsInstance(argv, list)
+                self.assertEqual(Path(argv[1]).resolve(), SCRIPT.resolve())
+                self.assertEqual(argv[argv.index("--construction") + 1], construction)
+                self.assertEqual(argv[argv.index("--slot") + 1], row)
+                for k, name in enumerate(rec["processes"], 1):
+                    proc = self.record(root / "runs" / name)
+                    self.assertEqual(proc.get("identity"), IDENTITIES[construction], name)
+                    pargv = proc.get("argv")
+                    self.assertIsInstance(pargv, list, name)
+                    self.assertEqual(pargv[:3], [sys.executable, "-I", str(self.standin)], name)
+                    self.assertEqual(pargv[pargv.index("--process") + 1], str(k), name)
+                    self.assertEqual(pargv[pargv.index("--pairs") + 1], "104", name)
 
 
 class R3Slot(unittest.TestCase):

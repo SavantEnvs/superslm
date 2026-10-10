@@ -18,6 +18,10 @@ meets the others' real pids:
   publish  (the two Python programs, by audit hook) a fresh acquire never opens the lock path itself: the path's first
            and only event is the move (rename, or link) of the temporary file holding the pid into place, so the lock
            is never visible empty. The PowerShell acquire is not observable this way (record T-3189 §14).
+  boot     (D-SLM8466 (3)) a lock file modified before the last boot is stale in every holder, whatever it holds (a live
+           pid, torn content); the same live pid written after the boot refuses; the driver records the reason
+  torn     (T-3204 N-2) a JSON body, or a dead pid with a sign or a digit separator, is torn in every holder
+  sharing  (T-3204 O-3) a holder of the file without write sharing: every holder refuses, PowerShell by name
 
 PKV_ROWS_DRIVER, PKV_PAIRS_RUNNER and PKV_PROVENANCE_PS1 name the programs under test (default: this checkout's); the
 test author runs the remedy reverted through them.
@@ -275,6 +279,90 @@ class TimingLock(unittest.TestCase):
                 self.assertFalse([e for e in events[1:] if e[0] != "open" or e[2] not in ("r", "rb")],
                                  f"{program} wrote the lock after moving it into place: {events}")
                 self.assertFalse(self.lock.exists())
+
+    # ---- T-3204 (second confirmation review) remedies, D-SLM8466 (3) and N-2/O-3, SuperSLM 4156b30 --------------------
+    def last_boot(self):
+        """The last boot in epoch seconds, this cell's own reading: now less the uptime."""
+        if os.name == "nt":
+            import ctypes
+            tick = ctypes.windll.kernel32.GetTickCount64
+            tick.restype = ctypes.c_uint64
+            return time.time() - tick() / 1000.0
+        return time.time() - time.clock_gettime(time.CLOCK_BOOTTIME)
+
+    def live_pid(self):
+        p = subprocess.Popen([sys.executable, "-I", "-c", "import sys; sys.stdin.readline()"], stdin=subprocess.PIPE,
+                             text=True)
+        self.procs.append(p)
+        return p.pid
+
+    def write_lock(self, text, before_boot):
+        self.lock.write_bytes(text.encode("ascii"))
+        if before_boot:
+            when = self.last_boot() - 3600
+            os.utime(self.lock, (when, when))
+
+    # boot: a lock file modified before the last boot is stale whatever it holds, a live pid or torn content included;
+    # the same live pid written after the boot still refuses
+    def test_lock_modified_before_the_last_boot_is_stale(self):
+        live = self.live_pid()
+        for contender in PROGRAMS:
+            for name, text, before, want in (("live pid, after the boot", str(live), False, "REFUSED"),
+                                             ("live pid, before the boot", str(live), True, "HELD"),
+                                             ("torn, before the boot", '{"pid": 1', True, "HELD")):
+                with self.subTest(contender=contender, case=name):
+                    self.write_lock(text, before)
+                    line = self.attempt(contender)
+                    self.assertTrue(line.startswith(want), f"{contender}, {name}: {line}")
+                    if want == "HELD":
+                        self.assertFalse(self.lock.exists())
+                    self.lock.unlink(missing_ok=True)
+
+    # boot, the driver's record: the recovery's reason is "before the last boot"
+    def test_driver_records_a_pre_boot_recovery(self):
+        spec = importlib.util.spec_from_file_location("rows_driver_boot", DRIVER)
+        rows = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rows)
+        self.write_lock(str(self.live_pid()), True)
+        with rows.timing_lock(self.root / "r.json", lock_path=self.lock) as held:
+            self.assertEqual(held.get("reason"), "before the last boot")
+
+    # torn: the content is the bare decimal pid and nothing else. A JSON body, or a dead pid with a sign or a digit
+    # separator, is torn in every holder (an int() or TryParse reading would recover the dead pid)
+    def test_json_and_signed_pids_are_torn(self):
+        dead = self.dead_pid()
+        digits = str(dead)
+        for contender in PROGRAMS:
+            for name, text in (("json", '{"pid": %d}' % dead), ("plus sign", "+" + digits),
+                               ("separator", digits[:1] + "_" + digits[1:]), ("minus sign", "-" + digits)):
+                with self.subTest(contender=contender, content=name):
+                    self.write_lock(text, False)
+                    line = self.attempt(contender)
+                    self.assertTrue(line.startswith("REFUSED"), f"{contender} took a lock holding {text!r}: {line}")
+                    self.assertIn("torn", line)
+                    self.assertEqual(self.content(), text, f"{contender} changed a torn lock")
+                    self.lock.unlink()
+
+    # sharing: another process holds the lock file open without write sharing. Every holder refuses; the PowerShell
+    # holder names the sharing conflict (never a raw .NET error)
+    def test_sharing_conflict_refuses_and_powershell_names_it(self):
+        self.write_lock(str(self.dead_pid()), False)
+        script = self.root / "share.ps1"
+        script.write_text("param([string]$Lock)\n"
+                          "$s = [IO.File]::Open($Lock, 'Open', 'Read', 'Read')\n"
+                          "[Console]::Out.WriteLine('open'); [Console]::Out.Flush()\n"
+                          "$null = [Console]::In.ReadLine(); $s.Dispose()\n")
+        holder = subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+                                   "-Lock", str(self.lock)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.procs.append(holder)
+        self.assertEqual(self.first_line(holder), "open")
+        for contender in PROGRAMS:
+            with self.subTest(contender=contender):
+                line = self.attempt(contender)
+                self.assertTrue(line.startswith("REFUSED"), f"{contender}: {line}")
+                if contender == "ps1":
+                    self.assertIn("sharing conflict", line)
+                    self.assertIn("3 attempts", line)
 
 
 if __name__ == "__main__":
