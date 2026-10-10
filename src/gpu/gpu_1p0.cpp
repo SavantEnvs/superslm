@@ -2656,14 +2656,6 @@ SslmGpuStatus sslm_decode_step_gpuImpl(SslmGpuContext* ctx, SslmGpuSequenceHandl
 	if (!superslm_gpu::CallProceedsOrBusy_DecodeStepGpu(is_submitted)) {
 		return SSLM_BUSY;  // design Sec4.2's own state table, unchanged policy.
 	}
-	if (seq->pool != nullptr && g_process_wide_submitted_sequences > 0) {
-		// G3-ledger: EntrySubmitGuard. Paged-KV plan §4 item 4 (rev 5: the process scope): a
-		// submitting call on a pooled holder returns SSLM_BUSY while any sequence in the process
-		// is Submitted, before any state changes, so the pool latch's precondition holds. Written
-		// against today's process count, for pooled holders only, until the ledger's guard lands.
-		return SSLM_BUSY;
-	}
-
 	SslmGpuModelHandle* model = seq->model;
 	uint32_t layers_to_issue = 0;
 	const superslm_gpu::SslmGpuStatus plan = superslm_gpu::PlanDispatchBudgetGpu(
@@ -2671,6 +2663,15 @@ SslmGpuStatus sslm_decode_step_gpuImpl(SslmGpuContext* ctx, SslmGpuSequenceHandl
 	    model->dispatches_per_layer);
 	if (plan == superslm_gpu::SslmGpuStatus::DispatchBudgetTooSmall) {
 		return SSLM_DISPATCH_BUDGET_TOO_SMALL;
+	}
+	if (seq->pool != nullptr && g_process_wide_submitted_sequences > 0) {
+		// G3-ledger: EntrySubmitGuard. Paged-KV plan §4 item 4 (rev 5: the process scope): a
+		// submitting call on a pooled holder returns SSLM_BUSY while any sequence in the process
+		// is Submitted, before any state changes, so the pool latch's precondition holds. Written
+		// against today's process count, for pooled holders only, until the ledger's guard lands.
+		// After the dispatch-budget refusal: §4.4's precedence ("the decode budget refusal
+		// precedes the guard"; cell 3.6d/G3:precedence:budget_too_small).
+		return SSLM_BUSY;
 	}
 	seq->bind_eligible = false;
 
@@ -2807,6 +2808,15 @@ SslmGpuStatus sslm_decode_step_batch_gpuImpl(SslmGpuContext* ctx, SslmGpuSequenc
 		// call already consumed it) is uniformly SSLM_BATCH_BUDGET_EXHAUSTED at the batch call
 		// -- design Sec9's own table reserves SSLM_DISPATCH_BUDGET_TOO_SMALL for the
 		// single-sequence call alone, never naming it as a batch-call channel.
+		// Paged-KV plan §3.4 / cell 5.2 (5.7 at G3): a pooled holder at its limit (below the cap) is
+		// refused SSLM_GPU_KV_BUDGET_EXCEEDED in its own slot whatever the running dispatch remainder,
+		// consuming none of it, so the other slots proceed exactly as beside a holder at its cap.
+		// Checked before the dispatch planning, so the status is the budget's even when an earlier
+		// slot used the whole remainder (SubmitOneSequenceDecode repeats the check for the single call).
+		if (seq->pool != nullptr && seq->limit < seq->context_cap && seq->context_length >= seq->limit) {
+			out_statuses[i] = SSLM_GPU_KV_BUDGET_EXCEEDED;
+			continue;
+		}
 		uint32_t layers_to_issue = 0;
 		const superslm_gpu::SslmGpuStatus plan = superslm_gpu::PlanDispatchBudgetGpu(
 		    remaining_budget, seq->model->num_hidden_layers, seq->layer_index, &layers_to_issue,
