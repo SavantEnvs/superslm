@@ -33,6 +33,13 @@
 #ifndef SSLM_G1C_HELPERS_H
 #define SSLM_G1C_HELPERS_H
 
+// pkvg unification: PKVG_STEP (3, 4 or 5; set by build_paged_kv_gpu.bat / _mingw.sh) keeps only the cell
+// parts (and the teardown calls) whose bracket is at or before that step, so a step's executable links
+// only the verbs that step defines. Unset, every part is compiled (the group's original build).
+#ifndef PKVG_STEP
+#define PKVG_STEP 5
+#endif
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -460,7 +467,9 @@ struct World {
 		for (SslmGpuSequenceHandle* q : submitted) (void)Ready(s.ctx, q);
 		submitted.clear();
 		for (SslmGpuSequenceHandle* q : seqs) (void)sslm_gpu_seq_release(s.ctx, q);
+#if PKVG_STEP >= 4  // G4 verb; before G4 no part makes a prefix
 		for (SslmGpuPrefixHandle* p : prefixes) (void)sslm_gpu_prefix_release(s.ctx, p);
+#endif
 		for (SslmGpuAdapterHandle* a : adapters) (void)sslm_gpu_adapter_unmap(s.ctx, a);
 		for (SslmGpuModelHandle* m : models) (void)sslm_gpu_model_unmap(s.ctx, m);
 		for (PoolRec& p : pools) {

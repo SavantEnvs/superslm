@@ -52,6 +52,7 @@
 // returns SSLM_OK (or its own refusal) on a pooled holder while A is Submitted.
 // GREEN: each part at its step, on both GPUs.
 #include "g1c_guard_runs.h"
+// pkvg unification: the parts after PKVG_STEP (g1c_helpers.h) are compiled out.
 
 #include <memory>
 
@@ -566,6 +567,7 @@ void G3AssertWindow() {
 	G1C_CHECK(st == SSLM_OK, "the assert's window: a pooled prefill with nothing else Submitted -> %s, want SSLM_OK", St(st));
 }
 
+#if PKVG_STEP >= 4
 // ---------------------------------------------------------------------------------------------
 // [G4]
 // ---------------------------------------------------------------------------------------------
@@ -588,6 +590,8 @@ void G4PrecedencePrefixCount0() {
 	PrecedenceRun(p);
 }
 
+#endif  // PKVG_STEP >= 4
+#if PKVG_STEP >= 5
 // ---------------------------------------------------------------------------------------------
 // [G5]
 // ---------------------------------------------------------------------------------------------
@@ -623,6 +627,7 @@ void G5PrecedenceRestoreIntoPoolBadMagic() {
 	p.expect_idle = {SSLM_SEQUENCE_KV_BUFFER_MISMATCH, SSLM_GPU_HOLDER_MODE_MISMATCH};
 	PrecedenceRun(p);
 }
+#endif  // PKVG_STEP >= 5
 }  // namespace
 
 G1C_CELL("3.6d/G3:bridge_decode_not_ready", "G3", G3BridgeNotReady);
@@ -651,10 +656,13 @@ G1C_CELL("3.6d/G3:precedence:budget_too_small", "G3", G3PrecedenceBudgetTooSmall
 G1C_CELL("3.6d/G3:mixed_batch", "G3", G3MixedBatch);
 G1C_CELL("3.6d/G3:scope", "G3", G3Scope);
 G1C_CELL("3.6d/G3:assert_window", "G3", G3AssertWindow);
+#if PKVG_STEP >= 4
 G1C_CELL("3.6d/G4:adopt", "G4", G4Adopt);
 G1C_CELL("3.6d/G4:begin_from", "G4", G4BeginFrom);
 G1C_CELL("3.6d/G4:prefix_prefill", "G4", G4PrefixPrefill);
 G1C_CELL("3.6d/G4:precedence:prefix_count0", "G4", G4PrecedencePrefixCount0);
+#endif
+#if PKVG_STEP >= 5
 G1C_CELL("3.6d/G5:restore_into_pool", "G5", G5RestoreIntoPool);
 G1C_CELL("3.6d/G5:resave-bridge_decode_not_ready", "G5", G5ResaveBridgeNotReady);
 G1C_CELL("3.6d/G5:resave-bridge_decode_ready", "G5", G5ResaveBridgeReady);
@@ -665,3 +673,4 @@ G1C_CELL("3.6d/G5:resave-prompt_prefill", "G5", G5ResavePromptPrefill);
 G1C_CELL("3.6d/G5:resave-schema_prefill", "G5", G5ResaveSchemaPrefill);
 G1C_CELL("3.6d/G5:resave-adopt", "G5", G5ResaveAdopt);
 G1C_CELL("3.6d/G5:precedence:restore_into_pool_bad_magic", "G5", G5PrecedenceRestoreIntoPoolBadMagic);
+#endif

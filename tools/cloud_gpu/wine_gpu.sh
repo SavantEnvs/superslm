@@ -114,6 +114,10 @@ cmd_exec() {
 	exec "$WINE" "$exe" "$@"
 }
 
+# Sourced by another script (tests/paged-kv-gpu/build_paged_kv_gpu_mingw.sh) for its variables and functions
+# (CACHE, VKP_DIR, DXC, CXX, SRCS, wine_env, start_xvfb): stop before dispatching a command.
+if [ "${WINE_GPU_SOURCED:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
+
 case "${1:-}" in
 	setup) cmd_setup ;;
 	build) shift; cmd_build "$@" ;;

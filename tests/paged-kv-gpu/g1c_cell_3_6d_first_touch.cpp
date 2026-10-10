@@ -1,6 +1,6 @@
 // Paged-KV plan (rev 16.2) §7 cell 3.6d [G3], the FIRST-TOUCH CONTROL, group g1c. Built ONLY in the
 // allocation-fault build (SUPERSLM_GPU_ALLOC_FAULT_INJECTION with SUPERSLM_GPU_TEST_SEAMS), where te425's
-// hooks live, and run ALONE in a fresh process (g1c_firsttouch.exe; see g1c_main_draft.cpp).
+// hooks live, and run ALONE in a fresh process (pkvg_firsttouch_g3.exe; see build_paged_kv_gpu.bat).
 //
 //   "first touch (rev 9). In a fresh process, with the device never constructed, the process's first
 //    singleton-reaching call is a guarded refusal after the guard: the prompt prefill with count == 0. It
