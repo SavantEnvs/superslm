@@ -143,7 +143,7 @@ void Cell46Legacy() {
 // set kv_block_size = 1, and their flat engine paths stay in the existing suites, green at C4; this
 // cell names the geometry in the matrix and runs it through the legacy ABI, so a regression there is
 // attributed. The model is pkv_def with CFG1's kv_block_size patched to 1 (integrity hash
-// recomputed): §3.1 gives B = 1, while the weights, and so the tokens and K/V rows, are pkv_def's.
+// recomputed) and, from T1, pinned to 1: B = 1, while the weights, and so the tokens and K/V rows, are pkv_def's.
 // Tokens and rows equal pkv_def's v1.11.0 reference (the blobs carry the twin's own model hash, so
 // they are compared by rows, not whole), and the rows read from the pages at B = 1 equal them too.
 void Cell49() {
@@ -152,7 +152,19 @@ void Cell49() {
 	Fixture twin;
 	PKV_CHECK_MSG(PatchedBlockSizeTwin(def, 1, &twin), "pkv_def with kv_block_size 1 maps");
 	if (!twin.ok) return;
-	const int64_t B = 1;  // §3.1: kv_block_size 1 <= cap and divides it
+	// From T1 CFG1's kv_block_size no longer selects B (4.11), so the member is pkv_def pinned to 1 (plan §3.1, §25.6
+	// G-2; T-3198 §5.3), the loader pin's pattern (D-SLM8439): the pin's SSLM_OK is required once the T0 stub is gone,
+	// B == 1 always (on 2ebe5e3 the patched header gives it).
+	const sslm_status pin = KvPagesTestPinPagePositions(twin.model, 1);
+#if !defined(PKV_R9_STUB_PIN)
+	PKV_CHECK_MSG(pin == SSLM_OK, "the pin of the B = 1 twin is refused (%s)", AbiStatusName(pin));
+#else
+	(void)pin;
+#endif
+	twin.pinned = 1;
+	const int64_t B = 1;
+	PKV_CHECK_MSG(sslm_kv_page_positions(twin.model) == B, "the B = 1 twin runs at B = %lld",
+	              static_cast<long long>(sslm_kv_page_positions(twin.model)));
 	PKV_CHECK_EQ(sslm_kv_block_size(twin.model), sslm_kv_block_size(def.model));
 	// kills: page arithmetic that assumes B > 1 (a zero-size tail page, a +1 slack page drawn
 	// past cap / B, a page run of length 0) anywhere in prefill, decode, reset, copy adopt or save
