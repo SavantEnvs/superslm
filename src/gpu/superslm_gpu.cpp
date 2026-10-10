@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "d3d12_harness.h"
+#include "gpu_call_timing_snapshot.h"
 #include "shaders/kv_page_addr_model.h"
 #include "gpu_kv_pool_geometry.h"  // paged-KV G3: the coverage twin's chunk-wide form
 
@@ -678,13 +679,30 @@ ResidentWeights g_resident_weights;
 // it returns.
 bool g_last_weight_upload_was_skipped = false;
 
-// T-2101 (dispatch-overhead decomposition): backs the public `LastCallTiming()` accessor
-// (`gpu_port.h`) -- see that declaration's own header comment for what each field measures.
-GpuCallTiming g_last_call_timing;
-// T-2101 (per-site decomposition, follow-up to D-SLM3312): backs the public
-// `LastCallPerDispatchTimingsMs()` accessor (`gpu_port.h`) -- one GPU-measured millisecond figure
-// per dispatch this call issued, in dispatch order.
-std::vector<double> g_last_call_per_dispatch_ms;
+// T-2101 (dispatch-overhead decomposition, per-site decomposition): backs the public
+// `LastCallTiming()` and `LastCallPerDispatchTimingsMs()` accessors (`gpu_port.h`) -- see those
+// declarations' own header comments for what each field measures. From G3 (plan §4.4, decision 80)
+// a call's timing is per call: the layer-loop record carries its own GpuCallTiming and
+// per-dispatch vector, and the call's timing is published here, under the snapshot's one mutex, at
+// the finish tail's end and on the submit's and the tail's catch paths; every chunk open
+// publishes an empty snapshot (PrepareGpuLayerLoopChunkOpenState). The accessors copy it under
+// that mutex, so no finishing poller writes shared timing state unlocked.
+LastCallTimingSnapshot<GpuCallTiming> g_last_call_timing_snapshot;
+// The publishes the catch paths and the chunk open make: a publish allocates its block, and a
+// failed allocation there must not leave a catch clause or the guard ladder by exception. A failed
+// publish keeps the previous snapshot (a diagnostic, not a status).
+void PublishCallTimingNoThrow(const GpuCallTiming& timing, std::vector<double> per_dispatch_ms) noexcept {
+	try {
+		g_last_call_timing_snapshot.Publish(timing, std::move(per_dispatch_ms));
+	} catch (...) {
+	}
+}
+void PublishEmptyCallTimingNoThrow() noexcept {
+	try {
+		g_last_call_timing_snapshot.PublishEmpty();
+	} catch (...) {
+	}
+}
 
 // T-2101 (throughput, D-SLM3301/D-SLM3294): the K/V workspace's own device residency, mirroring
 // ResidentWeights' shape exactly. Before this: `superslm_gpu.cpp`'s call site copied the WHOLE
@@ -1488,22 +1506,14 @@ inline void MaybeThrowInjectedT2169ChunkRecordingTailFault() {
 #endif  // SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION
 }
 
-// T-2192 finding M3: fires between `ExecuteCommandLists` and `Signal()` -- `ExecuteCommandLists`
-// has therefore already genuinely queued the recorded work to the GPU when this throws, the exact
-// "work is already in flight, only Signal() itself failed" state T-2192's own T2(b) remedy
-// (this file, `SubmitOneSubChunkToFullDepthForG5Bridge`'s tail) handles. `std::runtime_error`,
-// matching what `SSLM_GPU_HR` throws on a real `Signal()` failure.
-inline void MaybeThrowInjectedT2169ChunkRecordingTailSignalFault() {
-#ifdef SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION
-	if (g_t2169_chunk_recording_tail_signal_fault_armed) {
-		g_t2169_chunk_recording_tail_signal_fault_armed = false;
-		throw std::runtime_error(
-		    "T2192 T2(b): injected fault between ExecuteCommandLists and Signal(), simulating a "
-		    "failed Signal() after the recorded work was already queued to the GPU");
-	}
-#endif  // SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION
-}
-
+// T-2192 finding M3; from G3 (plan §4.4) inside Submit(): the singleton's first Signal after the
+// seam is armed is not made, so `ExecuteCommandLists` has already genuinely queued the recorded
+// work when the Signal "fails" -- the "work is already in flight, only Signal() itself failed"
+// state. Submit() then retries at a fresh value and, recovered, drains it and rethrows this
+// failure through ThrowT2169ChunkRecordingTailSignalFault() below: a `std::runtime_error`,
+// matching what `SSLM_GPU_HR` throws on a real `Signal()` failure. The consume and the throw are
+// harness::Device's (d3d12_harness.h, SignalFence and ThrowSignalFailure); defined after the
+// anonymous namespace below because they read its armed flag.
 // T-2192 finding M3: fires immediately before `new GpuLayerLoopInFlight()`, after `Close()`,
 // `ExecuteCommandLists`, and `Signal()` have all genuinely succeeded -- the exact entry state the
 // existing `catch (const std::bad_alloc&)` clause documents. `std::bad_alloc`, matching the real
@@ -1517,6 +1527,21 @@ inline void MaybeThrowInjectedT2169ChunkRecordingTailBadAllocFault() {
 #endif  // SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION
 }
 }  // namespace
+
+#ifdef SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION
+namespace harness {
+bool ConsumeT2169ChunkRecordingTailSignalFault() noexcept {
+	if (!g_t2169_chunk_recording_tail_signal_fault_armed) return false;
+	g_t2169_chunk_recording_tail_signal_fault_armed = false;  // single-shot
+	return true;
+}
+void ThrowT2169ChunkRecordingTailSignalFault() {
+	throw std::runtime_error(
+	    "T2192 T2(b): injected fault between ExecuteCommandLists and Signal(), simulating a "
+	    "failed Signal() after the recorded work was already queued to the GPU");
+}
+}  // namespace harness
+#endif  // SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION
 
 // External linkage, deliberately outside the anonymous namespace immediately above -- same
 // reasoning as `ArmO11AllocationFailureInjection` (this file, above): `tests/t2178-gpu-batched-
@@ -1580,9 +1605,15 @@ size_t KvViewRowOffset(const superslm::KvPageView& view, uint32_t layer, size_t 
 // gpu_port.h forward-declares. Every field is FINISH-phase-only state that only exists
 // once Submit has recorded and closed the command list -- see gpu_port.h's own comment
 // on `RunLayerLoopGpuSubmit`/`RunLayerLoopGpuFinish` for the ownership contract.
-struct GpuLayerLoopInFlight {
-	harness::Device* dev = nullptr;
-	uint64_t fence_val = 0;
+//
+// From G3 (plan §4.4, *The finish made structural*): the record a GpuInFlightToken carries. It
+// derives from GpuInFlightPayload, which holds the GpuSubmission Submit() returned (so the fence
+// value lives there, not here), and only the token can construct it (GpuInFlightToken::Make). It
+// also carries the call's own timing (decision 80), published by the finish tail.
+struct GpuLayerLoopInFlight final : public GpuInFlightPayload {
+	harness::Device* const dev;
+	GpuCallTiming timing{};
+	std::vector<double> per_dispatch_ms;
 	uint32_t dispatch_count_this_call = 0;
 	Microsoft::WRL::ComPtr<ID3D12Resource> seq_readback;
 	Microsoft::WRL::ComPtr<ID3D12Resource> kv_readback;
@@ -1624,6 +1655,12 @@ struct GpuLayerLoopInFlight {
 	Microsoft::WRL::ComPtr<ID3D12Resource> work_scratch_uav;
 	Microsoft::WRL::ComPtr<ID3D12Resource> lw_upload_keep_alive;
 	std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> upload_keep_alive;
+
+private:
+	friend class harness::BasicGpuInFlightToken<GpuLayerLoopInFlight>;
+	GpuLayerLoopInFlight(harness::GpuSubmission&& submission, harness::Device* device,
+	                     const GpuCallTiming& call_timing) noexcept
+	    : GpuInFlightPayload(std::move(submission)), dev(device), timing(call_timing) {}
 };
 
 // T-2113 (B10 lever 1b): the group-cooperative lane count for the fused stage-1 reduction
@@ -1974,8 +2011,7 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 	// rejected by any guard below never reaches the recording-window reset further down, and
 	// without this line would report the PREVIOUS successful call's own stale timing rather than
 	// the honest "nothing was timed" answer `LastCallTiming()`'s own header comment documents.
-	g_last_call_timing = GpuCallTiming{};
-	g_last_call_per_dispatch_ms.clear();
+	PublishEmptyCallTimingNoThrow();
 	// T-2052 (Claude/Poirot/36b9327-gpu-serial-port-reconfirmation-review.md,
 	// M1, correcting T-2049's own N1): CPU parity, corrected a SECOND time.
 	// T-2049's own comment here claimed "All eight [guards] now run here" --
@@ -2593,8 +2629,11 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 	// window. (The zero-reset for a REJECTED call lives at this function's own entry, above,
 	// alongside `g_last_weight_upload_was_skipped`'s own -- not here, since a rejected call never
 	// reaches this line at all.)
-	SSLM_GPU_HR(dev.alloc->Reset());
-	SSLM_GPU_HR(dev.list->Reset(dev.alloc.Get(), nullptr));
+	// From G3 the reset is the ledger's (plan §4.4): BeginRecording() refuses it, before resetting
+	// anything, on a stranded ledger (GpuSubmissionStrandedError, rule 0), inside a C ABI call that
+	// passed no EntrySubmitGuard, or while the device's last submission is unobserved
+	// (PoolSubmitContractError).
+	dev.BeginRecording();
 	out_state->list_opened = true;
 
 	// EVERY variable below this point that the command list's own GPU virtual addresses
@@ -3024,40 +3063,34 @@ superslm::SslmForwardStatus ClassifyForwardFault(harness::Device& dev, bool stra
 	    is_stranded, removed, kind == harness::GpuFaultKind::Allocation));
 }
 
-// The status for a fault in a submission tail -- the Close, ExecuteCommandLists, the fence Signal
-// and the in-flight token's allocation that follow a recording window -- shared by both tails.
-// Call only from inside a catch handler. Where the fault struck decides the stranded input:
+// The status for a fault in a submission tail -- the Close, the ledger's Submit() and the in-flight
+// token's construction that follow a recording window -- shared by both tails. Call only from
+// inside a catch handler, after the try's locals (the GpuSubmission or GpuInFlightToken the tail
+// made) have been destroyed: each drains its submission through the non-throwing drain as it is
+// destroyed. Where the fault struck decides the stranded input:
 //   - before the Close was attempted (the pre-Close pin seam): the list is still recording, so it
 //     is closed here through CloseListConfirmed;
 //   - at the Close (CloseListOrThrow): its exception already carries the list's confirmed state;
-//   - after ExecuteCommandLists, with the Signal done: the submission is waited out at its own
-//     fence value;
-//   - after ExecuteCommandLists, with the Signal failed: a FRESH fence value is signalled and
-//     waited out (T-2192 T2(b): a retry at the failed call's value may be a silent no-op).
+//   - after ExecuteCommandLists (`executed`: Submit() reached its execute): from G3 every recovery
+//     is the ledger's (plan §4.4, *The ledger on the fault paths*). Submit() has already retried a
+//     failed Signal at a fresh value and, recovered, drained it before rethrowing; a Submit() that
+//     could not recover threw GpuSubmissionStrandedError with the ledger stranded; and work that
+//     Submit() handed out was drained by its token's destructor during the unwinding. So nothing
+//     is left in flight here, and the ledger alone says whether the work's completion was
+//     confirmed. Decision (3.6g's M3, g1d's carried ambiguity): the caller's own tail
+//     `Wait(submitted_)` the fault-path table names is dropped as redundant -- every path that
+//     reaches this function has already observed or stranded the submission -- so 3.6g's
+//     still-blocked leg separates "Submit() rethrows without its drain" (M3).
 // Work whose completion cannot be confirmed is stranded (rule 0): the caller is about to release
 // resources that work reads. Otherwise the classifier decides by the exception's kind: a Signal
 // that failed with E_OUTOFMEMORY and recovered is rule 2, any other recovered failure rule 3.
 superslm::SslmForwardStatus SubmissionTailFaultStatus(harness::Device& dev, bool close_attempted,
-                                                      bool executed, bool signaled) {
+                                                      bool executed) {
 	bool stranded = false;
 	if (!executed) {
 		if (!close_attempted) stranded = !dev.CloseListConfirmed().closed;
 	} else {
-		UINT64 wait_value = dev.fence_val;
-		bool wait_possible = true;
-		if (!signaled) {
-			wait_value = ++dev.fence_val;
-			wait_possible = SUCCEEDED(dev.queue->Signal(dev.fence.Get(), wait_value));
-		}
-		if (!wait_possible) {
-			stranded = true;
-		} else if (dev.fence->GetCompletedValue() < wait_value) {
-			if (SUCCEEDED(dev.fence->SetEventOnCompletion(wait_value, dev.fence_event))) {
-				WaitForSingleObject(dev.fence_event, INFINITE);
-			} else {
-				stranded = true;
-			}
-		}
+		stranded = dev.ledger().Stranded();
 	}
 	return ClassifyForwardFault(dev, stranded);
 }
@@ -3083,13 +3116,13 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
     size_t num_key_value_heads, size_t intermediate_size, int64_t context_cap,
     const superslm::SslmTensorManifest& rope_tables, uint8_t* workspace, size_t workspace_size,
     ID3D12Resource* external_kv_resident, bool* io_external_kv_needs_resume_barrier,
-    GpuLayerLoopInFlight** out_inflight, ID3D12Resource* external_weights_resident,
+    GpuInFlightToken* out_inflight, ID3D12Resource* external_weights_resident,
     ID3D12Resource* external_rope_cos_resident, ID3D12Resource* external_rope_sin_resident,
     bool external_rope_has, uint64_t external_rope_cos_elems, uint64_t external_rope_sin_elems,
     const GpuAdapterBridge* adapter_bridge, size_t q_width, uint8_t* out_q_codes,
     size_t out_q_codes_capacity, uint64_t model_generation, bool model_has_qk_norm,
     const GpuPagedKvBinding* paged_kv) {
-	if (out_inflight) *out_inflight = nullptr;
+	if (out_inflight) *out_inflight = GpuInFlightToken();
 	// T-2169 (Rung 2b-prep, D-SLM3632/D-SLM3633): the guard ladder, the weight/rope/K-V
 	// pack-and-residency decision, and the once-per-call root-signature/binding setup now live in
 	// PrepareGpuLayerLoopChunkOpenState (above) -- a mechanical extraction, called here exactly
@@ -3444,8 +3477,15 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 	// came from CloseListOrThrow, which has already confirmed the list's state -- a typed HRESULT
 	// failure for a list it confirmed Closed, GpuSubmissionStrandedError for one it could not.
 	bool tail_close_attempted = false;
-	bool tail_executed = false;
-	bool tail_signaled = false;  // the Signal after ExecuteCommandLists succeeded
+	// From G3: whether ExecuteCommandLists ran is read off the ledger's submission counter, which
+	// Submit() advances only after its execute (TailExecuted, below).
+	const uint64_t tail_counter_before = dev.submission_counter();
+	const auto TailExecuted = [&dev, tail_counter_before]() noexcept {
+		return dev.submission_counter() != tail_counter_before;
+	};
+	// Decision 80: this call's own timing, carried by its record and published by the finish
+	// tail, or published here on a catch path as far as the call got.
+	GpuCallTiming call_timing{};
 	try {
 		// T-2195 pertoken pin (Curie): the SAME pre-Close pin seam
 		// `SubmitOneSubChunkToFullDepthForG5Bridge`'s own tail already calls (this file, below) --
@@ -3459,33 +3499,28 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 		dev.CloseListOrThrow();
 		tail_list_closed = true;
 		const auto t_record_end = std::chrono::steady_clock::now();
-		g_last_call_timing.record_ms =
+		call_timing.record_ms =
 		    std::chrono::duration<double, std::milli>(t_record_end - t_record_start).count();
 
 		// T-2101: `submit_wait_ms` is CPU time from submission to the fence signaling complete --
 		// submission overhead PLUS actual GPU execution PLUS driver/OS scheduling, NOT a GPU-only
 		// number. `gpu_busy_ms` (below, from the timestamp queries §31's own bracket placed around this
 		// call's first/last dispatch) is the GPU-only figure the roofline comparison is judged against.
-		ID3D12CommandList* lists[] = {dev.list.Get()};
-		dev.queue->ExecuteCommandLists(1, lists);
-		// `ExecuteCommandLists` is only reachable once `Close()` has succeeded (the statement order
-		// above), matching the sibling's own identical assertion.
+		// `Submit()` is only reachable once `Close()` has succeeded (the statement order above),
+		// matching the sibling's own identical assertion. From G3 (plan §4.4) the submission is the
+		// ledger's: ExecuteCommandLists, then a Signal at a fresh value with one fresh-value retry.
 		assert(tail_list_closed);
-		tail_executed = true;
-		SSLM_GPU_HR(dev.queue->Signal(dev.fence.Get(), ++dev.fence_val));
-		tail_signaled = true;
+		harness::GpuSubmission submission = dev.Submit();
 		// T-2113 (B5, design Sec6.2): NO fence-wait here -- "records ... submits ... and
 		// returns without waiting for the fence." Everything below used to run
 		// synchronously at this point (the wait, the GPU-timing readback, the SeqState/KV
 		// readback, the sticky-tag decode); it now lives in RunLayerLoopGpuFinish, driven
 		// by the in-flight token this call hands back. `record_ms` is still measured here
 		// (it is host-side recording time, already complete by this point); `submit_wait_ms`/
-		// `gpu_busy_ms`/`readback_ms` are now measured inside Finish, against the SAME
-		// `g_last_call_timing` global every existing caller of the synchronous
-		// `RunLayerLoopGpu` wrapper still reads after ITS OWN Submit+Finish pair completes.
-		std::unique_ptr<GpuLayerLoopInFlight> inflight(new GpuLayerLoopInFlight());
-		inflight->dev = &dev;
-		inflight->fence_val = dev.fence_val;
+		// `gpu_busy_ms`/`readback_ms` are measured inside Finish, into the record's own timing,
+		// which Finish publishes (decision 80).
+		GpuInFlightToken token = GpuInFlightToken::Make(std::move(submission), &dev, call_timing);
+		GpuLayerLoopInFlight* inflight = token.get();
 		inflight->dispatch_count_this_call = dispatch_count_this_call;
 		inflight->seq_readback = seq_readback;
 		inflight->kv_readback = kv_readback;
@@ -3511,26 +3546,29 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 		inflight->work_scratch_uav = state.work_scratch_uav;
 		inflight->lw_upload_keep_alive = state.lw_upload_keep_alive;
 		inflight->upload_keep_alive = state.upload_keep_alive;
-		if (out_inflight) *out_inflight = inflight.release();
+		if (out_inflight) *out_inflight = std::move(token);
 		return superslm::SslmForwardStatus::Ok;
 	} catch (const std::bad_alloc&) {
-		// Reached after Close() and Signal() both succeeded (the in-flight token's allocation) --
-		// mirrors `SubmitOneSubChunkToFullDepthForG5Bridge`'s own identical `bad_alloc` clause
-		// exactly (this file, above): the GPU already has this submission queued against the fence
-		// value just signaled, so every resource this stack is about to release
-		// (`seq_readback`/`kv_readback`/every `state` buffer) must wait the fence out first, rather
-		// than let a GPU-referenced resource's last COM reference drop while the device may still be
-		// using it. SubmissionTailFaultStatus does the wait, and reports a wait it cannot confirm
-		// as a stranded submission.
+		// Reached after Close() (a host allocation failure in the token's construction or its
+		// fields, after Submit() handed its work out) -- mirrors
+		// `SubmitOneSubChunkToFullDepthForG5Bridge`'s own identical `bad_alloc` clause exactly (this
+		// file, below). The GPU already has this submission queued, so every resource this stack is
+		// about to release (`seq_readback`/`kv_readback`/every `state` buffer) must wait the fence
+		// out first. From G3 the submission's own token did that as it was destroyed, during the
+		// unwinding into this clause; SubmissionTailFaultStatus reads the ledger and reports a wait
+		// that could not be confirmed as a stranded submission.
+		const bool tail_executed = TailExecuted();
 		InvalidateResidencyCachesOnThrow();
 		if (!tail_executed && external_kv_resident != nullptr &&
 		    io_external_kv_needs_resume_barrier != nullptr) {
 			*io_external_kv_needs_resume_barrier = kv_resume_barrier_entry_value;
 		}
-		return SubmissionTailFaultStatus(dev, tail_close_attempted, tail_executed, tail_signaled);
+		PublishCallTimingNoThrow(call_timing, {});
+		return SubmissionTailFaultStatus(dev, tail_close_attempted, tail_executed);
 	} catch (const std::runtime_error&) {
-		// A failed Close() or Signal(), or the pre-Close pin seam -- mirrors the sibling's own
-		// identical clause exactly.
+		// A failed Close() or Signal() (Submit()'s recovered first failure, or its stranded error),
+		// or the pre-Close pin seam -- mirrors the sibling's own identical clause exactly.
+		const bool tail_executed = TailExecuted();
 		InvalidateResidencyCachesOnThrow();
 		if (!tail_executed) {
 			// `ExecuteCommandLists` never ran. The caller-owned resume-barrier latch this function
@@ -3545,23 +3583,26 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 		// 1.8.0 (TE-426): the list's confirmed state and the submission's confirmed completion decide
 		// rule 0, then the classifier decides by kind (SubmissionTailFaultStatus's own comment). A
 		// list still recording after Close, a retry and the confirm step refuses every later
-		// `dev.alloc->Reset()` in the process, so it is reported GpuDeviceRemoved (T-2192 T2(a)).
-		return SubmissionTailFaultStatus(dev, tail_close_attempted, tail_executed, tail_signaled);
+		// reset in the process, so it is reported GpuDeviceRemoved (T-2192 T2(a)).
+		PublishCallTimingNoThrow(call_timing, {});
+		return SubmissionTailFaultStatus(dev, tail_close_attempted, tail_executed);
 	} catch (...) {
 		// 1.8.0 (TE-432): any other exception type -- a std::length_error, or a non-standard type --
-		// from anywhere in the tail, the in-flight token's allocation after ExecuteCommandLists and
-		// Signal included. Without this clause it left the function with the submission still
-		// executing, and the unwinding released `seq_readback`/`kv_readback`/every `state` buffer
-		// the queued work reads and writes, which removes the device. The same containment as the
-		// two clauses above: restore the latch when nothing executed, then close the list or wait the
-		// submission out; work whose completion cannot be confirmed is rule 0, and the classifier
-		// decides the rest by kind (a non-standard type is rule 3).
+		// from anywhere in the tail, the in-flight token's construction after Submit() included.
+		// Without this clause it left the function with the submission still executing, and the
+		// unwinding released `seq_readback`/`kv_readback`/every `state` buffer the queued work reads
+		// and writes, which removes the device. The same containment as the two clauses above:
+		// restore the latch when nothing executed, then close the list (the submission's token has
+		// already drained it); work whose completion cannot be confirmed is rule 0, and the
+		// classifier decides the rest by kind (a non-standard type is rule 3).
+		const bool tail_executed = TailExecuted();
 		InvalidateResidencyCachesOnThrow();
 		if (!tail_executed && external_kv_resident != nullptr &&
 		    io_external_kv_needs_resume_barrier != nullptr) {
 			*io_external_kv_needs_resume_barrier = kv_resume_barrier_entry_value;
 		}
-		return SubmissionTailFaultStatus(dev, tail_close_attempted, tail_executed, tail_signaled);
+		PublishCallTimingNoThrow(call_timing, {});
+		return SubmissionTailFaultStatus(dev, tail_close_attempted, tail_executed);
 	}
 }
 
@@ -3596,7 +3637,7 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
     bool* io_external_kv_needs_resume_barrier, ID3D12Resource* external_weights_resident,
     ID3D12Resource* external_rope_cos_resident, ID3D12Resource* external_rope_sin_resident,
     bool external_rope_has, uint64_t external_rope_cos_elems, uint64_t external_rope_sin_elems,
-    const GpuAdapterBridge* adapter_bridge, GpuLayerLoopInFlight** out_inflight, size_t q_width,
+    const GpuAdapterBridge* adapter_bridge, GpuInFlightToken* out_inflight, size_t q_width,
     // (T-2577 round 2, D-SLM6278): mirrors `RunLayerLoopGpuSubmit`'s own trailing
     // `model_generation` -- threaded into this call's own `PrepareGpuLayerLoopChunkOpenState`
     // call, below.
@@ -3604,7 +3645,7 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
     // Paged-KV plan §4 items 5-6a, step G3: the pooled binding (null: the one-page view) and the rows
     // the chunk writes from this sub-chunk's open to its end (the chunk-wide coverage twin).
     const GpuPagedKvBinding* paged_kv, uint32_t coverage_tokens) {
-	if (out_inflight) *out_inflight = nullptr;
+	if (out_inflight) *out_inflight = GpuInFlightToken();
 	// T-2184 remedy S3 (Brunel fix round 1, D-SLM3662): this primitive's own catch clauses call
 	// the same file-scope `InvalidateResidencyCachesOnThrow()` `RunLayerLoopGpuSubmit`'s catch
 	// clauses call (declared once, above `RunLayerLoopGpuSubmit`) -- previously a THIRD locally-
@@ -3876,14 +3917,17 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 	// `dev.list->Close()`, then `GetDeviceRemovedReason()` picks the status) rather than inventing
 	// a new recovery shape.
 	bool tail_list_closed = false;
-	// T-2192 finding T2(b): tracks whether `ExecuteCommandLists` has already run -- the point past
-	// which the recorded work is genuinely queued to the GPU regardless of what throws next. Read
-	// by the `runtime_error` catch below to tell a `Close()` failure (nothing submitted) apart from
-	// a `Signal()` failure (submitted, only the fence signal failed).
-	bool tail_executed = false;
-	// 1.8.0 (TE-426): RunLayerLoopGpuSubmit's own twin flags (that tail, above, states their meaning).
+	// 1.8.0 (TE-426): RunLayerLoopGpuSubmit's own twin flags (that tail, above, states their
+	// meaning). T-2192 finding T2(b): whether `ExecuteCommandLists` has already run -- the point past
+	// which the recorded work is genuinely queued to the GPU regardless of what throws next -- is
+	// read off the ledger's submission counter (from G3), which Submit() advances only after its
+	// execute.
 	bool tail_close_attempted = false;
-	bool tail_signaled = false;
+	const uint64_t tail_counter_before = dev.submission_counter();
+	const auto TailExecuted = [&dev, tail_counter_before]() noexcept {
+		return dev.submission_counter() != tail_counter_before;
+	};
+	GpuCallTiming call_timing{};  // decision 80 (RunLayerLoopGpuSubmit's tail, above)
 	try {
 		// The pin seam fires here, throwing exactly the type `SSLM_GPU_HR` would on a real
 		// failure, unarmed cost zero.
@@ -3892,30 +3936,25 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 		dev.CloseListOrThrow();
 		tail_list_closed = true;
 		const auto t_record_end = std::chrono::steady_clock::now();
-		g_last_call_timing.record_ms =
+		call_timing.record_ms =
 		    std::chrono::duration<double, std::milli>(t_record_end - t_record_start).count();
-		ID3D12CommandList* lists[] = {dev.list.Get()};
-		dev.queue->ExecuteCommandLists(1, lists);
-		// `ExecuteCommandLists` is only reachable once `Close()` has succeeded (the statement
-		// order above), so `tail_list_closed` is always true by this point -- asserted rather than
-		// left as a fact only the statement order documents, so a future reordering that broke it
-		// would fail loudly here instead of silently mis-branching the catch below.
+		// `Submit()` is only reachable once `Close()` has succeeded (the statement order above), so
+		// `tail_list_closed` is always true by this point -- asserted rather than left as a fact
+		// only the statement order documents. From G3 (plan §4.4) the submission is the ledger's:
+		// ExecuteCommandLists, then a Signal at a fresh value with one fresh-value retry. T-2192
+		// finding M3's Signal()-failure seam fires inside it (harness::Device::SignalFence), strictly
+		// after ExecuteCommandLists; a recovered retry is drained inside Submit() before the first
+		// failure is rethrown.
 		assert(tail_list_closed);
-		tail_executed = true;
-		// T-2192 finding M3: the Signal()-failure seam, unarmed cost zero -- fires here, strictly
-		// after ExecuteCommandLists so `tail_executed` is genuinely true when it throws.
-		MaybeThrowInjectedT2169ChunkRecordingTailSignalFault();
-		SSLM_GPU_HR(dev.queue->Signal(dev.fence.Get(), ++dev.fence_val));
-		tail_signaled = true;
-		// From here on, only `std::bad_alloc` from the `new` below can throw -- Close() and
-		// Signal() have both already succeeded, so the GPU already has this submission queued and
-		// fenced at `dev.fence_val`.
+		harness::GpuSubmission submission = dev.Submit();
+		// From here on, only `std::bad_alloc` from the token's construction can throw -- Close()
+		// and Submit() have both already succeeded, so the GPU already has this submission queued
+		// and fenced, held by `submission`, which drains it if anything below throws.
 		// T-2192 finding M3: the bad_alloc seam, unarmed cost zero -- fires immediately before the
 		// real allocation, after Close()/Execute/Signal have all genuinely succeeded.
 		MaybeThrowInjectedT2169ChunkRecordingTailBadAllocFault();
-		std::unique_ptr<GpuLayerLoopInFlight> inflight(new GpuLayerLoopInFlight());
-		inflight->dev = &dev;
-		inflight->fence_val = dev.fence_val;
+		GpuInFlightToken token = GpuInFlightToken::Make(std::move(submission), &dev, call_timing);
+		GpuLayerLoopInFlight* inflight = token.get();
 		inflight->dispatch_count_this_call = dispatch_count_this_call;
 		inflight->seq_readback = seq_readback;
 		inflight->kv_readback = kv_readback;
@@ -3934,28 +3973,28 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 		inflight->work_scratch_uav = state.work_scratch_uav;
 		inflight->lw_upload_keep_alive = state.lw_upload_keep_alive;
 		inflight->upload_keep_alive = state.upload_keep_alive;
-		if (out_inflight) *out_inflight = inflight.release();
+		if (out_inflight) *out_inflight = std::move(token);
 		return superslm::SslmForwardStatus::Ok;
 	} catch (const std::bad_alloc&) {
-		// Reached only after Close() and Signal() both succeeded (the only throwing statement
-		// between here and the try's own start is the `new` above) -- the list is already Closed,
-		// and the GPU already has this submission queued against the fence value just signaled.
-		// Every resource this function's stack is about to release on the way out
-		// (`seq_readback`/`kv_readback`/`state`'s own buffers) is exactly what that recorded work
-		// reads from or writes to, so wait the fence out before releasing them -- the same
-		// SetEventOnCompletion/WaitForSingleObject idiom `RunLayerLoopGpuFinish`'s own blocking
-		// path uses (this file, below) -- rather than let a GPU-referenced resource's last COM
-		// reference drop while the device may still be using it. SubmissionTailFaultStatus does
-		// the wait, and reports a wait it cannot confirm as a stranded submission.
+		// Reached only after Close() and Submit() both succeeded -- the list is already Closed, and
+		// the GPU already has this submission queued. Every resource this function's stack is about
+		// to release on the way out (`seq_readback`/`kv_readback`/`state`'s own buffers) is exactly
+		// what that recorded work reads from or writes to, so the fence is waited out before they
+		// are released: from G3 by the submission's own token (`submission`, or `token`), drained as
+		// it was destroyed during the unwinding into this clause. SubmissionTailFaultStatus reads
+		// the ledger and reports a wait it could not confirm as a stranded submission.
+		const bool tail_executed = TailExecuted();
 		InvalidateResidencyCachesOnThrow();
 		if (!tail_executed && external_kv_resident != nullptr &&
 		    io_external_kv_needs_resume_barrier != nullptr) {
 			*io_external_kv_needs_resume_barrier = kv_resume_barrier_entry_value;
 		}
-		return SubmissionTailFaultStatus(dev, tail_close_attempted, tail_executed, tail_signaled);
+		PublishCallTimingNoThrow(call_timing, {});
+		return SubmissionTailFaultStatus(dev, tail_close_attempted, tail_executed);
 	} catch (const std::runtime_error&) {
-		// A failed Close() or Signal() (or the pre-Close injected pin, which fires before either
-		// runs).
+		// A failed Close() or Signal() (Submit()'s recovered first failure, or its stranded error),
+		// or the pre-Close injected pin, which fires before either runs.
+		const bool tail_executed = TailExecuted();
 		InvalidateResidencyCachesOnThrow();
 		if (!tail_executed) {
 			// `ExecuteCommandLists` never ran: either the pre-Close fault fired first, or Close()
@@ -3983,46 +4022,35 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 			}
 			// The RESULT of closing the list decides whether the context is honestly reusable
 			// (T-2192 finding T2(a)): a list still recording after Close, a retry and the confirm
-			// step refuses every later `dev.alloc->Reset()` in the process (T-2191 S6's own class),
-			// so it is reported GpuDeviceRemoved, never a status that implies a recovered, reusable
-			// list (SubmissionTailFaultStatus).
+			// step refuses every later reset in the process (T-2191 S6's own class), so it is
+			// reported GpuDeviceRemoved, never a status that implies a recovered, reusable list
+			// (SubmissionTailFaultStatus).
 		}
-		// If `ExecuteCommandLists` already ran -- the GPU has this submission queued, the identical
-		// situation the `bad_alloc` clause above documents. Whatever `dev.fence_val` holds right
-		// now may or may not already be the value the failed `Signal()` attempted (that increment
-		// is evaluated as part of constructing `Signal()`'s own argument, so a REAL `Signal()`
-		// failure leaves it already advanced; the injected pin fires as a separate statement
-		// strictly before that line, so on the injected path it is not) -- rather than depend on
-		// which case this is, mint a FRESH, unambiguously-unreached value here and signal that one.
-		// A stale retry at whatever `dev.fence_val` already held would be a near-guaranteed no-op
-		// (that value was very likely already reached by an earlier submission's own wait), which
-		// is exactly the silent non-wait T-2192 finding T2(b) exists to close -- reproduced by
-		// executing this cell against the real device before this fix: the retry skipped waiting
-		// entirely, the stack's buffers were released into work the GPU was still doing, and the
-		// device was confirmed removed on the very next call. This function's stack is about to
-		// release `seq_readback`/`kv_readback`/every `state` buffer the already-queued work reads
-		// from or writes to, so the fence must be made to signal -- or the wait skipped only
-		// because the device is confirmed gone -- before this function returns, the same
-		// requirement the `bad_alloc` clause above honors for the identical post-Execute situation.
-		// Direct HRESULT checks, not `SSLM_GPU_HR` -- a second throw here must not re-enter this
-		// same catch. 1.8.0 (TE-426): a recovery that fails, or a wait that cannot be confirmed,
-		// leaves the about-to-be-released resources racing whatever the GPU is still doing with
-		// them, so it is a stranded submission (rule 0), GpuDeviceRemoved whatever
+		// If `ExecuteCommandLists` already ran, the GPU had this submission queued. T-2192 finding
+		// T2(b) required a FRESH, unambiguously-unreached fence value to be signalled and waited
+		// out before this stack releases the buffers that work reads (a stale retry at an
+		// already-reached value is a silent non-wait, reproduced on the real device). From G3 that
+		// recovery is the ledger's own (plan §4.4, *The ledger on the fault paths*): Submit()
+		// retried at a fresh value and drained it before rethrowing the first failure, or left the
+		// ledger stranded and threw GpuSubmissionStrandedError. A recovery that failed, or a wait
+		// that could not be confirmed, is a stranded submission (rule 0), GpuDeviceRemoved whatever
 		// GetDeviceRemovedReason() reports; a recovery that was waited out is classified by what
-		// failed. All of it lives in SubmissionTailFaultStatus, shared with
-		// RunLayerLoopGpuSubmit's tail.
-		return SubmissionTailFaultStatus(dev, tail_close_attempted, tail_executed, tail_signaled);
+		// failed (SubmissionTailFaultStatus, shared with RunLayerLoopGpuSubmit's tail).
+		PublishCallTimingNoThrow(call_timing, {});
+		return SubmissionTailFaultStatus(dev, tail_close_attempted, tail_executed);
 	} catch (...) {
 		// 1.8.0 (TE-432): RunLayerLoopGpuSubmit's own twin catch-all (this file, above): any other
-		// exception type from anywhere in the tail, the in-flight token's allocation after
-		// ExecuteCommandLists and Signal included, is contained like the two clauses above -- the
-		// submission is waited out before this stack releases the buffers it uses.
+		// exception type from anywhere in the tail, the in-flight token's construction after
+		// Submit() included, is contained like the two clauses above -- the submission was drained
+		// by its token before this stack releases the buffers it uses.
+		const bool tail_executed = TailExecuted();
 		InvalidateResidencyCachesOnThrow();
 		if (!tail_executed && external_kv_resident != nullptr &&
 		    io_external_kv_needs_resume_barrier != nullptr) {
 			*io_external_kv_needs_resume_barrier = kv_resume_barrier_entry_value;
 		}
-		return SubmissionTailFaultStatus(dev, tail_close_attempted, tail_executed, tail_signaled);
+		PublishCallTimingNoThrow(call_timing, {});
+		return SubmissionTailFaultStatus(dev, tail_close_attempted, tail_executed);
 	}
 }
 
@@ -4087,13 +4115,13 @@ superslm::SslmForwardStatus SubmitChunkToFullDepthForG5Bridge(
     bool* io_external_kv_needs_resume_barrier, ID3D12Resource* external_weights_resident,
     ID3D12Resource* external_rope_cos_resident, ID3D12Resource* external_rope_sin_resident,
     bool external_rope_has, uint64_t external_rope_cos_elems, uint64_t external_rope_sin_elems,
-    const GpuAdapterBridge* adapter_bridge, GpuLayerLoopInFlight** out_inflight, size_t q_width,
+    const GpuAdapterBridge* adapter_bridge, GpuInFlightToken* out_inflight, size_t q_width,
     // (T-2577 round 2, D-SLM6278): mirrors `RunLayerLoopGpuSubmit`'s own trailing
     // `model_generation` -- forwarded to every `SubmitOneSubChunkToFullDepthForG5Bridge` call
     // this function's own sub-chunk-splitting loop makes, below.
     uint64_t model_generation, bool model_has_qk_norm, bool* out_readback_guard_rejected,
     const GpuPagedKvBinding* paged_kv) {
-	if (out_inflight) *out_inflight = nullptr;
+	if (out_inflight) *out_inflight = GpuInFlightToken();
 	if (out_readback_guard_rejected) *out_readback_guard_rejected = false;
 	if (chunk_len == 0) {
 		// Nothing to submit -- no guard ladder has run, so this is not itself a rejection; the
@@ -4114,7 +4142,7 @@ superslm::SslmForwardStatus SubmitChunkToFullDepthForG5Bridge(
 		const uint32_t this_sub_chunk =
 		    remaining < kT2169TdrSafeMaxChunkTokens ? remaining : kT2169TdrSafeMaxChunkTokens;
 		const bool is_last = (submitted + this_sub_chunk) >= chunk_len;
-		GpuLayerLoopInFlight* inflight = nullptr;
+		GpuInFlightToken inflight;
 		const superslm::SslmForwardStatus submit_status = SubmitOneSubChunkToFullDepthForG5Bridge(
 		    seq, layers, num_hidden_layers, hidden_size, head_dim, num_key_value_heads,
 		    intermediate_size, context_cap, rope_tables, workspace, workspace_size,
@@ -4131,7 +4159,7 @@ superslm::SslmForwardStatus SubmitChunkToFullDepthForG5Bridge(
 			// The caller's own async contract (design Sec4.2/Sec4.3): only the FINAL
 			// (sub-)chunk's own inflight token is handed back unfinished -- the caller drives
 			// its own Finish, exactly as it already does for the single-sub-chunk case.
-			if (out_inflight) *out_inflight = inflight;
+			if (out_inflight) *out_inflight = std::move(inflight);
 			return superslm::SslmForwardStatus::Ok;
 		}
 		// Every non-final sub-chunk is finished SYNCHRONOUSLY, here, before the next sub-chunk's
@@ -4144,7 +4172,7 @@ superslm::SslmForwardStatus SubmitChunkToFullDepthForG5Bridge(
 		// done with the allocator the current list used, which the fence wait below guarantees.
 		int32_t ready = 0;
 		const superslm::SslmForwardStatus finish_status =
-		    RunLayerLoopGpuFinish(inflight, seq, workspace, /*block=*/1, &ready);
+		    RunLayerLoopGpuFinish(std::move(inflight), seq, workspace, /*block=*/1, &ready);
 		if (finish_status != superslm::SslmForwardStatus::Ok) {
 			// `RunLayerLoopGpuFinish` returns `GpuDeviceRemoved`/`GpuAllocationFailed`/
 			// `GpuOperationFailed` only from its catch (a fault in the fence wait or a readback
@@ -4190,7 +4218,7 @@ superslm::SslmForwardStatus SubmitChunkToFullDepthForG5Bridge(
 // waits unconditionally (matching the old unconditional wait exactly); `block==0` polls
 // `GetCompletedValue()` and, if not yet signaled, returns immediately with `*out_ready=0`
 // and `inflight` untouched -- still owned by the caller, still pollable.
-superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuLayerLoopInFlight* inflight,
+superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuInFlightToken&& inflight,
                                                     superslm::SequenceLayerState& seq,
                                                     uint8_t* workspace, int32_t block,
                                                     int32_t* out_ready, uint8_t* out_q_codes) {
@@ -4202,10 +4230,11 @@ superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuLayerLoopInFlight* inflight
 		return superslm::SslmForwardStatus::GpuOperationFailed;
 	}
 	harness::Device& dev = *inflight->dev;
-	const bool signaled = dev.fence->GetCompletedValue() >= inflight->fence_val;
-	if (!signaled && !block) {
+	// From G3 (plan §4.4, *The not-ready poll*): the poll is the ledger's Poll(v), through the
+	// token, which raises observed_ once the fence has reached the token's value and never waits.
+	if (!block && !inflight.ReadyNoWait()) {
 		// Pure poll, nothing ready yet -- design Sec4.2: "*out_ready=0, no state change."
-		// `inflight` is NOT consumed; the caller polls again later against the SAME token.
+		// `inflight` is NOT moved from: the caller polls again later against the SAME token.
 		return superslm::SslmForwardStatus::Ok;
 	}
 #if defined(SUPERSLM_ENABLE_GPU_CHUNK_DISPATCH_INSTRUMENT)
@@ -4227,31 +4256,22 @@ superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuLayerLoopInFlight* inflight
 	// `GetDeviceRemovedReason()`-queried disposition Submit's own generic catch already
 	// uses for the analogous failure discovered during recording.
 	//
-	// `owned` takes ownership of `inflight` BEFORE the try block -- not after the wait,
-	// as an earlier draft had it -- specifically so RAII covers a throw from ANYWHERE
-	// in the try, including the wait itself, with no path that could reach the catch
-	// below still holding a naked, undeleted `inflight`, and no path where the catch
-	// would need to `delete` it manually (which risked a double-free against `owned`'s
-	// own destructor, on a throw AFTER `owned` had already taken ownership -- caught by
-	// this section's own review before it was ever exercised on real hardware).
-	std::unique_ptr<GpuLayerLoopInFlight> owned(inflight);  // consumed, exactly once, from here on
+	// From G3 (plan §4.4, *The finish made structural*): the finish moves from the token only
+	// here, once the fence has reached its value or the call blocks, and BEFORE the try block,
+	// so the local token frees the record on every exit from the try, the wait included.
+	GpuInFlightToken owned = std::move(inflight);  // consumed, exactly once, from here on
+	GpuLayerLoopInFlight* const rec = owned.get();
 	try {
-	if (!signaled) {
-		// A wait that cannot be confirmed leaves the submission's completion unknown: rule 0.
-		const HRESULT wait_hr = dev.fence->SetEventOnCompletion(inflight->fence_val, dev.fence_event);
-		if (FAILED(wait_hr)) {
-			std::fprintf(stderr, "superslm_gpu: SetEventOnCompletion failed 0x%08lx\n",
-			             static_cast<unsigned long>(wait_hr));
-			throw harness::GpuSubmissionStrandedError("D3D12 fence wait could not be confirmed");
-		}
-		WaitForSingleObject(dev.fence_event, INFINITE);
-	}
+	// The ledger's wait: returns without arming the event when the fence is already at the
+	// token's value; a wait that cannot be confirmed strands the ledger (lost_) and throws
+	// GpuSubmissionStrandedError, rule 0.
+	owned.Wait();
 	// From here down: BYTE-FOR-BYTE the old synchronous tail, reading from `inflight`'s
 	// own fields instead of this function's own locals (they were this function's own
 	// locals, in the pre-split RunLayerLoopGpu; Submit captured them into `inflight`
 	// immediately after recording, before this call ever ran).
 	const auto t_submit_wait_end = std::chrono::steady_clock::now();
-	g_last_call_timing.submit_wait_ms =
+	rec->timing.submit_wait_ms =
 	    std::chrono::duration<double, std::milli>(t_submit_wait_end - owned->t_record_end).count();
 
 	if (dev.timestamp_frequency > 0 && owned->dispatch_count_this_call > 0) {
@@ -4263,11 +4283,11 @@ superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuLayerLoopInFlight* inflight
 			D3D12_RANGE qnone{0, 0};
 			dev.timestamp_readback->Unmap(0, &qnone);
 			const double freq = static_cast<double>(dev.timestamp_frequency);
-			g_last_call_timing.gpu_busy_ms =
+			rec->timing.gpu_busy_ms =
 			    static_cast<double>(ts.back() - ts.front()) / freq * 1000.0;
-			g_last_call_per_dispatch_ms.resize(owned->dispatch_count_this_call);
+			rec->per_dispatch_ms.resize(owned->dispatch_count_this_call);
 			for (uint32_t d = 0; d < owned->dispatch_count_this_call; ++d) {
-				g_last_call_per_dispatch_ms[d] =
+				rec->per_dispatch_ms[d] =
 				    static_cast<double>(ts[d + 1] - ts[d]) / freq * 1000.0;
 			}
 		}
@@ -4317,7 +4337,7 @@ superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuLayerLoopInFlight* inflight
 		D3D12_RANGE none{0, 0};
 		owned->q_codes_readback->Unmap(0, &none);
 	}
-	g_last_call_timing.readback_ms =
+	rec->timing.readback_ms =
 	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_readback_start)
 	        .count();
 
@@ -4359,6 +4379,8 @@ superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuLayerLoopInFlight* inflight
 	seq.rope_k_saturation_count = (static_cast<uint64_t>(rk_hi_u) << 32) | static_cast<uint64_t>(rk_lo_u);
 	seq.context_length = ctxlen;
 
+	// Decision 80: the call's timing becomes the last call's, under the snapshot's one mutex.
+	PublishCallTimingNoThrow(rec->timing, std::move(rec->per_dispatch_ms));
 	if (out_ready) *out_ready = 1;
 	return DecodeStickyTag(sticky_tag);
 	} catch (const std::exception&) {
@@ -4370,6 +4392,7 @@ superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuLayerLoopInFlight* inflight
 		// frees `inflight` via its own destructor during stack unwinding, regardless of where
 		// inside the try the throw happened -- nothing here frees it a second time.
 		if (out_ready) *out_ready = 1;  // a terminal status, not a "still pending" one
+		PublishCallTimingNoThrow(rec->timing, std::move(rec->per_dispatch_ms));  // as far as it got
 		return ClassifyForwardFault(dev, /*stranded=*/false);
 	} catch (...) {
 		// 1.8.0 (TE-435): any other exception type -- a non-standard type from a host allocation
@@ -4379,6 +4402,7 @@ superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuLayerLoopInFlight* inflight
 		// clause the exception left the function with the token freed and the handle Submitted,
 		// pointing at it.
 		if (out_ready) *out_ready = 1;
+		PublishCallTimingNoThrow(rec->timing, std::move(rec->per_dispatch_ms));
 		return ClassifyForwardFault(dev, /*stranded=*/false);
 	}
 }
@@ -4402,7 +4426,7 @@ superslm::SslmForwardStatus RunLayerLoopGpu(superslm::SequenceLayerState& seq,
                                              bool* io_external_kv_needs_resume_barrier,
 	                                         uint64_t model_generation,
 	                                         bool model_has_qk_norm) {
-	GpuLayerLoopInFlight* inflight = nullptr;
+	GpuInFlightToken inflight;
 	const superslm::SslmForwardStatus submit_status = RunLayerLoopGpuSubmit(
 	    seq, layers, num_hidden_layers, layer_budget, hidden_size, head_dim, num_key_value_heads,
 	    intermediate_size, context_cap, rope_tables, workspace, workspace_size, external_kv_resident,
@@ -4415,7 +4439,7 @@ superslm::SslmForwardStatus RunLayerLoopGpu(superslm::SequenceLayerState& seq,
 		return submit_status;  // rejected (a guard, or an exception) before submission
 	}
 	int32_t ready = 0;
-	return RunLayerLoopGpuFinish(inflight, seq, workspace, /*block=*/1, &ready);
+	return RunLayerLoopGpuFinish(std::move(inflight), seq, workspace, /*block=*/1, &ready);
 }
 
 // T-2052 (item 3): the device-observable N3's own residency cache was
@@ -4542,9 +4566,49 @@ GpuGemmSiteGroupPlan ComputeGpuGemmSiteGroupPlan(GpuGemmSplitSite site, uint32_t
 	return plan;
 }
 
-GpuCallTiming LastCallTiming() { return g_last_call_timing; }
+GpuCallTiming LastCallTiming() { return g_last_call_timing_snapshot.CopyTiming(); }
 
-std::vector<double> LastCallPerDispatchTimingsMs() { return g_last_call_per_dispatch_ms; }
+// Paged-KV plan §4.4, step G3: the internal layer's drain (gpu_port.h). Reads the singleton
+// through the accessor, so a process with no device returns at once and constructs nothing.
+void DrainSubmissionsGpu() {
+	if (harness::SingletonLedgerIfConstructed() == nullptr) return;
+	harness::g_device_holder.device.Drain();
+}
+
+uint64_t BoundaryCheckReportsForTest() { return inflight::BoundaryCheckReportCount(); }
+uint64_t BoundaryCheckWalkedForTest() { return inflight::BoundaryCheckWalkedCount(); }
+
+#if defined(SUPERSLM_GPU_QUEUE_GATE_SEAM)
+// Plan §4.4, *The queue gate* (d3d12_harness.h, QueueGateState): the singleton only, both
+// injection builds. The arm constructs the singleton when the process has none, makes the gate
+// fence on its device the first time, and holds every later singleton submission at a fresh
+// target until the release; an arm while held keeps the current target. The release signals the
+// target from the host and is idempotent.
+void ArmQueueGateForTest() {
+	harness::Device& dev = harness::GetDevice();
+	if (!dev.available.load()) return;
+	harness::QueueGateState& gate = harness::QueueGate();
+	std::lock_guard<std::mutex> lock(gate.mutex);
+	if (gate.held) return;
+	if (!gate.fence) {
+		if (FAILED(dev.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate.fence)))) {
+			gate.fence.Reset();
+			return;
+		}
+	}
+	gate.target = ++gate.counter;
+	gate.held = true;
+}
+void ReleaseQueueGateForTest() {
+	harness::QueueGateState& gate = harness::QueueGate();
+	std::lock_guard<std::mutex> lock(gate.mutex);
+	if (!gate.held) return;
+	gate.held = false;
+	if (gate.fence) (void)gate.fence->Signal(gate.target);
+}
+#endif  // SUPERSLM_GPU_QUEUE_GATE_SEAM
+
+std::vector<double> LastCallPerDispatchTimingsMs() { return g_last_call_timing_snapshot.CopyPerDispatchMs(); }
 
 const int8_t* KeyRowGpu(const uint8_t* workspace, uint32_t layer, int64_t context_cap,
                          size_t num_kv_heads, size_t head_dim, size_t kv_head, int64_t position) {
@@ -4864,8 +4928,8 @@ bool RestoreGpuSequenceState(const void* blob, size_t blob_size, superslm::Seque
 		                                  D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 		auto readback_buf = dev.MakeBuffer(workspace_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
 		                                    D3D12_RESOURCE_STATE_COPY_DEST);
-		SSLM_GPU_HR(dev.alloc->Reset());
-		SSLM_GPU_HR(dev.list->Reset(dev.alloc.Get(), nullptr));
+		// G3: the ledger's reset (plan §4.4).
+		dev.BeginRecording();
 		dev.list->CopyResource(device_buf.Get(), upload_buf.Get());
 		D3D12_RESOURCE_BARRIER b{};
 		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -4877,11 +4941,10 @@ bool RestoreGpuSequenceState(const void* blob, size_t blob_size, superslm::Seque
 		dev.list->CopyResource(readback_buf.Get(), device_buf.Get());
 		// 1.8.0 (TE-426): the Close is confirmed (CloseListConfirmed), and the Signal, which has
 		// no retry here, and the wait are rule 0 on any failure -- each throws the typed error the
-		// caller's classifier (sslm_gpu_seq_restore, gpu_1p0.cpp) reads.
+		// caller's classifier (sslm_gpu_seq_restore, gpu_1p0.cpp) reads. From G3 the submission and
+		// the wait are the ledger's: Submit(no retry), then the submission's own Wait().
 		dev.CloseListOrThrow();
-		ID3D12CommandList* lists[] = {dev.list.Get()};
-		dev.queue->ExecuteCommandLists(1, lists);
-		dev.SignalAndWaitOrStrand();
+		dev.Submit(/*retry=*/false).Wait();
 		void* p = nullptr;
 		D3D12_RANGE range{0, static_cast<SIZE_T>(workspace_size)};
 		SSLM_GPU_HR(readback_buf->Map(0, &range, &p));
@@ -5009,8 +5072,8 @@ bool RunDescriptorTableBind(const int8_t* const* array_pointers, const size_t* a
 		s_pso = dev.MakePSO(s_root_sig.Get(), cso);
 	}
 
-	SSLM_GPU_HR(dev.alloc->Reset());
-	SSLM_GPU_HR(dev.list->Reset(dev.alloc.Get(), s_pso.Get()));
+	dev.BeginRecording();  // G3: the ledger's reset (plan §4.4); the PSO is set right after it
+	dev.list->SetPipelineState(s_pso.Get());
 	ID3D12DescriptorHeap* heaps[] = {heap.Get()};
 	dev.list->SetDescriptorHeaps(1, heaps);
 	dev.list->SetComputeRootSignature(s_root_sig.Get());
@@ -5030,9 +5093,7 @@ bool RunDescriptorTableBind(const int8_t* const* array_pointers, const size_t* a
 	dev.list->ResourceBarrier(1, &b);
 	dev.list->CopyResource(readback.Get(), out_uav.Get());
 	dev.CloseListOrThrow();
-	ID3D12CommandList* lists[] = {dev.list.Get()};
-	dev.queue->ExecuteCommandLists(1, lists);
-	dev.SignalAndWaitOrStrand();
+	dev.Submit(/*retry=*/false).Wait();
 
 	out_widened->resize(total_elements);
 	void* p = nullptr;

@@ -13,6 +13,7 @@
 #include "superslm/decode_digest.h"
 #include "superslm/forward_sites.h"
 #include "superslm/gpu_port.h"
+#include "../src/gpu/gpu_inflight_token.h"  // GpuInFlightToken (plan G3): complete for construction/destruction
 #include "superslm/intmath.h"
 #include "superslm/layer_marshal.h"
 #include "superslm/matmul.h"
@@ -81,6 +82,7 @@
 #ifdef _WIN32
 using enum SslmGpuStatus;
 #endif
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -28595,7 +28597,7 @@ static void TestT2577_S1b_ModelGenerationReachesTheG5BridgeChunkEntryPoint() {
 		uint8_t ws[kWorkspaceSize] = {};
 		const CarriedScale scale{INT64_C(1073741824), 0};
 		const std::vector<uint8_t> block = pack_block(hidden_codes, 2, scale);
-		superslm_gpu::GpuLayerLoopInFlight* inflight = nullptr;
+		superslm_gpu::GpuInFlightToken inflight;
 		const auto submit_st = superslm_gpu::SubmitChunkToFullDepthForG5Bridge(
 		    seq, &fixture.layer, /*num_hidden_layers=*/1, /*hidden_size=*/2, /*head_dim=*/2,
 		    /*num_key_value_heads=*/1, /*intermediate_size=*/2, /*context_cap=*/1,
@@ -28605,14 +28607,14 @@ static void TestT2577_S1b_ModelGenerationReachesTheG5BridgeChunkEntryPoint() {
 		    /*external_rope_sin_resident=*/nullptr, /*external_rope_has=*/false,
 		    /*external_rope_cos_elems=*/0, /*external_rope_sin_elems=*/0, /*adapter_bridge=*/nullptr,
 		    &inflight, /*q_width=*/0, generation);
-		CHECK_MSG(submit_st == SslmForwardStatus::Ok && inflight != nullptr,
+		CHECK_MSG(submit_st == SslmForwardStatus::Ok && inflight,
 		          "SubmitChunkToFullDepthForG5Bridge(generation=%llu) status == %s, want Ok "
 		          "with a live inflight token",
 		          (unsigned long long)generation, SslmForwardStatusName(submit_st));
 		if (submit_st != SslmForwardStatus::Ok || !inflight) return false;
 		int32_t ready = 0;
 		const auto finish_st =
-		    superslm_gpu::RunLayerLoopGpuFinish(inflight, seq, ws, /*block=*/1, &ready);
+		    superslm_gpu::RunLayerLoopGpuFinish(std::move(inflight), seq, ws, /*block=*/1, &ready);
 		CHECK_MSG(finish_st == SslmForwardStatus::Ok,
 		          "RunLayerLoopGpuFinish after the G5-bridge submit status == %s, want Ok",
 		          SslmForwardStatusName(finish_st));

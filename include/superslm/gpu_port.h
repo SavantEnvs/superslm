@@ -150,22 +150,37 @@ superslm::SslmForwardStatus RunLayerLoopGpu(superslm::SequenceLayerState& seq,
 // path that actually performs the readback (fence signaled, or `block=1`); a `block=0`
 // poll against an unsignaled fence returns the token UNCHANGED (still owned by the
 // caller, pollable again).
+//
+// From G3 (paged-KV plan §4.4, *Three states*, *The finish made structural*) the token is a
+// `GpuInFlightToken` (src/gpu/gpu_inflight_token.h), no longer a raw pointer: move-only, draining
+// on destruction (a token destroyed while it still holds work waits on its device's fence and
+// frees the record, without a readback), and draining on move-assignment. The submitters hand it
+// out through a `GpuInFlightToken*` out-parameter; RunLayerLoopGpuFinish takes it by rvalue
+// reference and moves from it only once the fence has reached its value (or `block == 1`). Only
+// the token can construct the record. It is declared, not defined, here, so this header still
+// needs nothing of D3D12; a caller that holds one includes gpu_inflight_token.h (src/gpu).
 struct GpuLayerLoopInFlight;
+namespace harness {
+template <class Record>
+class BasicGpuInFlightToken;
+}  // namespace harness
+using GpuInFlightToken = harness::BasicGpuInFlightToken<GpuLayerLoopInFlight>;
 
 // SUBMIT: identical work RunLayerLoopGpu always did, through ExecuteCommandLists/Signal
 // -- NEVER a fence-wait (design Sec6.2: "records ... submits ... and returns without
 // waiting for the fence"). Two outcomes:
 //   - a guard rejects, or an exception is thrown during recording (before Signal is
 //     ever reached): the rejecting SslmForwardStatus is returned directly and
-//     `*out_inflight` is left null -- nothing was submitted, `seq`/`workspace`
+//     `*out_inflight` is left empty -- nothing was submitted, `seq`/`workspace`
 //     untouched, exactly RunLayerLoopGpu's own existing contract for the identical
 //     inputs.
 //   - recording+submission succeeds: returns `superslm::SslmForwardStatus::Ok` (the
 //     CALL-LEVEL "did this proceed" signal, design Sec4.3's own two-channel split --
 //     NOT yet the decoded per-call result, which exists only once the fence the
-//     returned `*out_inflight` names has signaled) and `*out_inflight` is set to a
-//     freshly heap-allocated token the caller passes to RunLayerLoopGpuFinish exactly
-//     once.
+//     returned `*out_inflight` names has signaled) and `*out_inflight` holds the
+//     submission, which the caller moves into RunLayerLoopGpuFinish (or drops, which drains
+//     it without a readback). A fault after the list executed leaves `*out_inflight` empty:
+//     the submission's own token drained it before the status returned.
 //
 // The trailing six parameters are the model/RoPE analogue of the existing
 // `external_kv_resident` pair above (B3), added here (B5) so a caller routed
@@ -249,7 +264,7 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
     size_t num_key_value_heads, size_t intermediate_size, int64_t context_cap,
     const superslm::SslmTensorManifest& rope_tables, uint8_t* workspace, size_t workspace_size,
     ID3D12Resource* external_kv_resident, bool* io_external_kv_needs_resume_barrier,
-    GpuLayerLoopInFlight** out_inflight, ID3D12Resource* external_weights_resident = nullptr,
+    GpuInFlightToken* out_inflight, ID3D12Resource* external_weights_resident = nullptr,
     ID3D12Resource* external_rope_cos_resident = nullptr,
     ID3D12Resource* external_rope_sin_resident = nullptr, bool external_rope_has = false,
     uint64_t external_rope_cos_elems = 0, uint64_t external_rope_sin_elems = 0,
@@ -285,7 +300,7 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 // and the fence has already signaled): waits on the fence if it has not signaled yet
 // and `block == 1`; then performs the identical readback + SeqState-decode +
 // `DecodeStickyTag(...)` work RunLayerLoopGpu's own synchronous tail always performed,
-// sets `*out_ready = 1`, deletes `inflight` (consumed, exactly once), and returns the
+// sets `*out_ready = 1`, moves from `inflight` (consumed, exactly once), and returns the
 // DECODED per-call result -- the channel design Sec4.2 names `sslm_gpu_ready`'s own
 // `out_status`. It never throws (1.8.0, TE-435): a fault of any exception type once the token is
 // taken consumes it and returns the classified status with `*out_ready = 1`, so a caller's
@@ -294,7 +309,7 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 // recorded a q_codes readback copy (non-null `out_q_codes` there), Finish copies the actual
 // bytes into THIS call's own `out_q_codes` buffer after the fence wait, up to the capacity
 // Submit was given. Null (the default) skips the copy -- every existing caller unaffected.
-superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuLayerLoopInFlight* inflight,
+superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuInFlightToken&& inflight,
                                                     superslm::SequenceLayerState& seq,
                                                     uint8_t* workspace, int32_t block,
                                                     int32_t* out_ready,
@@ -309,8 +324,8 @@ superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuLayerLoopInFlight* inflight
 // caller's own pre-packed, per-token `[0, SeqScaleOff(hidden_size)+16)` embedding buffer (Sec5
 // 2b) -- the caller (the pre-scan) computes it via `EmbedEntry`, this function performs no
 // embedding arithmetic and no admission decision of its own. Async, matching
-// `RunLayerLoopGpuSubmit`'s own contract: `*out_inflight` is null on an immediate rejection
-// (nothing to close), otherwise owns a token the caller drains via `RunLayerLoopGpuFinish`.
+// `RunLayerLoopGpuSubmit`'s own contract: `*out_inflight` is empty on an immediate rejection
+// (nothing to close), otherwise holds a token the caller drains via `RunLayerLoopGpuFinish`.
 // T-2432 (Track A step 2/3): `q_width`, identical convention as `RunLayerLoopGpuSubmit`'s own
 // new parameter (immediately above) -- default `0` means "not supplied, derive as
 // hidden_size," so every pre-T-2432 caller of this function is unaffected.
@@ -323,7 +338,7 @@ superslm::SslmForwardStatus SubmitChunkToFullDepthForG5Bridge(
     bool* io_external_kv_needs_resume_barrier, ID3D12Resource* external_weights_resident,
     ID3D12Resource* external_rope_cos_resident, ID3D12Resource* external_rope_sin_resident,
     bool external_rope_has, uint64_t external_rope_cos_elems, uint64_t external_rope_sin_elems,
-    const GpuAdapterBridge* adapter_bridge, GpuLayerLoopInFlight** out_inflight,
+    const GpuAdapterBridge* adapter_bridge, GpuInFlightToken* out_inflight,
     size_t q_width = 0,
     // (T-2577 round 2, D-SLM6278): mirrors `RunLayerLoopGpuSubmit`'s own trailing
     // `model_generation` -- see that declaration's own header comment for the full contract.
@@ -1004,6 +1019,58 @@ uint32_t AllocationCallsAttempted();
 // Returns true iff the GPU-residency map succeeds cleanly (Ok); false iff it returns
 // the defined failure status this step names (unchanged by the redesign).
 bool MapModelGpuResidencyWithInjection(uint64_t required_bytes);
+
+// --- Paged-KV plan §4.4, step G3: the submission ledger, as the internal layer sees it. ---
+//
+// P1's precondition, for this layer (§4.4, *The promise*). Per device, a reset, a submission and a
+// blocking wait are serialised: at most one thread at a time is inside any of them on one device.
+// A poller -- RunLayerLoopGpuFinish with `block == 0` against a fence its token has not reached --
+// is exempt and may run beside them; a blocking waiter (RunLayerLoopGpuFinish with `block == 1`,
+// or one whose fence was reached, and DrainSubmissionsGpu) counts as inside it. The device each
+// sink-reaching function of this header resets, submits or waits on:
+//   - the singleton (harness::GetDevice()'s device): RunLayerLoopGpu, RunLayerLoopGpuSubmit,
+//     SubmitChunkToFullDepthForG5Bridge, RestoreGpuSequenceState, BindDescriptorTableAndReadback,
+//     DescriptorHeapRegionIsCleanAfterHandleRelease, the B1 primitive battery
+//     (DynamicScaleReciprocalGpu, RequantTokenCodeWideGpu, BiasReconcileWideGpu,
+//     CombineCarriedScaleGpu, MaxAbsReduceWideGpuScheme0/1,
+//     CheckRoundingDivideByPotExponentDomainGpu, CheckBiasAccumulateMagnitudeDomainGpu,
+//     RequantChainCheckedGpu), and the finish and drain below;
+//   - a context's own device: SslmGpuDeviceLogitsBundleCreateForTest and
+//     SslmGpuDeviceLogitsRunForTest (the allocation-fault build only).
+//
+// What this layer gets in place of a Busy channel (decision 58): it has none. Every reset runs the
+// ledger's check first: a reset while the device's last submission is unobserved throws
+// harness::PoolSubmitContractError (a std::logic_error) before anything is reset, and a reset on a
+// stranded device throws harness::GpuSubmissionStrandedError (rule 0). The duty that keeps the
+// first from firing: finish every token RunLayerLoopGpuSubmit or SubmitChunkToFullDepthForG5Bridge
+// hands out (RunLayerLoopGpuFinish, until it reports `*out_ready = 1`), or, for a token kept in
+// storage and never finished, drain it with DrainSubmissionsGpu. A GpuInFlightToken dropped as a
+// local drains itself on destruction.
+
+// Waits for the singleton's last submission to complete, which observes it, so the next reset
+// passes the ledger's check. Reads the singleton through harness::SingletonLedgerIfConstructed(),
+// so in a process with no device it returns at once and constructs nothing. Throws
+// harness::GpuSubmissionStrandedError (a std::runtime_error) on a stranded ledger. A blocking
+// waiter: inside P1's precondition. Does not submit: it waits, and never resets or submits.
+void DrainSubmissionsGpu();
+
+// The boundary token check's readings (§4.4, *The two boundary checks*): records its walk drained
+// and reported, and records it walked and passed on a Submitted handle's `in_flight`, process-wide.
+// Do not submit.
+uint64_t BoundaryCheckReportsForTest();
+uint64_t BoundaryCheckWalkedForTest();
+
+#if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION) || defined(SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION)
+// The queue gate (§4.4, *The queue gate*), both injection builds, the singleton only. While held,
+// every submission on the singleton makes its queue wait on a host-controlled gate fence before
+// ExecuteCommandLists, so it stays incomplete until the release. ArmQueueGateForTest() holds it
+// (constructing the singleton when the process has none); an arm while held keeps the current
+// gate value, and an arm after a release holds the next submission. ReleaseQueueGateForTest()
+// signals the gate from the host; with the gate not held it does nothing. A per-context device is
+// never gated. Do not submit: they set and signal the gate fence from the host.
+void ArmQueueGateForTest();
+void ReleaseQueueGateForTest();
+#endif
 
 }  // namespace superslm_gpu
 
