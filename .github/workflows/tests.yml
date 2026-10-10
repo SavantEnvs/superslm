@@ -1118,6 +1118,11 @@ jobs:
       # GPU forward-status site in the source is in the committed census with a disposition.
       - name: Fail on any GPU status site the census does not list
         run: python tests/ci/check_gpu_status_site_census.py
+      # GPU paged-KV plan G3 (§4.4, the token lint): no device, allocator or queue is created, and no
+      # list is executed, outside src/gpu/d3d12_harness.h, where the submission ledger keeps P1. The
+      # submit-guard census in the same script is advisory and needs the plan; it is not run here.
+      - name: Fail on any D3D12 sink call outside the harness (token lint)
+        run: python tests/ci/check_gpu_pool_submit_guard.py --lint-only
       # TE-435: the census sees the catch clauses that exist, never one that is missing. This gate
       # refuses any outermost `try` under src/gpu whose handlers do not end in `catch (...)`, so no
       # exception type can leave a site that holds a command list, submitted work or handle state.

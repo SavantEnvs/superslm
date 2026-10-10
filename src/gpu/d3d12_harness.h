@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "submission_ledger.h"
+#include "gpu_inflight_token.h"
 
 namespace superslm_gpu {
 namespace harness {
@@ -148,15 +149,17 @@ inline GpuFaultRule ClassifyGpuFault(bool stranded, bool device_removed, bool al
 // Other for every other cause (final).
 enum class SetupFailure { None, Allocation, Other };
 
-struct Device {
+// From G3 (plan §4.4, *The submission ledger*) a Device is a SubmissionDevice: its queue, command
+// allocator, fence and fence event are private, and the only ways to reset, submit and wait are
+// the base's BeginRecording(), Submit(), Wait(v), Poll(v) and Drain(), which keep the ledger. The
+// command list stays public: recording into it is not a submission.
+struct Device final : public SubmissionDevice {
+	Device() noexcept = default;
+	~Device() override = default;
+
 	ComPtr<IDXGIAdapter1> adapter;
 	ComPtr<ID3D12Device> dev;
-	ComPtr<ID3D12CommandQueue> queue;
-	ComPtr<ID3D12CommandAllocator> alloc;
 	ComPtr<ID3D12GraphicsCommandList> list;
-	ComPtr<ID3D12Fence> fence;
-	HANDLE fence_event = nullptr;
-	UINT64 fence_val = 0;
 	// Set last by a successful Init() and never cleared. Every other field is written only while
 	// this is false (by Init(), and for the process's device by GetDevice() under its mutex), so a
 	// reader that sees true sees a Device that no longer changes; every reader checks it first.
@@ -332,7 +335,6 @@ struct Device {
 			fence_event = nullptr;
 		}
 		fence.Reset();
-		fence_val = 0;
 		list.Reset();
 		alloc.Reset();
 		queue.Reset();
@@ -344,9 +346,50 @@ struct Device {
 		create_device_out_of_memory_ = false;
 	}
 
+	// The fence value of this device's last attempted Signal (the base's counter; today's
+	// fence_val). A tail's catch compares it with the value it read before Submit() to learn
+	// whether ExecuteCommandLists ran. Read only by the thread that submits (P1).
+	uint64_t submission_counter() const noexcept { return fence_value_counter(); }
+
+	// True for the process's submission device (GetDevice()'s, below): the queue gate is consulted
+	// only there.
+	bool IsProcessSingleton() const noexcept;
+
 private:
 	// True when a D3D12CreateDevice call in this Init() returned E_OUTOFMEMORY.
 	bool create_device_out_of_memory_ = false;
+
+	// The ledger's private primitives (plan §4.4): nothing outside the base's submission surface
+	// reaches the queue, the allocator or the fence.
+	ComPtr<ID3D12CommandQueue> queue;
+	ComPtr<ID3D12CommandAllocator> alloc;
+	ComPtr<ID3D12Fence> fence;
+	HANDLE fence_event = nullptr;
+
+	void ResetAllocatorAndList() override {
+		SSLM_GPU_HR(alloc->Reset());
+		SSLM_GPU_HR(list->Reset(alloc.Get(), nullptr));
+	}
+	// The queue gate's wait (fault-injection builds, the singleton only), then ExecuteCommandLists.
+	// Defined after GetDevice() below.
+	void ExecuteRecordedList() override;
+	// queue->Signal(fence, v). In the T2169 chunk-recording build the signal-fault seam fires here
+	// (inside Submit(), after ExecuteCommandLists): the armed Signal is not made, and
+	// ThrowSignalFailure reports it with the seam's own message. Defined below GetDevice().
+	bool SignalFence(uint64_t value, int32_t* failure) noexcept override;
+	[[noreturn]] void ThrowSignalFailure(int32_t failure) override;
+	uint64_t CompletedFenceValue() noexcept override { return fence->GetCompletedValue(); }
+	// A failed SetEventOnCompletion means the wait cannot be confirmed (the ledger's lost_).
+	bool WaitFenceEvent(uint64_t value) noexcept override {
+		const HRESULT hr = fence->SetEventOnCompletion(value, fence_event);
+		if (FAILED(hr)) {
+			std::fprintf(stderr, "superslm_gpu: SetEventOnCompletion failed 0x%08lx\n",
+			             static_cast<unsigned long>(hr));
+			return false;
+		}
+		WaitForSingleObject(fence_event, INFINITE);
+		return true;
+	}
 
 	void InitSteps() {
 		// T-2169 (D-SLM3649's own owed evidence, Dan's review): SSLM_GPU_ENABLE_DEBUG_LAYER, when
@@ -613,33 +656,6 @@ public:
 			throw GpuSubmissionStrandedError("D3D12 command list could not be confirmed Closed");
 		}
 		ThrowGpuHrFailure(close.first_hr, __FILE__, __LINE__);
-	}
-
-	// Waits for the fence to reach fence_val. A failed SetEventOnCompletion means the wait cannot
-	// be confirmed, so the submitted work's completion is unknown: GpuSubmissionStrandedError.
-	void WaitForFenceOrStrand() {
-		if (fence->GetCompletedValue() < fence_val) {
-			const HRESULT hr = fence->SetEventOnCompletion(fence_val, fence_event);
-			if (FAILED(hr)) {
-				std::fprintf(stderr, "superslm_gpu: SetEventOnCompletion failed 0x%08lx\n",
-				             static_cast<unsigned long>(hr));
-				throw GpuSubmissionStrandedError("D3D12 fence wait could not be confirmed");
-			}
-			WaitForSingleObject(fence_event, INFINITE);
-		}
-	}
-
-	// Signals the fence at a fresh value after ExecuteCommandLists, with no retry, and waits for
-	// it. A failed Signal leaves submitted work whose completion cannot be confirmed:
-	// GpuSubmissionStrandedError.
-	void SignalAndWaitOrStrand() {
-		const HRESULT hr = queue->Signal(fence.Get(), ++fence_val);
-		if (FAILED(hr)) {
-			std::fprintf(stderr, "superslm_gpu: fence Signal failed 0x%08lx\n",
-			             static_cast<unsigned long>(hr));
-			throw GpuSubmissionStrandedError("D3D12 fence Signal failed after ExecuteCommandLists");
-		}
-		WaitForFenceOrStrand();
 	}
 
 	HRESULT CloseListOnce() {
@@ -934,8 +950,8 @@ public:
 		                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		auto readback = MakeBuffer(out_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
 		                            D3D12_RESOURCE_STATE_COPY_DEST);
-		SSLM_GPU_HR(alloc->Reset());
-		SSLM_GPU_HR(list->Reset(alloc.Get(), pso));
+		BeginRecording();
+		list->SetPipelineState(pso);
 		list->SetComputeRootSignature(rs);
 		list->SetComputeRootShaderResourceView(0, in_buf->GetGPUVirtualAddress());
 		list->SetComputeRootUnorderedAccessView(1, uav->GetGPUVirtualAddress());
@@ -949,9 +965,7 @@ public:
 		list->ResourceBarrier(1, &b);
 		list->CopyResource(readback.Get(), uav.Get());
 		CloseListOrThrow();
-		ID3D12CommandList* lists[] = {list.Get()};
-		queue->ExecuteCommandLists(1, lists);
-		SignalAndWaitOrStrand();
+		Submit(/*retry=*/false).Wait();
 		std::vector<uint8_t> out(out_bytes);
 		void* p = nullptr;
 		D3D12_RANGE range{0, (SIZE_T)out_bytes};
@@ -976,8 +990,13 @@ struct DeviceHolder {
 	bool setup_attempted = false;
 };
 
+// Plan §4.4 (*The ledger term never constructs the device*): the holder lives at namespace scope,
+// not inside GetDevice(), so SingletonLedgerIfConstructed() below can read the device's
+// `available` flag without constructing or setting up anything.
+inline DeviceHolder g_device_holder;
+
 inline Device& GetDevice() noexcept {
-	static DeviceHolder holder;
+	DeviceHolder& holder = g_device_holder;
 	if (holder.device.available.load()) return holder.device;
 	std::lock_guard<std::mutex> lock(holder.mutex);
 	if (!holder.setup_attempted) {
@@ -989,6 +1008,84 @@ inline Device& GetDevice() noexcept {
 		holder.device.Init();
 	}
 	return holder.device;
+}
+
+// The guard's ledger term (plan §4.4, *Scope*): the singleton's ledger when the process's device is
+// set up, null otherwise (no device: nothing was ever submitted on it, which the term reads as
+// observed). Never constructs or sets up the device. `available` is stored last by a successful
+// Init() and never cleared, so a reader that loads true sees a ledger that is never replaced.
+inline const SubmissionLedger* SingletonLedgerIfConstructed() noexcept {
+	Device& d = g_device_holder.device;
+	return d.available.load(std::memory_order_acquire) ? &d.ledger() : nullptr;
+}
+
+inline bool Device::IsProcessSingleton() const noexcept { return this == &g_device_holder.device; }
+
+#if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION) || defined(SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION)
+#define SUPERSLM_GPU_QUEUE_GATE_SEAM 1
+// Plan §4.4, *The queue gate*: a test seam in both injection builds. While `held`, every Submit()
+// on the singleton makes its queue wait on `fence` at `target` before ExecuteCommandLists, so the
+// submission stays incomplete until ReleaseQueueGateForTest() signals the gate from the host. A
+// per-context device is never gated. ArmQueueGateForTest() / ReleaseQueueGateForTest() (gpu_port.h,
+// defined in gpu_1p0.cpp) hold and release it; the release is idempotent, and an arm after a
+// release holds the next submission at a fresh target.
+struct QueueGateState {
+	std::mutex mutex;
+	ComPtr<ID3D12Fence> fence;  // made on the singleton's device (a gate fence is waited on only there)
+	uint64_t counter = 0;
+	uint64_t target = 0;
+	bool held = false;
+};
+inline QueueGateState& QueueGate() {
+	static QueueGateState state;
+	return state;
+}
+#endif
+
+#if defined(SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION)
+// The T2169 build's signal-fault seam (superslm_gpu.cpp, ArmT2169ChunkRecordingTailSignalFaultInjection),
+// moved inside Submit() at G3 (plan §4.4, *Costs on today's paths*): single-shot; consumed by the
+// singleton's first Signal after it is armed, which is then not made. Defined in superslm_gpu.cpp.
+bool ConsumeT2169ChunkRecordingTailSignalFault() noexcept;
+[[noreturn]] void ThrowT2169ChunkRecordingTailSignalFault();
+// The failure code SignalFence reports for the seam: a success HRESULT, so never a real Signal
+// failure's.
+constexpr int32_t kT2169SignalSeamFailure = 0x00005EA1;
+#endif
+
+inline void Device::ExecuteRecordedList() {
+#if defined(SUPERSLM_GPU_QUEUE_GATE_SEAM)
+	if (IsProcessSingleton()) {
+		QueueGateState& gate = QueueGate();
+		std::lock_guard<std::mutex> lock(gate.mutex);
+		if (gate.held && gate.fence) SSLM_GPU_HR(queue->Wait(gate.fence.Get(), gate.target));
+	}
+#endif
+	ID3D12CommandList* lists[] = {list.Get()};
+	queue->ExecuteCommandLists(1, lists);
+}
+
+inline bool Device::SignalFence(uint64_t value, int32_t* failure) noexcept {
+#if defined(SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION)
+	if (IsProcessSingleton() && ConsumeT2169ChunkRecordingTailSignalFault()) {
+		*failure = kT2169SignalSeamFailure;
+		return false;
+	}
+#endif
+	const HRESULT hr = queue->Signal(fence.Get(), value);
+	if (FAILED(hr)) {
+		std::fprintf(stderr, "superslm_gpu: fence Signal failed 0x%08lx\n", static_cast<unsigned long>(hr));
+		*failure = static_cast<int32_t>(hr);
+		return false;
+	}
+	return true;
+}
+
+inline void Device::ThrowSignalFailure(int32_t failure) {
+#if defined(SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION)
+	if (failure == kT2169SignalSeamFailure) ThrowT2169ChunkRecordingTailSignalFault();
+#endif
+	ThrowGpuHrFailure(static_cast<HRESULT>(failure), __FILE__, __LINE__);
 }
 
 // Whether `dev` reports itself removed, the fault classifier's rule-1 input. A Device that was

@@ -277,12 +277,15 @@ def apply(p: Patch, ident: str):
         p.replace(g, "} else if (base->config.tie_word_embeddings) {\n\t\th->head_rows = h->embed_weights.data();",
                   "} else if (base->config.tie_word_embeddings) {\n\t\th->head_weights = h->embed_weights; // MUTANT m: duplicate tied copy\n\t\th->head_rows = h->head_weights.data();")
     elif ident == "n":
+        # GPU paged-KV plan G3: re-anchored on the ledger's reset, `dev.BeginRecording();` (the only
+        # reset a recording site can reach once the allocator is private), so the mutant moves the
+        # phase-B reset ahead of phase A's allocations exactly as it did on the raw Reset pair.
         p.replace(g, "\t\tfor (const Allocation& a : allocations) {",
-                  "\t\tSSLM_GPU_HR(dev.alloc->Reset());\n"
-                  "\t\tSSLM_GPU_HR(dev.list->Reset(dev.alloc.Get(), nullptr));\n"
+                  "\t\tdev.BeginRecording();\n"
                   "\t\tfor (const Allocation& a : allocations) { // MUTANT n")
-        p.replace(g, "\t\t// Phase B.\n\t\tSSLM_GPU_HR(dev.alloc->Reset());\n\t\tSSLM_GPU_HR(dev.list->Reset(dev.alloc.Get(), nullptr));",
-                  "\t\t// Phase B reset already occurred before allocations (MUTANT n).")
+        p.replace(g, "\t\tdev.BeginRecording();\n\t\tdev.list->CopyResource(out->head.Get(), staging.Get());",
+                  "\t\t// Phase B reset already occurred before allocations (MUTANT n).\n"
+                  "\t\tdev.list->CopyResource(out->head.Get(), staging.Get());")
     elif ident in ("n2_upload", "n3_upload"):
         # TE-425: anchored on the code lines only, so a rewritten comment between phase A and phase B
         # (1.8.0 rewrote it) does not move the mutant. Phase A's two allocations are removed where
@@ -290,7 +293,7 @@ def apply(p: Patch, ident: str):
         resident = ("\tMicrosoft::WRL::ComPtr<ID3D12Resource> resident =\n"
                     "\t    dev.MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, resource_flags, D3D12_RESOURCE_STATE_COPY_DEST);\n")
         upload = "\tMicrosoft::WRL::ComPtr<ID3D12Resource> upload = dev.Upload(data, bytes);\n"
-        reset = "\tSSLM_GPU_HR(dev.alloc->Reset());\n\tSSLM_GPU_HR(dev.list->Reset(dev.alloc.Get(), nullptr));\n"
+        reset = "\tdev.BeginRecording();\n"  # G3: the ledger's reset (re-anchored)
         p.replace(g, upload + resident, "")
         new = (reset + upload + resident if ident == "n2_upload"
                else resident + reset + upload)
@@ -301,13 +304,13 @@ def apply(p: Patch, ident: str):
                "\t\t                                  D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);\n"
                "\t\tauto readback_buf = dev.MakeBuffer(workspace_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,\n"
                "\t\t                                    D3D12_RESOURCE_STATE_COPY_DEST);\n"
-               "\t\tSSLM_GPU_HR(dev.alloc->Reset());\n\t\tSSLM_GPU_HR(dev.list->Reset(dev.alloc.Get(), nullptr));")
+               "\t\t// G3: the ledger's reset (plan §4.4).\n\t\tdev.BeginRecording();")
         device = ("\t\tauto device_buf = dev.MakeBuffer(workspace_size, D3D12_HEAP_TYPE_DEFAULT,\n"
                   "\t\t                                  D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);\n")
         upload = "\t\tauto upload_buf = dev.Upload(src, workspace_size);\n"
         readback = ("\t\tauto readback_buf = dev.MakeBuffer(workspace_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,\n"
                     "\t\t                                    D3D12_RESOURCE_STATE_COPY_DEST);\n")
-        reset = "\t\tSSLM_GPU_HR(dev.alloc->Reset());\n\t\tSSLM_GPU_HR(dev.list->Reset(dev.alloc.Get(), nullptr));\n"
+        reset = "\t\tdev.BeginRecording();\n"  # G3: the ledger's reset (re-anchored)
         new = (reset + upload + device + readback if ident == "n2_restore"
                else device + reset + upload + readback)
         p.replace(s, old, new + f"\t\t// MUTANT {ident}")
@@ -322,8 +325,9 @@ def apply(p: Patch, ident: str):
                   "auto bundle = std::make_unique<SslmGpuDeviceLogitsBundleForTest>();\n"
                   "\t\tbundle->head_copy.assign(head_rows, head_rows + static_cast<size_t>(V) * H);\n"
                   "\t\tconst SslmGpuStatus st = CreateDeviceLogitsBuffers(ctx, head_rows, V, H, &bundle->buffers);")
-        p.replace(g, "\treturn InvokeGpuApiBoundary(\n\t    __func__, [&] { return RunDeviceLogits(ctx, bundle->buffers, x_codes, wide_out); });",
-                  "\treturn InvokeGpuApiBoundary(__func__, [&] {\n"
+        # G3: the ForTest seams run through the internal boundary (no C ABI call scope), re-anchored.
+        p.replace(g, "\treturn InvokeGpuInternalBoundary(\n\t    __func__, [&] { return RunDeviceLogits(ctx, bundle->buffers, x_codes, wide_out); });",
+                  "\treturn InvokeGpuInternalBoundary(__func__, [&] {\n"
                   "\t\tDeviceLogitsBuffers fresh;\n"
                   "\t\tconst SslmGpuStatus made = CreateDeviceLogitsBuffers(ctx, bundle->head_copy.data(),\n"
                   "\t\t    bundle->buffers.V, bundle->buffers.H, &fresh);\n"

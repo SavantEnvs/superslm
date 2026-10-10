@@ -40,6 +40,7 @@ set(SUPERSLM_CORE_SOURCES
 	src/forward/checked_chain_funnel.cpp
 	src/forward/forward_sites.cpp
 	src/forward/parallel_split.cpp
+	src/gpu/gpu_inflight_registry.cpp  # GPU paged-KV plan G3: the run site's task trampoline (D3D12-free)
 	src/decode_digest.cpp
 	src/kv_pages.cpp
 	src/sslm_abi.cpp

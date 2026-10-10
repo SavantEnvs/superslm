@@ -113,6 +113,16 @@ public:
 	void Wait() {
 		if (payload_) payload_->submission_.Wait();
 	}
+	// The wait seam's wait (sslm_gpu_test_only_wait_in_flight): waits on the device's fence at the
+	// token's value through the ledger's Wait(v), which observes it, and keeps the record and the
+	// token as they are, so the holder stays Submitted with nothing executing. Throws
+	// GpuSubmissionStrandedError when the wait cannot be confirmed (the ledger's lost_).
+	void ObserveWithoutFinishing() {
+		if (payload_ && payload_->submission_.rec_) {
+			inflight::InFlightRecord* rec = payload_->submission_.rec_;
+			rec->device()->Wait(rec->fence_value());
+		}
+	}
 	// The counting accessor calls this when it moves the token's handle out of Submitted: the
 	// record re-registers under the current outermost call (kept at depth 0), so the walk at that
 	// call's return sees the handle no longer Submitted and drains and reports it.
