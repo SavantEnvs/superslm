@@ -23,16 +23,14 @@ using namespace pkv::bc;
 using clock_type = std::chrono::steady_clock;
 // The identity line each cell 7.9 construction prints first on stdout (D-SLM8466 (2)), so the driver's records show
 // which construction ran without trusting its --construction label. tools/run_paged_kv_rows.py's CONSTRUCTION_IDENTITY
-// holds the same strings and refuses any other (79-7). Production and 7.9-MR-OPT are this source's row79, built as
-// superslm_pkv_pair and as superslm_pkv_pair_mr_opt (PKV_PAIR_MR_OPT, against the mutant library). MA-1 and MA-2 are the
-// commissioning seat's constructions (plan section 23.8, T7): one executable for both, which prints kIdentityMa1 or
-// kIdentityMa2 for the construction its command line selects, then PAIR lines only (no RESERVE, no IDS: it has no
-// paged arm). The driver's module docstring states the whole contract.
+// holds the same strings and refuses any other (79-7). Each string lives in one C++ source and in the driver (plan
+// section 30.7): production's and 7.9-MR-OPT's here, this source's row79 built as superslm_pkv_pair and as
+// superslm_pkv_pair_mr_opt (PKV_PAIR_MR_OPT, against the mutant library); MA-1's and MA-2's in
+// tools/paged_kv_pair_ma.cpp, the commissioning seat's superslm_pkv_pair_ma (plan section 29.4: linked against the
+// production library only; PAIR lines only, no RESERVE and no IDS, since it has no paged arm).
 constexpr const char* kIdentityProduction = "PKV_PAIR_PRODUCTION_V2 defs=none";
 constexpr const char* kIdentityProductionProbe = "PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE";
 constexpr const char* kIdentityMrOpt = "PKV_PAIR_MR_OPT_V1 defs=none";
-[[maybe_unused]] constexpr const char* kIdentityMa1 = "PKV_PAIR_MA1_V1 defs=none";
-[[maybe_unused]] constexpr const char* kIdentityMa2 = "PKV_PAIR_MA2_V1 defs=none";
 // This build's own identity: row79's first line, and the `identity` mode's output.
 const char* BuildIdentity(){
 #if defined(PKV_C6_IDENTITY_PROBE)
