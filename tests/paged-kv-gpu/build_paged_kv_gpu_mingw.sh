@@ -69,6 +69,7 @@ g1e_cell_9_8|plain|G5|g1e_cell_9_8|
 g1e_cell_9_12|plain|G5|g1e_cell_9_12|
 g1e_cell_9_13|plain|G5|g1e_cell_9_13|
 g1e_cell_8_17|plain|G5|g1e_cell_8_17|
+g1e_cell_slm6_cap|plain|G5|g1e_cell_slm6_cap|
 '
 # Host-only programs (no engine): the suite's process runner.
 HOST_TABLE="pkvg_suite"
