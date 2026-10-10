@@ -152,7 +152,7 @@ superslm::SslmForwardStatus RunLayerLoopGpu(superslm::SequenceLayerState& seq,
 // caller, pollable again).
 //
 // From G3 (paged-KV plan §4.4, *Three states*, *The finish made structural*) the token is a
-// `GpuInFlightToken` (src/gpu/gpu_inflight_token.h), no longer a raw pointer: move-only, draining
+// `GpuInFlightToken`, defined in src/gpu/gpu_inflight_token.h, no longer a raw pointer: move-only, draining
 // on destruction (a token destroyed while it still holds work waits on its device's fence and
 // frees the record, without a readback), and draining on move-assignment. The submitters hand it
 // out through a `GpuInFlightToken*` out-parameter; RunLayerLoopGpuFinish takes it by rvalue
@@ -418,7 +418,7 @@ enum class GpuLayerLoopGuard : int {
 // Every return path that resolves the call BEFORE that decision runs reads false, by
 // construction (the function-entry reset, never overwritten on that path): the ten-guard
 // ladder, the two device-capability rejections, and every return inside the recording window's
-// own catch, thirty-four paths in all -- T-2568 added one new catch clause to each of
+// own catch, thirty-six paths in all -- T-2568 added one new catch clause to each of
 // RunLayerLoopGpuSubmit and SubmitOneSubChunkToFullDepthForG5Bridge
 // (GpuLayerWeightsContractError's own, PackLayerWeightsBytes' required-pointer refusal), two more
 // than the twenty-five this paragraph named before; T-2577 (D-SLM6279, GpuShaderBinaryStaleError's
@@ -428,13 +428,15 @@ enum class GpuLayerLoopGuard : int {
 // reduced each submission tail's two clauses to one classified return apiece (two fewer), one more
 // per function, for thirty-one; TE-432 gave each submission tail a catch-all clause, one more
 // return per function, for thirty-three; the paged-KV plan's coverage guard (step M1, a tenth
-// ladder guard, one more return) makes thirty-four. Every path that resolves the call AFTER the
+// ladder guard, one more return) makes thirty-four; the paged-KV plan's step G3 gave each
+// recording window a GpuSubmissionStrandedError clause (a stranded ledger's refusal is rethrown
+// before the list opens; one more classified return per function), for thirty-six. Every path that resolves the call AFTER the
 // decision reads exactly what the decision decided (true on a cache hit, false on a miss),
 // whether the call's own final status is Ok or one of DecodeStickyTag's fifteen rejecting
-// statuses, including ResidualReconciliationScaleOutOfDomain -- the thirty-four before them,
-// alike, forty-one paths' own destination in total (TE-435 gave RunLayerLoopGpuFinish a catch-all
+// statuses, including ResidualReconciliationScaleOutOfDomain -- the thirty-six before them,
+// alike, forty-three paths' own destination in total (TE-435 gave RunLayerLoopGpuFinish a catch-all
 // clause, one more return after the decision, where TE-432's count was thirty-nine; the coverage
-// guard's return, before the decision, took forty to forty-one).
+// guard's return, before the decision, took forty to forty-one; G3's two stranded clauses, forty-three).
 //
 // Both counts are derived structurally from source, not restated by hand, by
 // tests/ci/check_gpu_guard_status_parity.py (derive_lwuws_before_decision_count/

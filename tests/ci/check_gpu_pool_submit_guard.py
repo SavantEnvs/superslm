@@ -2,7 +2,7 @@
 """The submit-guard census and the token lint (GPU paged-KV plan, step G3; plan §4.4 *The census*, §8, 11.10).
 
     python3 tests/ci/check_gpu_pool_submit_guard.py --src <tree> --plan <plan.md> [--json]
-    python3 tests/ci/check_gpu_pool_submit_guard.py --lint-only [--src <tree>] [--json]
+    python3 tests/ci/check_gpu_pool_submit_guard.py [--lint-only] [--src <tree>] [--json]   (no --plan: the lint alone)
 
 Two instruments share this script and its record format, and nothing else:
 
@@ -754,12 +754,10 @@ def main():
     a = ap.parse_args()
     root = os.path.abspath(a.src)
     lint = token_lint(root)
-    if a.lint_only:
+    if a.lint_only or not a.plan:          # with no --plan only the lint can run (the census's rows are the plan's)
         emit(lint, a.json)
         print(f"token lint: {len(lint)} sink call(s) outside d3d12_harness.h under src/ and include/", file=sys.stderr)
         return 1 if lint else 0
-    if not a.plan:
-        ap.error("--plan <plan.md> is required for the census (the rows are parsed from it); --lint-only needs none")
     PLAN = open(a.plan, encoding="utf-8").read()
     globals()["PLAN"] = PLAN
     D7 = derive7(root); globals()["D7"] = D7

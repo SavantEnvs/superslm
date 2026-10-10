@@ -3384,6 +3384,14 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 		// A container asked for more than it can hold: an allocation failure, contained as above.
 		const bool list_closed = AbandonRecording(dev, state);
 		return ClassifyForwardFault(dev, /*stranded=*/!list_closed);
+	} catch (const harness::GpuSubmissionStrandedError&) {
+		// GPU paged-KV plan G3 (§4.4, the internal layer's duty): BeginRecording() refused the reset on
+		// a stranded ledger (rule 0) before the list was opened, so nothing was reset or recorded. The
+		// internal layer has no Busy channel; the refusal reaches the caller as the exception itself.
+		// A list this call did open is classified as the runtime_error clause below does.
+		if (!state.list_opened) throw;
+		const bool list_closed = AbandonRecording(dev, state);
+		return ClassifyForwardFault(dev, /*stranded=*/!list_closed);
 	} catch (const std::runtime_error&) {
 		// 1.8.0 (TE-426): the fault classifier (d3d12_harness.h) replaces the removed-or-allocation
 		// split below. GpuAllocationError (E_OUTOFMEMORY from any D3D12 call, or the O11 seam) is
@@ -3478,11 +3486,8 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 	// failure for a list it confirmed Closed, GpuSubmissionStrandedError for one it could not.
 	bool tail_close_attempted = false;
 	// From G3: whether ExecuteCommandLists ran is read off the ledger's submission counter, which
-	// Submit() advances only after its execute (TailExecuted, below).
+	// Submit() advances only after its execute (each catch below compares it).
 	const uint64_t tail_counter_before = dev.submission_counter();
-	const auto TailExecuted = [&dev, tail_counter_before]() noexcept {
-		return dev.submission_counter() != tail_counter_before;
-	};
 	// Decision 80: this call's own timing, carried by its record and published by the finish
 	// tail, or published here on a catch path as far as the call got.
 	GpuCallTiming call_timing{};
@@ -3557,7 +3562,7 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 		// out first. From G3 the submission's own token did that as it was destroyed, during the
 		// unwinding into this clause; SubmissionTailFaultStatus reads the ledger and reports a wait
 		// that could not be confirmed as a stranded submission.
-		const bool tail_executed = TailExecuted();
+		const bool tail_executed = dev.submission_counter() != tail_counter_before;
 		InvalidateResidencyCachesOnThrow();
 		if (!tail_executed && external_kv_resident != nullptr &&
 		    io_external_kv_needs_resume_barrier != nullptr) {
@@ -3568,7 +3573,7 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 	} catch (const std::runtime_error&) {
 		// A failed Close() or Signal() (Submit()'s recovered first failure, or its stranded error),
 		// or the pre-Close pin seam -- mirrors the sibling's own identical clause exactly.
-		const bool tail_executed = TailExecuted();
+		const bool tail_executed = dev.submission_counter() != tail_counter_before;
 		InvalidateResidencyCachesOnThrow();
 		if (!tail_executed) {
 			// `ExecuteCommandLists` never ran. The caller-owned resume-barrier latch this function
@@ -3595,7 +3600,7 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 		// restore the latch when nothing executed, then close the list (the submission's token has
 		// already drained it); work whose completion cannot be confirmed is rule 0, and the
 		// classifier decides the rest by kind (a non-standard type is rule 3).
-		const bool tail_executed = TailExecuted();
+		const bool tail_executed = dev.submission_counter() != tail_counter_before;
 		InvalidateResidencyCachesOnThrow();
 		if (!tail_executed && external_kv_resident != nullptr &&
 		    io_external_kv_needs_resume_barrier != nullptr) {
@@ -3888,6 +3893,14 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 	} catch (const std::length_error&) {
 		const bool list_closed = AbandonRecording(dev, state);
 		return ClassifyForwardFault(dev, /*stranded=*/!list_closed);
+	} catch (const harness::GpuSubmissionStrandedError&) {
+		// GPU paged-KV plan G3 (§4.4, the internal layer's duty): BeginRecording() refused the reset on
+		// a stranded ledger (rule 0) before the list was opened, so nothing was reset or recorded. The
+		// internal layer has no Busy channel; the refusal reaches the caller as the exception itself.
+		// A list this call did open is classified as the runtime_error clause below does.
+		if (!state.list_opened) throw;
+		const bool list_closed = AbandonRecording(dev, state);
+		return ClassifyForwardFault(dev, /*stranded=*/!list_closed);
 	} catch (const std::runtime_error&) {
 		// D-SLM3634: the identical chunk-scoped discard, for the generic failure class
 		// RunLayerLoopGpuSubmit's own twin catch clause already handles (superslm_gpu.cpp, above)
@@ -3924,9 +3937,6 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 	// execute.
 	bool tail_close_attempted = false;
 	const uint64_t tail_counter_before = dev.submission_counter();
-	const auto TailExecuted = [&dev, tail_counter_before]() noexcept {
-		return dev.submission_counter() != tail_counter_before;
-	};
 	GpuCallTiming call_timing{};  // decision 80 (RunLayerLoopGpuSubmit's tail, above)
 	try {
 		// The pin seam fires here, throwing exactly the type `SSLM_GPU_HR` would on a real
@@ -3983,7 +3993,7 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 		// are released: from G3 by the submission's own token (`submission`, or `token`), drained as
 		// it was destroyed during the unwinding into this clause. SubmissionTailFaultStatus reads
 		// the ledger and reports a wait it could not confirm as a stranded submission.
-		const bool tail_executed = TailExecuted();
+		const bool tail_executed = dev.submission_counter() != tail_counter_before;
 		InvalidateResidencyCachesOnThrow();
 		if (!tail_executed && external_kv_resident != nullptr &&
 		    io_external_kv_needs_resume_barrier != nullptr) {
@@ -3994,7 +4004,7 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 	} catch (const std::runtime_error&) {
 		// A failed Close() or Signal() (Submit()'s recovered first failure, or its stranded error),
 		// or the pre-Close injected pin, which fires before either runs.
-		const bool tail_executed = TailExecuted();
+		const bool tail_executed = dev.submission_counter() != tail_counter_before;
 		InvalidateResidencyCachesOnThrow();
 		if (!tail_executed) {
 			// `ExecuteCommandLists` never ran: either the pre-Close fault fired first, or Close()
@@ -4043,7 +4053,7 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 		// exception type from anywhere in the tail, the in-flight token's construction after
 		// Submit() included, is contained like the two clauses above -- the submission was drained
 		// by its token before this stack releases the buffers it uses.
-		const bool tail_executed = TailExecuted();
+		const bool tail_executed = dev.submission_counter() != tail_counter_before;
 		InvalidateResidencyCachesOnThrow();
 		if (!tail_executed && external_kv_resident != nullptr &&
 		    io_external_kv_needs_resume_barrier != nullptr) {
