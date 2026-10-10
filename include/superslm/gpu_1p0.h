@@ -420,6 +420,10 @@ SslmGpuStatus sslm_gpu_seq_embed_token(SslmGpuContext* ctx, SslmGpuSequenceHandl
                                         int32_t token_id) noexcept;
 
 /* --- Sec4.2: save/restore/reset. Declared for B3/B5.
+ * Paged KV (1.13.0, the writer rule): a POOLED sequence (sslm_gpu_seq_create_budgeted) saves an
+ * 'SLM6' budget blob instead -- the 'SLM5' header and tail, then kv_mode, budget and origin, the
+ * residual, and only the rows [0, L') in canonical layout -- which only
+ * sslm_gpu_seq_restore_into_pool restores; everything below describes a DEDICATED sequence.
  * `sslm_gpu_seq_save` writes a v5 blob ('SLM5', v1.6.0, T-2895/D-SLM7572), carrying `model`'s
  * own content hash (design Sec22), the four per-site K/V saturation counters whose sum is
  * kv_saturation_count unless the sequence's history since its last reset includes an 'SLM4'
