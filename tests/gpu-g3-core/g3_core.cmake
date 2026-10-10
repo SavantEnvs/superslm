@@ -7,9 +7,12 @@
 # The sanitizer arms and the mutants are run by tests/gpu-g3-core/run_g3_core.py (g++ 13.3, the
 # plan's ThreadSanitizer route), which builds each arm itself.
 #
-# RED STAGE: EXCLUDE_FROM_ALL until the green implementation lands, so the default build stays green.
+# superslm_tests also runs the ledger's cells (3.6h and G3/ledger) through
+# g3_superslm_tests_adapter.cpp, with src/gpu on its include path on every platform (outside the
+# WIN32 block, where it was added before G3) and SUPERSLM_LEDGER_YIELD_HOOK defined on the whole
+# target, so every translation unit of that binary sees one definition of the ledger class.
 set(G3_CORE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu-g3-core)
-add_executable(superslm_g3_core_tests EXCLUDE_FROM_ALL
+add_executable(superslm_g3_core_tests
 	${G3_CORE_DIR}/g3_main.cpp
 	${G3_CORE_DIR}/g3_cells_ledger.cpp
 	${G3_CORE_DIR}/g3_cells_token.cpp
@@ -26,3 +29,11 @@ else()
 	find_package(Threads REQUIRED)
 	target_link_libraries(superslm_g3_core_tests PRIVATE Threads::Threads)
 endif()
+add_test(NAME superslm_g3_core_tests COMMAND superslm_g3_core_tests)
+
+target_sources(superslm_tests PRIVATE
+	${G3_CORE_DIR}/g3_superslm_tests_adapter.cpp
+	${G3_CORE_DIR}/g3_cells_ledger.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gpu_inflight_registry.cpp)
+target_include_directories(superslm_tests PRIVATE ${G3_CORE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu)
+target_compile_definitions(superslm_tests PRIVATE SUPERSLM_LEDGER_YIELD_HOOK)
