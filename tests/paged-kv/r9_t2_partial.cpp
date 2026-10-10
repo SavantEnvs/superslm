@@ -10,11 +10,11 @@
 //   2.9/T2              pinned B = 16 at cap 32,768: 2,097,152 blocks refused before the buffer check
 //   2.9b/T2             unpinned thresholds: D = 64 at cap 32,768 (B = 128) and D = 128 (B = 64)
 //   2.9c/T2             pkv_odd: 252,645,135 blocks passes the page check, 252,645,136 is refused
-//   2.9d/T2             the block product's overflow at a non-dividing cap (model gap: the CFG1-only
-//                       fixture does not map)
+//   2.9d/T2             the block product's overflow at a non-dividing cap, through the geometry seam
+//                       (rev 16.23, D-SLM8437: the CFG1-only fixture loads and does not map)
 //   10.9/T2             admission at a non-dividing cap, the writes to the cap, save, adopt, state size
 //   4.13/T2:cap4100     4.2 (prefix lengths) whole on pkv_odd at B = 256
-//   6.7/T2:non-dividing contiguous option <-> page pool at cap 4,100, and a pin of 4 (needs T3's verb)
+//   6.7/T2:non-dividing a pin of 4 -> the derived B = 256 page pool, the 17-page reservation, the legacy size
 //   (rev 16.22: 2.4, 7.11, 9.2b and 9.3 at cap 4,100 are in r9_t2_saves.cpp)
 
 #include "pkv_r9.h"
@@ -196,10 +196,9 @@ void Cell29c() {
 // 2.9d [T2]. The block product's overflow at a non-dividing cap, on the plan's CFG1-only fixture:
 // L 2,090,000, H_kv 1,024, D 1,048,576, Int8, cap 4,100 (B = 16, 257 pages; q = L*2*H_kv*D per
 // position; cap*q and 16*q fit 64 bits, 257*16*q does not).
-// MODEL GAP (record §4): the fixture loads (SslmModel::Load) but cannot map (BuildEngineCache marshals
-// WGT1 weights it does not carry), so the ABI verbs it asserts on cannot be reached. Per the cell's
-// own rule the refusal is recorded with its source; it is neither a check the fixture is specified to
-// meet nor a bound on the overflow window, so it goes to the planner.
+// Rev 16.23 (D-SLM8437, T-3189 G-1): the fixture loads (SslmModel::Load) and does not map (sslm_model_map builds
+// the engine cache from WGT1 weights it does not carry), which is not a bound on the window, so every value is
+// read through the geometry seam over the loaded config; the create's refusal is requirement_fits == 0 at one block.
 void Cell29d() {
 	superslm_test::Cfg1Spec spec;
 	spec.hidden_size = 1u << 30;
@@ -219,14 +218,8 @@ void Cell29d() {
 	const std::vector<uint8_t> b = Cfg1OnlyArtifact(spec);
 	std::string err;
 	const superslm::SslmModelStatus ls = LoadStatus(b, &err);
-	Fixture fx;
-	sslm_status ms = SSLM_OK;
-	MapInto(b, "cfg1only_29d", Geometry{2090000, 1024, 1048576, 4100}, &fx, &ms);
-	std::printf("  2.9d fixture: SslmModel::Load = %s (%s); sslm_model_map = %s\n", superslm::SslmModelStatusName(ls),
-	            err.c_str(), AbiStatusName(ms));
 	PKV_CHECK_MSG(ls == superslm::SslmModelStatus::Ok, "the loader refuses the 2.9d fixture: %s (%s)",
 	              superslm::SslmModelStatusName(ls), err.c_str());
-	PKV_CHECK_MSG(fx.ok, "the 2.9d fixture does not map (%s): BuildEngineCache needs WGT1 (model gap)", AbiStatusName(ms));
 	// Rev 16.22 (D-SLM8427): the block keeps 1.11.0's cap * q; the overhead carries 12 slack positions;
 	// the create refuses through blocks + overhead > 2^64 - 1; the overhead saturates from 343 blocks.
 	const uint64_t block = 4100ull * q, overhead1 = 8 + 32 + 12 * q;
@@ -236,19 +229,25 @@ void Cell29d() {
 	PKV_CHECK_EQ(block + overhead1, 8902195894288424ull);                       // the unchecked-sum mutant's value
 	PKV_CHECK(343ull * 12 * q / q != 343ull * 12 || 343ull * 12 * q < 342ull * 12 * q);  // the slack product wraps at 343
 	PKV_CHECK(342ull * 12 * q / (12 * q) == 342ull);                            // and not at 342
-	if (!fx.ok) return;
-	PKV_CHECK_EQ(sslm_kv_block_size(fx.model), block);  // rev 16.21's grown block returns SIZE_MAX
-	PKV_CHECK_EQ(sslm_kv_pool_overhead_size(fx.model, 1), overhead1);
-	{
-		AlignedBuf small(4096);
-		sslm_kv_pool pool = nullptr;
-		// a buffer the create is told is SIZE_MAX bytes: only the overflow check can refuse it
-		PKV_CHECK_EQ(sslm_kv_pool_create(fx.model, small.p, SIZE_MAX, 1, &pool), SSLM_INVALID_ARGUMENT);
-		PKV_CHECK(pool == nullptr);
+	auto seam = [&](uint32_t n, KvPagesTestPoolGeometryOut* g) {
+		*g = KvPagesTestPoolGeometryOut{};
+		const sslm_status st = KvPagesTestPoolGeometry(b.data(), b.size(), n, g);
+		PKV_CHECK_MSG(st == SSLM_OK, "KvPagesTestPoolGeometry(2.9d, %u blocks) = %s", n, AbiStatusName(st));
+		return st == SSLM_OK;
+	};
+	KvPagesTestPoolGeometryOut g1, g342, g343;
+	if (seam(1, &g1)) {
+		PKV_CHECK_MSG(g1.block_size == block, "block %zu; 1.11.0's cap * q, 18,401,787,379,712,000,000, owed (rev 16.21's grown "
+		              "block saturates)", g1.block_size);
+		PKV_CHECK_MSG(g1.overhead == overhead1, "overhead(1) %zu; 8 + 32 + 12 q owed", g1.overhead);
+		PKV_CHECK_MSG(g1.page_count_fits == 1 && g1.requirement_fits == 0,
+		              "one block: page count fits %d, requirement fits %d; the create refuses through the sum (0 owed)",
+		              g1.page_count_fits, g1.requirement_fits);
+		PKV_CHECK_EQ(g1.page_positions, 16);
+		PKV_CHECK_EQ(g1.page_size, static_cast<size_t>(16 * q));
 	}
-	PKV_CHECK_EQ(sslm_kv_pool_overhead_size(fx.model, 343), SIZE_MAX);
-	PKV_CHECK(sslm_kv_pool_overhead_size(fx.model, 342) != SIZE_MAX);
-	PKV_CHECK_EQ(sslm_kv_page_size(fx.model), static_cast<size_t>(16 * q));
+	if (seam(343, &g343)) PKV_CHECK_MSG(g343.overhead == SIZE_MAX, "overhead(343) %zu, SIZE_MAX owed", g343.overhead);
+	if (seam(342, &g342)) PKV_CHECK_MSG(g342.overhead != SIZE_MAX, "overhead(342) saturates");
 }
 
 // 10.9 [T2]. Admission at a non-dividing cap (D-SLM8396).
@@ -398,72 +397,27 @@ void Cell413Cap4100() {
 	PKV_CHECK_EQ(1024 % OddB(), 0);
 }
 
-// 6.7 [T2]. At a non-dividing cap (T-3172 G-9): a blob saved in the contiguous option restores into
-// the B = 256 page pool and one saved in the page pool restores into the option, at widths 1, 255,
-// 256, 4,099 and 4,100; a third direction pins B = 4. Tokens and rows [0, L') equal, and the restoring
-// legacy holder reserves ceil(cap/B) pages. Needs T3's contiguous verb (record §4).
+// 6.7 [T2]. At a non-dividing cap (T-3172 G-9), the page-pool half (rev 16.23, T-3189 G-3: the option directions
+// and the cross-kind byte-equality are 6.7/T3:non-dividing): a blob saved at a pinned B = 4, which divides 4,100,
+// restores into the derived B = 256 page pool with rows equal; the restoring legacy holder reserves ceil(cap/B) =
+// 17 pages; and the page pool's legacy save is 160 + hidden_size + 4 * history + the flat block (rev 16.22).
 void Cell67NonDividing() {
 	const Fixture& odd = GetFixture("pkv_odd");
 	if (!odd.ok) return;
 	RequireOddB(odd);
 	const int64_t B = OddB();
 	const Lay y = LayoutOf(odd.geo, 1, B);
-	bool fits = false;
-	const uint64_t csize = ContiguousSize(y, 2, &fits);
-	for (int64_t W : {int64_t{1}, int64_t{255}, int64_t{256}, int64_t{4099}, int64_t{4100}}) {
-		ContigPoolOf cp(odd.model, 2, static_cast<size_t>(csize));
-		BlockPoolOf pp(odd.model, 2, y);
-		PKV_CHECK_MSG(cp.status == SSLM_OK, "W %lld: the contiguous pool: %s", static_cast<long long>(W), AbiStatusName(cp.status));
-		PKV_CHECK_EQ(pp.status, SSLM_OK);
-		if (!cp.pool || !pp.pool) continue;
-		for (int dir = 0; dir < 2; ++dir) {
-			sslm_kv_pool* src = dir == 0 ? &cp.pool : &pp.pool;
-			sslm_kv_pool* dst = dir == 0 ? &pp.pool : &cp.pool;
-			const int64_t dstB = dir == 0 ? B : 4100;
-			sslm_seq s = nullptr, r = nullptr;
-			PKV_CHECK_EQ(sslm_seq_create(odd.model, src, &s), SSLM_OK);
-			if (!s) continue;
-			PKV_CHECK_EQ(PrefillAll(odd.model, s, Stream(41, static_cast<int32_t>(W), odd.vocab), 64), SSLM_OK);
-			const std::vector<uint8_t> blob = bc::Save(s);
-			PKV_CHECK_EQ(sslm_seq_restore(odd.model, dst, blob.data(), blob.size(), &r), SSLM_OK);
-			if (r) {
-				std::vector<uint8_t> rows, brows;
-				// kills: a restore that writes floor(L/B) * B rows loses the tail (fails at 4,099)
-				PKV_CHECK_MSG(SeqRows(*dst, r, odd.geo, 1, dstB, W, Rot::kRotated, &rows) &&
-				                  BlobRows(blob, odd, HiddenSize(odd), W, &brows) && rows == brows,
-				              "W %lld, %s: restored rows equal the blob's", static_cast<long long>(W),
-				              dir == 0 ? "option -> page pool" : "page pool -> option");
-				if (W < 4100) PKV_CHECK(bc::DecodeN(odd.model, r, 2) == bc::DecodeN(odd.model, s, 2));
-				sslm_seq_release(r);
-			}
+	{  // the page pool's legacy save at width 4,099 is exactly 160 + hidden_size + 4 * history + the flat block
+		BlockPoolOf pp(odd.model, 1, y);
+		sslm_seq s = nullptr;
+		if (pp.pool && sslm_seq_create(odd.model, &pp.pool, &s) == SSLM_OK) {
+			PKV_CHECK_EQ(PrefillAll(odd.model, s, Stream(41, 4099, odd.vocab), 64), SSLM_OK);
+			const std::vector<uint8_t> b = bc::Save(s);
+			PKV_CHECK_MSG(b.size() == 160 + 192 + 4 * Le64(b, 112) + y.block_bytes,
+			              "the legacy save is %zu bytes; 160 + 192 + 4 * %llu + %zu owed", b.size(),
+			              static_cast<unsigned long long>(Le64(b, 112)), y.block_bytes);
 			sslm_seq_release(s);
 		}
-	}
-	// Rev 16.22 (D-SLM8427): the legacy blob saved at width 4,099 is byte-equal across pool kinds, and
-	// is 160 + hidden_size + 4 * history + the flat block. Mutant: a section sized by each pool's own
-	// reservation (cap * q in the option, 17 pages in the page pool) differs by 96,768 bytes.
-	{
-		bool f1 = false;
-		ContigPoolOf cp(odd.model, 1, static_cast<size_t>(ContiguousSize(y, 1, &f1)));
-		BlockPoolOf pp(odd.model, 1, y);
-		std::vector<uint8_t> blobs[2];
-		for (int k = 0; k < 2; ++k) {
-			sslm_kv_pool* pool = k == 0 ? &cp.pool : &pp.pool;
-			sslm_seq s = nullptr;
-			if (*pool && sslm_seq_create(odd.model, pool, &s) == SSLM_OK) {
-				PKV_CHECK_EQ(PrefillAll(odd.model, s, Stream(41, 4099, odd.vocab), 64), SSLM_OK);
-				blobs[k] = bc::Save(s);
-				sslm_seq_release(s);
-			}
-		}
-		PKV_CHECK_MSG(!blobs[0].empty() && blobs[0] == blobs[1],
-		              "the legacy saves of one state from the option (%zu bytes) and the page pool (%zu) differ",
-		              blobs[0].size(), blobs[1].size());
-		for (const auto& b : blobs)
-			if (!b.empty())
-				PKV_CHECK_MSG(b.size() == 160 + 192 + 4 * Le64(b, 112) + y.block_bytes,
-				              "a legacy save is %zu bytes; 160 + 192 + 4 * %llu + %zu owed", b.size(),
-				              static_cast<unsigned long long>(Le64(b, 112)), y.block_bytes);
 	}
 	// the restoring legacy holder reserves ceil(cap/B) = 17 pages: a 17-page page pool takes exactly one
 	{

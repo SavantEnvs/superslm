@@ -12,9 +12,14 @@
 //                          freeze returns no reserve page; restore_shared at origin 1,200 shares 0 pages
 //   4.14/T3:hostile        refusal order, the overflow pair 3,054,198,961 / 3,054,198,962 (L-3) at the
 //                          Qwen3-8B geometry with Int16 K/V at cap 40,960, null out and *out nulling (L-6)
+//   4.14/T3:reservation    a budget holder created, and one restored, in the option reserves exactly one page
+//                          (T-3195's lesser plane; mutant: reserving by the model's B)
 //   5.6/T3                 allocation-failure injection in sslm_kv_pool_create_contiguous
 //   7.8/T3                 the public header declares both verbs (their behaviour sentences are 4.14's)
 //   6.7/T3:option          a blob saved in the option restores in the page pool and back (pkv_def)
+//   6.7/T3:non-dividing    the same at cap 4,100 (pkv_odd), and the legacy save byte-equal across kinds
+//   4.15/T3                copy adopt across page geometries refused in both directions, nothing changed
+//                          (rev 16.23, D-SLM8434); the 0.5B member is 4.15/box
 //   7.9/C6:fixtures        the cloud twin of cell 7.9: pkv_def in a page pool against pkv_def in the
 //                          option, per-token random order, one blob restored into both arms; the token
 //                          streams must be equal (timings are recorded, never graded in the cloud)
@@ -23,6 +28,7 @@
 // its first use of the option.
 
 #include "pkv_r9.h"
+#include "pkv_r9_adopt415.h"
 
 #include "support/bad_alloc_injection.h"
 
@@ -421,13 +427,159 @@ void Cell79Fixtures() {
 	sslm_seq_release(b);
 }
 
+// 6.7 [T3], moved from T2 by rev 16.23 (T-3189 G-3): at the non-dividing cap 4,100 (pkv_odd, B = 256), a blob
+// saved in the contiguous option restores into the page pool and one saved in the page pool restores into the
+// option, at widths 1, 255, 256, 4,099 and 4,100; rows [0, L') equal and the next tokens agree. Mutant: a restore
+// that writes floor(L/B) * B rows loses the tail (fails at 4,099). Rev 16.22 (D-SLM8427): the legacy blob saved at
+// width 4,099 is byte-equal across pool kinds and is 160 + hidden_size + 4 * history + the flat block; a section
+// sized by each pool's own reservation (cap * q in the option, 17 pages in the page pool) differs by 96,768 bytes.
+void Cell67NonDividingOption() {
+	const Fixture& odd = GetFixture("pkv_odd");
+	if (!odd.ok) return;
+	const int64_t B = RuleB(48, 4100, 1);
+	PKV_CHECK_MSG(sslm_kv_page_positions(odd.model) == B, "pkv_odd runs at B = %lld; the rule gives 256",
+	              static_cast<long long>(sslm_kv_page_positions(odd.model)));
+	const Lay y = LayoutOf(odd.geo, 1, B);
+	bool fits = false;
+	const uint64_t csize = ContiguousSize(y, 2, &fits);
+	for (int64_t W : {int64_t{1}, int64_t{255}, int64_t{256}, int64_t{4099}, int64_t{4100}}) {
+		ContigPoolOf cp(odd.model, 2, static_cast<size_t>(csize));
+		BlockPoolOf pp(odd.model, 2, y);
+		PKV_CHECK_MSG(cp.status == SSLM_OK, "W %lld: the contiguous pool: %s", static_cast<long long>(W), AbiStatusName(cp.status));
+		PKV_CHECK_EQ(pp.status, SSLM_OK);
+		if (!cp.pool || !pp.pool) continue;
+		for (int dir = 0; dir < 2; ++dir) {
+			sslm_kv_pool* src = dir == 0 ? &cp.pool : &pp.pool;
+			sslm_kv_pool* dst = dir == 0 ? &pp.pool : &cp.pool;
+			const int64_t dstB = dir == 0 ? B : 4100;
+			sslm_seq s = nullptr, r = nullptr;
+			PKV_CHECK_EQ(sslm_seq_create(odd.model, src, &s), SSLM_OK);
+			if (!s) continue;
+			PKV_CHECK_EQ(PrefillAll(odd.model, s, Stream(41, static_cast<int32_t>(W), odd.vocab), 64), SSLM_OK);
+			const std::vector<uint8_t> blob = bc::Save(s);
+			PKV_CHECK_EQ(sslm_seq_restore(odd.model, dst, blob.data(), blob.size(), &r), SSLM_OK);
+			if (r) {
+				std::vector<uint8_t> rows, brows;
+				// kills: a restore that writes floor(L/B) * B rows loses the tail (fails at 4,099)
+				PKV_CHECK_MSG(SeqRows(*dst, r, odd.geo, 1, dstB, W, Rot::kRotated, &rows) &&
+				                  BlobRows(blob, odd, HiddenSize(odd), W, &brows) && rows == brows,
+				              "W %lld, %s: restored rows equal the blob's", static_cast<long long>(W),
+				              dir == 0 ? "option -> page pool" : "page pool -> option");
+				if (W < 4100) PKV_CHECK(bc::DecodeN(odd.model, r, 2) == bc::DecodeN(odd.model, s, 2));
+				sslm_seq_release(r);
+			}
+			sslm_seq_release(s);
+		}
+	}
+	// Rev 16.22 (D-SLM8427): the legacy blob saved at width 4,099 is byte-equal across pool kinds, and
+	// is 160 + hidden_size + 4 * history + the flat block. Mutant: a section sized by each pool's own
+	// reservation (cap * q in the option, 17 pages in the page pool) differs by 96,768 bytes.
+	{
+		bool f1 = false;
+		ContigPoolOf cp(odd.model, 1, static_cast<size_t>(ContiguousSize(y, 1, &f1)));
+		BlockPoolOf pp(odd.model, 1, y);
+		std::vector<uint8_t> blobs[2];
+		for (int k = 0; k < 2; ++k) {
+			sslm_kv_pool* pool = k == 0 ? &cp.pool : &pp.pool;
+			sslm_seq s = nullptr;
+			if (*pool && sslm_seq_create(odd.model, pool, &s) == SSLM_OK) {
+				PKV_CHECK_EQ(PrefillAll(odd.model, s, Stream(41, 4099, odd.vocab), 64), SSLM_OK);
+				blobs[k] = bc::Save(s);
+				sslm_seq_release(s);
+			}
+		}
+		PKV_CHECK_MSG(!blobs[0].empty() && blobs[0] == blobs[1],
+		              "the legacy saves of one state from the option (%zu bytes) and the page pool (%zu) differ",
+		              blobs[0].size(), blobs[1].size());
+		for (const auto& b : blobs)
+			if (!b.empty())
+				PKV_CHECK_MSG(b.size() == 160 + 192 + 4 * Le64(b, 112) + y.block_bytes,
+				              "a legacy save is %zu bytes; 160 + 192 + 4 * %llu + %zu owed", b.size(),
+				              static_cast<unsigned long long>(Le64(b, 112)), y.block_bytes);
+	}
+}
+
+
+// 4.14 [T3], T-3195's lesser plane (rev 16.23): a budget holder in a contiguous pool reserves exactly one page,
+// the whole cap (§21.2), whether created or restored. At 2ebe5e3 the four budget reservation sites compute
+// ReservationPages from the model's B (sslm_abi.cpp:2184, :2206, :2396, :3988), not the pool's; 4.14's other members
+// reach three of them and a budget restore into a contiguous pool reaches none. Graded by the fill probe: after one
+// budget holder, a pool of N blocks admits exactly N - 1 more budget-1 creates. Mutant: the reservation taken by the
+// model's B (R(100) = min(ceil(100/128) + 1, 32) = 2 pages of the pool's cap-sized pages), which admits N - 2.
+void Cell414Reservation() {
+	const Fixture& fx = Def();
+	if (!fx.ok) return;
+	const Lay y = DefLay(DefB());
+	const uint32_t N = 3;
+	PKV_CHECK(Reservation(100, kCap, DefB()) == 2 && Reservation(100, kCap, kCap) == 1);  // the mutant separates
+	// a budget blob to restore, saved from a page pool at the derived B
+	std::vector<uint8_t> blob;
+	{
+		PagePoolOf src(fx.model, 8, y.page_bytes);
+		sslm_seq s = nullptr;
+		if (src.pool && sslm_seq_create_budgeted(fx.model, &src.pool, 100, &s) == SSLM_OK) {
+			PrefillAll(fx.model, s, Stream(31, 60, fx.vocab), 64);
+			blob = bc::Save(s);
+			sslm_seq_release(s);
+		}
+		PKV_CHECK_MSG(IsMagic(blob, "SSB6"), "the budget-100 blob to restore was not made");
+	}
+	for (int restored = 0; restored < 2; ++restored) {
+		ContigPoolOf cp(fx.model, N, ContigBytes(y, N));
+		PKV_CHECK_MSG(cp.status == SSLM_OK, "the option's create: %s", AbiStatusName(cp.status));
+		if (!cp.pool) continue;
+		sslm_seq h = nullptr;
+		const sslm_status st = restored ? sslm_seq_restore(fx.model, &cp.pool, blob.data(), blob.size(), &h)
+		                                : sslm_seq_create_budgeted(fx.model, &cp.pool, 100, &h);
+		PKV_CHECK_MSG(st == SSLM_OK, "a budget-100 holder %s in the option: %s", restored ? "restored" : "created",
+		              AbiStatusName(st));
+		if (!h) continue;
+		sslm_status refusal = SSLM_OK;
+		const int n = CountCreates(fx.model, &cp.pool, 1, &refusal);
+		PKV_CHECK_MSG(n == static_cast<int>(N) - 1, "after one %s budget holder, %u blocks admit %d budget-1 creates; %u owed",
+		              restored ? "restored" : "created", N, n, N - 1);
+		sslm_seq_release(h);
+	}
+}
+
+using namespace pkv::r9::c415;
+
+void Cell415() {
+	Cell415On(GetFixture("pkv_def"), RuleB(48, 4096, 1), static_cast<int32_t>(RuleB(48, 4096, 1)), 700);  // B = 128
+	Cell415On(GetFixture("pkv_odd"), RuleB(48, 4100, 1), static_cast<int32_t>(RuleB(48, 4100, 1)), 700);  // B = 256
+	// One geometry: D = 48 at cap 100, where the rule's B is the cap; both directions admitted, rows equal.
+	const Fixture& one = Get("r9_d48_c100", Geometry{2, 2, 48, 100});
+	if (!one.ok) return;
+	PKV_CHECK_EQ(RuleB(48, 100, 1), 100);
+	for (int32_t len : {50, 99}) {
+		KindPools k(one, 100, 3);
+		PKV_CHECK_MSG(k.Ok(), "cap 100: the pools (contiguous: %s)", AbiStatusName(k.contig->status));
+		if (!k.Ok()) continue;
+		for (int dir = 0; dir < 2; ++dir) {
+			sslm_kv_pool* sp = dir == 0 ? &k.page->pool : &k.contig->pool;
+			sslm_kv_pool* pp = dir == 0 ? &k.contig->pool : &k.page->pool;
+			sslm_prefix p = LegacyPrefixOf(one, pp, len);
+			sslm_seq s = nullptr;
+			if (p && sslm_seq_create(one.model, sp, &s) == SSLM_OK)
+				ExpectAdmitted(one, *sp, 100, *pp, 100, s, p, len,
+				               std::string("cap 100 (one geometry): ") + (dir == 0 ? "page from contiguous" : "contiguous from page") +
+				                   ", len " + std::to_string(len));
+			if (s) sslm_seq_release(s);
+			if (p) sslm_prefix_release(p);
+		}
+	}
+}
+
 PKV_CELL("4.14/T3:bit-identity", "T3", Cell414BitIdentity);
+PKV_CELL("4.15/T3", "T3", Cell415);
+PKV_CELL("6.7/T3:non-dividing", "T3", Cell67NonDividingOption);
 PKV_CELL("4.14/T3:admission", "T3", Cell414Admission);
 PKV_CELL("4.14/T3:sizing", "T3", Cell414Sizing);
 PKV_CELL("4.14/T3:saves", "T3", Cell414Saves);
 PKV_CELL("4.14/T3:adopt", "T3", Cell414Adopt);
 PKV_CELL("4.14/T3:lifecycle", "T3", Cell414Lifecycle);
 PKV_CELL("4.14/T3:hostile", "T3", Cell414Hostile);
+PKV_CELL("4.14/T3:reservation", "T3", Cell414Reservation);
 PKV_CELL("5.6/T3", "T3", Cell56);
 PKV_CELL("7.8/T3", "T3", Cell78);
 PKV_CELL("6.7/T3:option", "T3", Cell67Option);

@@ -20,7 +20,7 @@ import os
 import subprocess
 import sys
 
-SYMBOL = b"KvPagesTestPinPagePositions"
+SYMBOLS = (b"KvPagesTestPinPagePositions", b"KvPagesTestPoolGeometry")  # the pin, and the geometry seam (rev 16.23)
 
 
 def find_lib(build, config, name):
@@ -44,17 +44,19 @@ def main(argv):
         print(f"INFRASTRUCTURE: libraries not found under {build} ({test_lib}, {prod_lib})")
         return 3
     with open(test_lib, "rb") as f:
-        in_test = SYMBOL in f.read()
-    print(f"{'PASS' if in_test else 'FAIL'} positive control: {SYMBOL.decode()} in {test_lib}: {in_test}")
-    ok = ok and in_test
+        test_bytes = f.read()
     with open(prod_lib, "rb") as f:
-        in_prod = SYMBOL in f.read()
-    print(f"{'PASS' if not in_prod else 'FAIL'} production: {SYMBOL.decode()} in {prod_lib}: {in_prod}")
-    ok = ok and not in_prod
+        prod_bytes = f.read()
+    for sym in SYMBOLS:
+        in_test = sym in test_bytes
+        print(f"{'PASS' if in_test else 'FAIL'} positive control: {sym.decode()} in {test_lib}: {in_test}")
+        in_prod = sym in prod_bytes
+        print(f"{'PASS' if not in_prod else 'FAIL'} production: {sym.decode()} in {prod_lib}: {in_prod}")
+        ok = ok and in_test and not in_prod
     run = subprocess.run(["cmake", "--build", build, "--config", config, "--target", "superslm_pkv_r9_pin_link_probe"],
                          capture_output=True, text=True)
     log = run.stdout + run.stderr
-    unresolved = run.returncode != 0 and SYMBOL.decode() in log and ("unresolved" in log or "undefined" in log)
+    unresolved = run.returncode != 0 and all(s.decode() in log for s in SYMBOLS) and ("unresolved" in log or "undefined" in log)
     print(f"{'PASS' if unresolved else 'FAIL'} link probe against superslm: exit {run.returncode}, "
           f"unresolved pin named: {unresolved}")
     ok = ok and unresolved

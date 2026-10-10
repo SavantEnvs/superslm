@@ -69,6 +69,25 @@ sslm_status sslm_kv_pool_create_contiguous(sslm_model model, void* buf, size_t b
 // divides the cap nor is the cap, B <= 0, B > cap, a pin after a pool exists on the model).
 sslm_status KvPagesTestPinPagePositions(sslm_model model, int64_t page_positions);
 
+// The geometry seam (rev 16.23, D-SLM8437; §3.1): C linkage, compiled only with
+// SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS beside the pin. It loads `artifact` with SslmModel::Load, never maps it, and
+// writes what the geometry and sizing verbs would return for it, computed through the verbs' one internal function:
+// page_positions (sslm_kv_page_positions), page_size (sslm_kv_page_size), block_size (sslm_kv_block_size), overhead
+// (sslm_kv_pool_overhead_size(block_count)), page_count_fits (block_count * ceil(cap/B) <= UINT32_MAX) and
+// requirement_fits (block_count * block_size + overhead <= SIZE_MAX). SSLM_INVALID_ARGUMENT on a null `out`; on a
+// refused artifact, the load's refusal. The test author's readings, where the plan names the fields but not their
+// layout: the field order and types below, and SSLM_ARTIFACT_REJECTED for a refused load (the status sslm_model_map
+// gives the same artifact).
+typedef struct KvPagesTestPoolGeometryOut {
+	int64_t page_positions;
+	size_t page_size;
+	size_t block_size;
+	size_t overhead;
+	int32_t page_count_fits;   // 1 or 0
+	int32_t requirement_fits;  // 1 or 0
+} KvPagesTestPoolGeometryOut;
+sslm_status KvPagesTestPoolGeometry(const void* artifact, size_t size, uint32_t block_count, KvPagesTestPoolGeometryOut* out);
+
 // G19's block-index peek (src/sslm_abi.cpp, every library build): n raw bytes of block `block_index`.
 sslm_status sslm_g5_test_only_peek_kv_block_bytes(sslm_kv_pool pool, uint32_t block_index, uint8_t* out_buf, size_t n);
 

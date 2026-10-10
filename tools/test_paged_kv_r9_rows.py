@@ -11,9 +11,10 @@ Cells (cell 7.9's text; the 79-series rows of the instrument table):
   guard   the bound table (n, P, M99) at B = 64 and at 7.9-MR-OPT's B = 16; M's definition; the
           vitality constructions at both page sizes (the T-3146 shuffle passes; ascending ids, the pair
           churn, interleave-5 and the set-concentrating order are rejected); the five id lists agree
-79-6 and 79-7 (blob or manifest mismatch, a seam-library build) are carried by
-tools/test_run_paged_kv_pairs.py's checked_blob and production_library cells until the commissioning
-seat restates them for the per-process rule (plan §20.4; record §4).
+  79-6    (rev 16.23, T-3189 G-4) a blob or manifest mismatch in any process: the restored blob's digest, the
+          manifest chain, the model binding; refused before restore, its own exit code, no record, row ungraded
+  79-7    a seam-library build, checked once per process before timing
+  per-process refusals: each kind its own non-zero exit code; a row is never graded on four processes
 """
 import collections
 import importlib.util
@@ -195,6 +196,85 @@ class Guard(unittest.TestCase):
         other = list(ids)
         other[3], other[4] = other[4], other[3]
         self.assertFalse(rows.id_lists_agree([ids] * 4 + [other]))
+
+
+def sha(path):
+    import hashlib
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+class Refusals(unittest.TestCase):
+    """79-6, 79-7 and the per-process refusal rule (cell 7.9, rev 16.23)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="t3189-r9-refusals-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.model = self.root / "model.sslm"
+        self.model.write_bytes(b"model bytes")
+        prev, at, pieces = "-", 0, []
+        for i, count in enumerate((700, 500)):
+            f = self.root / f"piece{i}.ssb"
+            f.write_bytes(f"blob after {at + count}".encode())
+            pieces.append({"file": f.name, "start": at, "count": count, "input_sha256": prev, "sha256": sha(f)})
+            prev, at = sha(f), at + count
+        self.manifest = self.root / "manifest.json"
+        self.write({"complete": True, "model_sha256": sha(self.model), "stream": {"seed": 79, "restore": 1200},
+                    "pieces": pieces, "final_blob": pieces[-1]["file"], "final_sha256": pieces[-1]["sha256"]})
+
+    def write(self, data):
+        self.data = data
+        self.manifest.write_text(json.dumps(data))
+
+    def test_79_6_healthy_blob_accepted(self):
+        blob, digest = rows.check_row_blob(self.manifest, self.model, 1200)
+        self.assertEqual(Path(blob).name, "piece1.ssb")
+        self.assertEqual(digest, sha(self.manifest))
+
+    def test_79_6_each_mismatch_refused(self):
+        cases = {
+            "blob digest": lambda: (self.root / "piece1.ssb").write_bytes(b"changed blob"),
+            "chain": lambda: self.write({**self.data, "pieces": [self.data["pieces"][0],
+                                                                  {**self.data["pieces"][1], "input_sha256": "0" * 64}]}),
+            "model binding": lambda: self.model.write_bytes(b"another model"),
+            "stream": lambda: self.write({**self.data, "stream": {"seed": 79, "restore": 1204}}),
+            "torn manifest": lambda: self.manifest.write_text('{"complete": tr'),
+            "final digest alone": lambda: self.write({**self.data, "final_sha256": "0" * 64}),
+        }
+        for name, damage in cases.items():
+            with self.subTest(case=name):
+                self.setUp()
+                damage()
+                with self.assertRaises(rows.Refusal):
+                    rows.check_row_blob(self.manifest, self.model, 1200)
+
+    def test_79_7_seam_build_refused(self):
+        self.assertIsNone(rows.check_build_identity("PKV_PAIR_PRODUCTION_V2 defs=none"))
+        for line in ("PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE", "PKV_PAIR_PRODUCTION_V2 defs=SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS", ""):
+            with self.subTest(line=line):
+                with self.assertRaises(rows.Refusal):
+                    rows.check_build_identity(line)
+
+    def test_exit_codes_distinct(self):
+        self.assertEqual(set(rows.EXIT_CODES), {"blob", "seam", "token", "pairs"})
+        self.assertEqual(len(set(rows.EXIT_CODES.values())), 4)
+        self.assertNotIn(0, rows.EXIT_CODES.values())
+
+    def test_row_graded_only_on_five_complete_processes(self):
+        ok = [{"status": "ok", "median": 0.01}] * 5
+        graded = rows.grade_row(ok)
+        self.assertTrue(graded["graded"])
+        self.assertEqual(graded["verdict"], "PASS")
+        self.assertIsNotNone(graded["record"])
+        for kind in ("blob", "seam", "token", "pairs"):
+            with self.subTest(kind=kind):
+                bad = list(ok)
+                bad[2] = {"status": "refused", "kind": kind}
+                g = rows.grade_row(bad)
+                self.assertEqual((g["graded"], g["verdict"], g["record"]), (False, None, None))
+                self.assertEqual(g["exit_code"], rows.EXIT_CODES[kind])
+        g = rows.grade_row(ok[:4])  # never graded on four
+        self.assertEqual((g["graded"], g["verdict"]), (False, None))
 
 
 class Process(unittest.TestCase):

@@ -17,6 +17,8 @@ leg that runs the suite and never committed, as the other paged-KV fixtures are.
   r9_d512_c64     D = 512 and 1,024: the grid's floor rows (bases; the cells re-cap them with the
   r9_d1024_c64    RoPE table stripped, which no geometry-only verb reads)
   r9_l3_c4096     three layers, D = 48, cap 4,096: runs = 12, which does not divide 64 (cell 6.6b)
+  r9_d48_c100     D = 48, cap 100: the rule's B is the cap, so a page pool and a contiguous pool share one
+                  geometry (cell 4.15's admitted cross-kind pair, rev 16.23)
   r9_q8_c64       36 layers, 8 query heads, 8 KV heads, D = 128: the Qwen3-8B K/V geometry of
                   cell 4.14's overflow pair (the cell sets Int16 K/V and cap 40,960 in CFG1).
                   8 query heads, not 32: the block product reads layers, KV heads, D and the
@@ -55,6 +57,7 @@ ROWS = (
     ("r9_d512_c64", 512, 64, 2, 4, 2),
     ("r9_d1024_c64", 1024, 64, 2, 4, 2),
     ("r9_l3_c4096", 48, 4096, 3, 4, 2),
+    ("r9_d48_c100", 48, 100, 2, 4, 2),
     ("r9_q8_c64", 128, 64, 36, 8, 8),
 )
 

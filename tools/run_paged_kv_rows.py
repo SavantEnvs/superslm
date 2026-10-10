@@ -21,6 +21,11 @@ WARMUP_TOKENS = 4
 BAR = 0.05
 LOCK_PATH = Path(r"D:\_scratch\SuperSLM\pkv-c6-timing.lock")
 
+# Rev 16.23 (T-3189 G-4): each refusal under the per-process rule has its own exit code, writes no timing record and
+# leaves the row ungraded: 79-6 a blob or manifest mismatch, 79-7 a seam-library build, 79-8 a token mismatch, 79-9 a
+# process with other than 104 timed pairs.
+EXIT_CODES = {}
+
 # slot -> {"n": mapped pages after the run, "P": pool pages, "m99": the guard bound}, at B = 64
 ROWS = {}
 # slot -> the same at B = 16, for 7.9-MR-OPT (slot R79MR)
@@ -81,3 +86,24 @@ def write_record(path, record):
 def read_record(path):
     """The record, or None when it is missing or torn (a torn record never supplies a verdict)."""
     return {}
+
+
+def check_row_blob(manifest_path, model_path, restore):
+    """79-6: the row's blob checked against its manifest before each process restores it: the manifest chain (each
+    piece's start, input digest and own digest), the model binding (the model file's SHA-256) and the stream
+    (seed 79, `restore` prompt tokens), and the final blob's digest. Returns (blob path, manifest SHA-256); raises
+    Refusal (exit code EXIT_CODES["blob"]) on any mismatch."""
+    return None
+
+
+def check_build_identity(identity_line):
+    """79-7: the production pair executable's identity line, checked once per process before timing; anything but
+    "PKV_PAIR_PRODUCTION_V2 defs=none" raises Refusal (exit code EXIT_CODES["seam"])."""
+    return None
+
+
+def grade_row(processes):
+    """processes: one dict per process, {"status": "ok", "median": float} or {"status": "refused", "kind": k}.
+    A row is graded only on five complete processes: {"graded": True, "verdict": row_verdict(...), "record": {...}};
+    otherwise {"graded": False, "verdict": None, "record": None, "exit_code": EXIT_CODES[kind of the first refusal]}."""
+    return None

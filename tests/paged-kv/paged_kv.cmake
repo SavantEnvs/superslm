@@ -169,3 +169,17 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|X64)$")
 		endif()
 	endforeach()
 endif()
+
+# Paged-KV plan rev 16.23, D-SLM8439: the C4 and C5 suites' fixture loader pins the generated fixtures to
+# B = 16 (pkv_common.h, PKV_PIN_GENERATED_FIXTURES). Until the builder defines the pin (T1), these executables
+# link the T0 stub, so they stay linkable and green on 2ebe5e3; the builder turns SUPERSLM_PKV_R9_STUB_PIN OFF
+# in the commit that defines it, which drops the stub here too.
+foreach(t superslm_pkv_c4 superslm_pkv_c5 superslm_pkv_c5_sse2_forced superslm_pkv_c5_avx2_forced superslm_pkv_c5_avx512_forced)
+	if(TARGET ${t})
+		target_compile_definitions(${t} PRIVATE PKV_PIN_GENERATED_FIXTURES=1)
+		if(SUPERSLM_PKV_R9_STUB_PIN)
+			target_sources(${t} PRIVATE ${PKV_DIR}/pkv_r9_stubs.cpp)
+			target_compile_definitions(${t} PRIVATE PKV_R9_STUB_PIN=1)
+		endif()
+	endif()
+endforeach()

@@ -10,6 +10,8 @@
 //              refused before the buffer check
 //   7.4c/box   on the unpinned 0.5B, a mid-page share adopt copies exactly page_bytes, read through the
 //              peek: 384 KiB at cap 4,096 and 768 KiB at cap 32,768; the mutant copying B = 16's page fails
+//   4.15/box   copy adopt across page geometries on the 0.5B at cap 4,096 (B = 64): page from contiguous at
+//              len 64 and 65, contiguous from page at len 100, refused; the controls admitted (rev 16.23)
 //   4.12/box   the harness check: every real-artifact cell records the B it ran at and asserts §3.1's rule
 //              (each cell above calls RecordB first)
 //
@@ -17,6 +19,7 @@
 //   qwen2.5-0.5b-instruct-cap4096-aex.sslm, qwen2.5-0.5b-instruct-cap32768-aex.sslm, qwen2.5-1.5b-instruct.sslm
 
 #include "pkv_r9.h"
+#include "pkv_r9_adopt415.h"
 
 namespace {
 
@@ -135,7 +138,15 @@ void Box74c() {
 	Box74cOn(bc::GetArtifact(k05B32k, kGeo05B32k), 768 * 1024);
 }
 
+void Box415() {
+	const Fixture& fx = bc::GetArtifact(k05B, kGeo05B);
+	if (!fx.ok) return;
+	RecordB(fx);
+	pkv::r9::c415::Cell415On(fx, 64, 64, 100);
+}
+
 PKV_CELL("4.6/box", "T1", Box46);
+PKV_CELL("4.15/box", "T3", Box415);
 PKV_CELL("2.9b/box", "T2", Box29b);
 PKV_CELL("7.4c/box", "T1", Box74c);
 

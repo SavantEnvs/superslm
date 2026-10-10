@@ -23,4 +23,11 @@ sslm_status sslm_kv_pool_create_contiguous(sslm_model, void*, size_t, uint32_t, 
 sslm_status KvPagesTestPinPagePositions(sslm_model, int64_t) { return SSLM_INVALID_ARGUMENT; }
 #endif
 
+// The geometry seam lands beside the pin at T1 (rev 16.23, D-SLM8437), so the pin's option guards both.
+#if defined(PKV_R9_STUB_PIN) && !defined(PKV_PIN_GENERATED_FIXTURES)
+sslm_status KvPagesTestPoolGeometry(const void*, size_t, uint32_t, KvPagesTestPoolGeometryOut*) {
+	return SSLM_INVALID_ARGUMENT;
+}
+#endif
+
 }  // extern "C"

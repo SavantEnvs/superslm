@@ -42,6 +42,11 @@
 static_assert(SSLM_KV_BUDGET_EXCEEDED == PKV_KV_BUDGET_EXCEEDED, "§3.6: SSLM_KV_BUDGET_EXCEEDED is ordinal 29");
 #endif
 
+#if defined(PKV_PIN_GENERATED_FIXTURES)
+// The test-only pin (paged-KV plan §3.1, D-SLM8440; declared beside the R9 surface in pkv_r9.h).
+extern "C" sslm_status KvPagesTestPinPagePositions(sslm_model model, int64_t page_positions);
+#endif
+
 namespace pkv {
 
 // ---- the registry and the checks -------------------------------------------------------------
@@ -158,7 +163,10 @@ struct Fixture {
 	Geometry geo{};
 	std::string sha;  // the file's SHA-256, matched against each .ref header
 	int32_t vocab = 256;
-	int64_t B() const { return geo.context_cap % 16 == 0 ? 16 : geo.context_cap; }  // §3.1, written here
+	// The page size the C2 to C6 cells were written at: 16 on the generated fixtures, which the loader pins in the
+	// C4 and C5 suites (paged-KV plan rev 16.23, D-SLM8439), and the cap on pkv_odd, which stays unpinned. A pinned
+	// value, not the rule (the rule's B is tests/paged-kv/pkv_r9.h's RuleB).
+	int64_t B() const { return geo.context_cap % 16 == 0 ? 16 : geo.context_cap; }
 	int64_t CapPages() const { return (geo.context_cap + B() - 1) / B(); }
 	// §3.4's R(budget), written here: min(ceil(budget / B) + 1, ceil(cap / B)).
 	int64_t R(int64_t budget) const {
@@ -211,6 +219,21 @@ inline const Fixture& GetFixture(const char* stem) {
 		const sslm_status st = sslm_model_map(f->bytes.p, f->size, &f->model);
 		PKV_CHECK_MSG(st == SSLM_OK, "sslm_model_map(%s) == %d", stem, static_cast<int>(st));
 		f->ok = st == SSLM_OK;
+#if defined(PKV_PIN_GENERATED_FIXTURES)
+		// D-SLM8439: the C4 and C5 suites' generated fixtures run at B = 16, the page size their assertions are
+		// written at. CFG1's kv_block_size 16 gives it on 2ebe5e3; from T1 the rule ignores CFG1, and the test-only
+		// pin gives it. The pin's SSLM_OK is required only once the T0 stub is gone; B == 16 is required always.
+		if (f->ok && std::string(stem) != "pkv_odd") {
+			const sslm_status pin = KvPagesTestPinPagePositions(f->model, 16);
+#if !defined(PKV_R9_STUB_PIN)
+			PKV_CHECK_MSG(pin == SSLM_OK, "the pin of %s to B = 16 is refused (%d)", stem, static_cast<int>(pin));
+#else
+			(void)pin;
+#endif
+			PKV_CHECK_MSG(sslm_kv_page_positions(f->model) == 16, "%s runs at B = %lld after the loader's pin, not 16", stem,
+			              static_cast<long long>(sslm_kv_page_positions(f->model)));
+		}
+#endif
 	} else {
 		PKV_CHECK_MSG(false, "fixture %s/%s.sslm not found or empty", dir ? dir : "(unset)", stem);
 	}

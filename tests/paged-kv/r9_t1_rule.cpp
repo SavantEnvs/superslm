@@ -19,6 +19,14 @@
 
 #include "pkv_r9.h"
 
+// T-3195 (re-strike of rev 16.23, lesser plane): 4.10's seam tie compares the seam, which reads the unloaded artifact
+// and so the derived B, with the verbs on fixtures loaded by pkv_common.h's GetFixture. That loader pins the
+// generated fixtures to B = 16 only where PKV_PIN_GENERATED_FIXTURES is defined (the C4 and C5 suites, D-SLM8439);
+// this executable must load them unpinned, and this guard makes a build that would pin them refuse to compile.
+#if defined(PKV_PIN_GENERATED_FIXTURES)
+#error "superslm_pkv_r9 loads the generated fixtures unpinned (4.10's seam tie, 4.13); PKV_PIN_GENERATED_FIXTURES is the C4 and C5 suites' alone"
+#endif
+
 namespace {
 
 using namespace pkv;
@@ -296,35 +304,44 @@ void Cell410Extremes() {
 }
 
 // 4.10 [T1]. A hostile head_dim, D = 2^20 and 2^31 (both even, so the loader's CFG1 checks admit
-// them), on the CFG1-and-sigmoid-only fixture the plan specifies. The value asserted is 16.
-// MODEL GAP (routed to the planner, record §4): sslm_kv_page_positions takes an sslm_model, and
-// sslm_model_map runs BuildEngineCache, which marshals every layer's WGT1 weights; a CFG1-only
-// artifact therefore cannot be mapped, and no seam evaluates the rule on a loaded view. The cell
-// records the loader's status and the map status, and fails while the gap stands.
+// them), on the CFG1-and-sigmoid-only fixture the plan specifies; B is 16 with no 32-bit wrap. Rev 16.23
+// (D-SLM8437, T-3189 G-1): neither fixture maps (sslm_model_map builds the engine cache from WGT1 weights they
+// do not carry), so B is read through the geometry seam over the loaded config.
+superslm_test::Cfg1Spec SmallCfg1(uint32_t layers, uint32_t heads, uint32_t kv_heads, uint32_t D, uint32_t cap,
+                                  uint32_t precision) {
+	superslm_test::Cfg1Spec spec;
+	spec.hidden_size = 2;
+	spec.num_hidden_layers = layers;
+	spec.num_attention_heads = heads;
+	spec.num_key_value_heads = kv_heads;
+	spec.head_dim = D;
+	spec.intermediate_size = 2;
+	spec.vocab_size = 256;
+	spec.context_cap = cap;
+	spec.kv_precision = precision;
+	spec.kv_block_size = 16;
+	return spec;
+}
+
+bool SeamOf(const std::vector<uint8_t>& artifact, uint32_t blocks, KvPagesTestPoolGeometryOut* out, const char* what) {
+	*out = KvPagesTestPoolGeometryOut{};
+	const sslm_status st = KvPagesTestPoolGeometry(artifact.data(), artifact.size(), blocks, out);
+	PKV_CHECK_MSG(st == SSLM_OK, "%s: KvPagesTestPoolGeometry = %s", what, AbiStatusName(st));
+	return st == SSLM_OK;
+}
+
 void Cell410HostileD() {
 	for (uint64_t D : {uint64_t{1} << 20, uint64_t{1} << 31}) {
-		superslm_test::Cfg1Spec spec;
-		spec.hidden_size = 2;
-		spec.num_hidden_layers = 2;
-		spec.num_attention_heads = 1;
-		spec.num_key_value_heads = 1;
-		spec.head_dim = static_cast<uint32_t>(D);
-		spec.intermediate_size = 2;
-		spec.vocab_size = 256;
-		spec.context_cap = 4096;
-		spec.kv_precision = 0;
-		spec.kv_block_size = 16;
-		const std::vector<uint8_t> b = Cfg1OnlyArtifact(spec);
+		const std::vector<uint8_t> b = Cfg1OnlyArtifact(SmallCfg1(2, 1, 1, static_cast<uint32_t>(D), 4096, 0));
 		std::string err;
 		const superslm::SslmModelStatus ls = LoadStatus(b, &err);
-		Fixture fx;
-		sslm_status ms = SSLM_OK;
-		MapInto(b, "cfg1only_d" + std::to_string(D), Geometry{2, 1, static_cast<uint32_t>(D), 4096}, &fx, &ms);
-		std::printf("  D = %llu: SslmModel::Load = %s (%s); sslm_model_map = %s\n", static_cast<unsigned long long>(D),
-		            superslm::SslmModelStatusName(ls), err.c_str(), AbiStatusName(ms));
-		PKV_CHECK_MSG(fx.ok, "D = %llu: the CFG1-only fixture does not map (%s), so B cannot be read (model gap)",
-		              static_cast<unsigned long long>(D), AbiStatusName(ms));
-		if (fx.ok) PKV_CHECK_EQ(sslm_kv_page_positions(fx.model), 16);
+		PKV_CHECK_MSG(ls == superslm::SslmModelStatus::Ok, "D = %llu: the loader refuses the fixture: %s (%s)",
+		              static_cast<unsigned long long>(D), superslm::SslmModelStatusName(ls), err.c_str());
+		KvPagesTestPoolGeometryOut g;
+		const std::string what = "D = " + std::to_string(D);
+		if (SeamOf(b, 1, &g, what.c_str()))
+			PKV_CHECK_MSG(g.page_positions == 16, "%s: B = %lld through the seam, 16 owed", what.c_str(),
+			              static_cast<long long>(g.page_positions));
 		PKV_CHECK_EQ(RuleB(D, 4096, 1), 16);
 	}
 }
@@ -354,6 +371,92 @@ void Cell410Generality() {
 		              r.D, static_cast<long long>(r.cap), static_cast<long long>(sslm_kv_page_positions(a.fx.model)),
 		              static_cast<long long>(r.want));
 	}
+	// Rev 16.23 (D-SLM8437): the same rows as CFG1-only fixtures at each model's own layers and heads, through the
+	// geometry seam; the page bytes follow from them, so the seam's page_size is asserted too.
+	struct Cfg { const char* model; uint32_t L, Hq, Hkv, D, cap; int64_t want; };
+	const Cfg cfgs[] = {
+	    {"Qwen2.5-0.5B", 24, 14, 2, 64, 4096, 64},  {"Qwen2.5-0.5B", 24, 14, 2, 64, 32768, 128},
+	    {"Qwen2.5-1.5B", 28, 12, 2, 128, 4096, 64}, {"Qwen2.5-1.5B", 28, 12, 2, 128, 32768, 64},
+	    {"Qwen2.5-3B", 36, 16, 2, 128, 4096, 64},   {"Qwen2.5-3B", 36, 16, 2, 128, 32768, 64},
+	    {"Qwen2.5-7B", 28, 28, 4, 128, 4096, 64},   {"Qwen2.5-7B", 28, 28, 4, 128, 32768, 64},
+	    {"Qwen3-0.6B/1.7B", 28, 16, 8, 128, 4096, 64}, {"Qwen3-0.6B/1.7B", 28, 16, 8, 128, 40960, 64},
+	    {"Qwen3-4B/8B", 36, 32, 8, 128, 4096, 64},  {"Qwen3-4B/8B", 36, 32, 8, 128, 40960, 64},
+	};
+	for (const Cfg& c : cfgs) {
+		const std::vector<uint8_t> b = Cfg1OnlyArtifact(SmallCfg1(c.L, c.Hq, c.Hkv, c.D, c.cap, 0));
+		KvPagesTestPoolGeometryOut g;
+		const std::string what = std::string(c.model) + " at cap " + std::to_string(c.cap);
+		if (!SeamOf(b, 1, &g, what.c_str())) continue;
+		PKV_CHECK_EQ(RuleB(c.D, c.cap, 1), c.want);
+		PKV_CHECK_MSG(g.page_positions == c.want && g.page_size == size_t{c.L} * 2 * c.Hkv * c.D * static_cast<size_t>(c.want),
+		              "%s: B %lld and page %zu through the seam; %lld and %zu owed", what.c_str(),
+		              static_cast<long long>(g.page_positions), g.page_size, static_cast<long long>(c.want),
+		              size_t{c.L} * 2 * c.Hkv * c.D * static_cast<size_t>(c.want));
+	}
+}
+
+// 4.10 [T1], rev 16.23 (D-SLM8437, T-3189 G-1): the seam tie. On every fixture the suite maps, the seam's values
+// equal the verbs' at block_count 1, 343 and the 2.9b and 2.9c thresholds: page_positions, page_size,
+// block_size and overhead equal the verbs; page_count_fits and requirement_fits together equal the create's
+// verdict on a buffer smaller than any requirement (SSLM_BUFFER_TOO_SMALL when both fit, SSLM_INVALID_ARGUMENT
+// otherwise), and requirement_fits equals the verbs' own block and overhead summed in the test. Mutant: a seam
+// with its own copy of the sizing that omits the slack term, which fails at pkv_odd's overhead (96,808 against 40).
+void Cell410SeamTie() {
+	struct Tied { std::string what; const Fixture* fx; };
+	std::vector<Tied> fixtures;
+	for (const char* stem : {"pkv_def", "pkv_32k", "pkv_qk", "pkv_odd"}) fixtures.push_back({stem, &GetFixture(stem)});
+	fixtures.push_back({"r9_d2_c8", &D2Cap8()});
+	fixtures.push_back({"r9_d48_c100", &Get("r9_d48_c100", Geometry{2, 2, 48, 100})});
+	fixtures.push_back({"r9_d64_c4096", &D64Cap(4096)});
+	fixtures.push_back({"r9_d512_c64", &D512()});
+	fixtures.push_back({"r9_d1024_c64", &D1024()});
+	static Fixture q8big;  // 4.14's Qwen3-8B K/V shape, Int16, cap 40,960
+	if (!q8big.ok && Q8().ok) {
+		Variant v;
+		v.cap = 40960;
+		v.kv_precision = 1;
+		v.strip_rope = true;
+		MakeVariant(Q8(), v, &q8big);
+	}
+	fixtures.push_back({"r9_q8 Int16 cap 40,960", &q8big});
+	for (const Tied& f : fixtures) {
+		// like with like: every fixture here is at the derived B (the seam's), never the C4 loader's pinned 16
+		if (f.fx->ok)
+			PKV_CHECK_MSG(sslm_kv_page_positions(f.fx->model) ==
+			                  RuleB(f.fx->geo.head_dim, static_cast<uint64_t>(f.fx->geo.context_cap), f.what.find("Int16") != std::string::npos ? 2 : 1),
+			              "%s is not at the rule's B (a pinned fixture would make the tie compare unlike with unlike)", f.what.c_str());
+		if (!f.fx->ok) {
+			PKV_CHECK_MSG(false, "%s did not map", f.what.c_str());
+			continue;
+		}
+		const std::vector<uint8_t> bytes(f.fx->bytes.p, f.fx->bytes.p + f.fx->size);
+		const int64_t B = sslm_kv_page_positions(f.fx->model);
+		const uint64_t pages = B > 0 ? static_cast<uint64_t>(CeilDiv(f.fx->geo.context_cap, B)) : 1;
+		for (uint32_t n : {1u, 343u, static_cast<uint32_t>(UINT32_MAX / pages), 252645135u}) {
+			KvPagesTestPoolGeometryOut g;
+			const std::string what = f.what + " at " + std::to_string(n) + " blocks";
+			if (!SeamOf(bytes, n, &g, what.c_str())) continue;
+			const size_t block = sslm_kv_block_size(f.fx->model), overhead = sslm_kv_pool_overhead_size(f.fx->model, n);
+			PKV_CHECK_MSG(g.page_positions == B && g.page_size == sslm_kv_page_size(f.fx->model) && g.block_size == block &&
+			                  g.overhead == overhead,
+			              "%s: seam (B %lld, page %zu, block %zu, overhead %zu) against the verbs (%lld, %zu, %zu, %zu)",
+			              what.c_str(), static_cast<long long>(g.page_positions), g.page_size, g.block_size, g.overhead,
+			              static_cast<long long>(B), sslm_kv_page_size(f.fx->model), block, overhead);
+			AlignedBuf tiny(4096);
+			sslm_kv_pool pool = nullptr;
+			const sslm_status st = sslm_kv_pool_create(f.fx->model, tiny.p, tiny.n, n, &pool);
+			if (pool) sslm_kv_pool_destroy(pool);
+			PKV_CHECK_MSG((g.page_count_fits && g.requirement_fits) == (st == SSLM_BUFFER_TOO_SMALL),
+			              "%s: seam fits (pages %d, requirement %d) against the create's %s", what.c_str(), g.page_count_fits,
+			              g.requirement_fits, AbiStatusName(st));
+			const bool sum_fits = overhead != SIZE_MAX && block <= (SIZE_MAX - overhead) / n;
+			PKV_CHECK_MSG((g.requirement_fits != 0) == sum_fits, "%s: requirement_fits %d, the verbs' sum fits %d",
+			              what.c_str(), g.requirement_fits, sum_fits ? 1 : 0);
+		}
+	}
+	// separation of the slack-omitting copy at pkv_odd (D = 48, cap 4,100, B = 256: 252 slack positions of 384 bytes)
+	const Lay odd = LayoutOf(Geometry{2, 2, 48, 4100}, 1, 256);
+	PKV_CHECK(odd.Overhead(1) == 96808u && 8u + 32u != odd.Overhead(1));
 }
 
 // 4.11 [T1]. Header independence: kv_block_size in {1, 16, 32, 4,096, 0xFFFFFFFF} gives the rule's B
@@ -450,6 +553,7 @@ PKV_CELL("4.10/T1:boundary", "T1", Cell410Boundary);
 PKV_CELL("4.10/T1:extremes", "T1", Cell410Extremes);
 PKV_CELL("4.10/T1:hostile-d", "T1", Cell410HostileD);
 PKV_CELL("4.10/T1:generality", "T1", Cell410Generality);
+PKV_CELL("4.10/T1:seam-tie", "T1", Cell410SeamTie);
 PKV_CELL("4.11/T1", "T1", Cell411);
 PKV_CELL("4.12/T1:refusals", "T1", Cell412Refusals);
 PKV_CELL("4.12/T1:pins", "T1", Cell412Pins);

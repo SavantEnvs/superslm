@@ -209,7 +209,7 @@ void Cell711() {
 }
 
 // 9.3 [T2], the pkv_odd restore side (rev 16.22): the paged build's legacy save of persist saved,
-// written for the OLD reader (tests/paged-kv/r9_old_reader.ps1 builds tests/paged-kv/r9_old_reader.cpp
+// written for the OLD reader (tests/paged-kv/r9_old_reader.ps1 builds tests/paged-kv/pkv_r9_old_reader.cpp
 // against the frozen v1.11.0 library, restores this file and continues it). The release's reader checks
 // `n <` only, so it cannot see a grown section; 9.2b's digest is the separating assertion, and this
 // cell's own digest check repeats it on the file it hands over.
