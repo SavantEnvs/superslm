@@ -10,7 +10,8 @@
 //   6.7/T1:layouts    SSB6 and the legacy SSB5 saved at one B restore at another: pinned 16 -> derived,
 //                     derived -> pinned 1, the one-page view (pinned to the cap) -> derived
 //   6.7/T1:old-blobs  v1.11.0's pinned contiguous blobs restore at the derived B
-//   6.7/T1:reshare    sslm_seq_restore_shared across layouts at origins 1,200 and 1,024
+//   6.7/T1:reshare    sslm_seq_restore_shared across layouts at origins 1,200 and 1,024: four must-accepts and
+//                     the must-reject 128 -> 1 at 1,200 (rev 16.24, D-SLM8442; T-3196 F-1)
 //   6.8/T1            adopt's tail copy, begin_from's tail copy, a materialized restore and release
 //                     poison on a reserve scattered by churn, at the derived B
 //
@@ -220,6 +221,51 @@ void Cell66b() {
 		if (a) sslm_seq_release(a);
 		if (b) sslm_seq_release(b);
 	}
+	// The gather mutant (plan 6.7: a gather that walks physical page order instead of logical order; T-3196 F-10).
+	// It is invisible wherever a holder's table ascends in physical id, as every fresh-pool holder above does, so
+	// this member scatters the reserve first (6.8's churn) and asserts from the engine's own table that the holder's
+	// pages do not ascend. Its save's rows are then graded against the flat twin, which no gather order can fake,
+	// and its restore against the save.
+	{
+		PagePoolOf pool(fx.model, 240, y.page_bytes);
+		PKV_CHECK_EQ(pool.status, SSLM_OK);
+		if (pool.pool) {
+			std::vector<sslm_seq> made;
+			for (int i = 0; i < 80; ++i) {
+				sslm_seq c = nullptr;
+				if (sslm_seq_create_budgeted(fx.model, &pool.pool, 1, &c) == SSLM_OK) made.push_back(c);
+			}
+			PKV_CHECK_EQ(made.size(), 80u);
+			for (uint32_t i : Shuffled(static_cast<uint32_t>(made.size()), 66001u)) sslm_seq_release(made[i]);
+			sslm_seq h = nullptr;
+			PKV_CHECK_EQ(sslm_seq_create_budgeted(fx.model, &pool.pool, 1200, &h), SSLM_OK);
+			if (h) {
+				const AbiWidth w = RunAbiWidth(fx.model, h, W, fx.vocab, true);
+				PKV_CHECK_EQ(w.prefill, SSLM_OK);
+				PKV_CHECK_EQ(w.ready, twin.ready);
+				PKV_CHECK_EQ(w.decode1, twin.decode1);
+				std::vector<uint32_t> table;
+				PKV_CHECK(legacy_a::SeqTable(h, &table) && static_cast<int64_t>(table.size()) >= CeilDiv(W + 1, B));
+				const bool scattered = !std::is_sorted(table.begin(), table.end());
+				PKV_CHECK_MSG(scattered, "construction: the churned holder's %zu pages ascend in physical id, so a "
+				              "physical-order gather would pass", table.size());
+				const std::vector<uint8_t> blob = bc::Save(h);
+				PKV_CHECK(IsMagic(blob, "SSB6"));
+				std::vector<uint8_t> rows;
+				PKV_CHECK_MSG(BlobRows(blob, fx, HiddenSize(fx), W + 1, &rows) && Sha(rows.data(), rows.size()) == twin.rows_decode1,
+				              "the scattered holder's save: rows [0, %lld) differ from the flat twin's (kills the "
+				              "physical-order gather)", static_cast<long long>(W + 1));
+				CheckRowsVsBlob("scattered budget holder", pool.pool, h, fx, B, W + 1, blob);
+				sslm_seq r = nullptr;
+				PKV_CHECK_EQ(sslm_seq_restore(fx.model, &pool.pool, blob.data(), blob.size(), &r), SSLM_OK);
+				if (r) {
+					CheckRowsVsBlob("its restore", pool.pool, r, fx, B, W + 1, blob);
+					sslm_seq_release(r);
+				}
+				sslm_seq_release(h);
+			}
+		}
+	}
 	// SharingHandleMatches: a frozen prefix of 1,040 positions (65 pages) re-shared on restore.
 	{
 		PagePoolOf pool(fx.model, 200, y.page_bytes);
@@ -315,7 +361,9 @@ void Cell67Layouts() {
 			if (!MakeSide(d.from_pin, &from) || !MakeSide(d.to_pin, &to)) continue;
 			CrossLayout(Fmt("%s, %s", d.name, budget ? "SSB6" : "SSB5").c_str(), from, to, budget);
 		}
-	// The gather mutant (physical page order instead of logical) is 6.8's construction.
+	// The gather mutant (physical page order instead of logical) is 6.6b's: its churned member asserts a scattered
+	// table and grades the save against the flat twin (T-3196 F-10). These fresh-pool layouts ascend in physical id,
+	// and 6.8 compares a restore with its own blob, so neither separates it.
 }
 
 // v1.11.0's contiguous blobs (the pinned SSB5 blobs) restore at the derived B, tokens equal the reference.
@@ -339,55 +387,81 @@ void Cell67OldBlobs() {
 	sslm_seq_release(r);
 }
 
-// The re-share branch across layouts (T-3162 G-2): the blob's rows differ from the live prefix's only
-// inside [floor(origin/B) * B, origin) at the restoring B; the compare passes there, and the restore
-// shares exactly floor(origin/B) pages.
+// The re-share branch across layouts (T-3162 G-2; T-3196 F-1). The identity compare spans
+// floor(origin/Bt) * Bt positions at the restoring Bt (SharingHandleMatches' memcmp), so a blob whose prefix
+// differs from the live prefix's only inside [floor(origin/Bt) * Bt, origin) re-shares exactly floor(origin/Bt)
+// pages, and one that differs inside the span takes the private path and shares none.
+//
+// Members, and the mutant each separates (plan cell 6.7's two: a span at the saving grain, a span of `origin`):
+//   16 -> derived 128, origin 1,200, differs on [1,152, 1,200): must share 9. The saving grain's span is 1,200
+//        (1,200 is a multiple of 16) and the span of `origin` is 1,200: both compare the differing tail, take the
+//        private path and share 0. Both mutants die here.
+//   16 -> derived 128, origin 1,024, no difference: must share 8 (aligned; neither mutant separates).
+//   derived 128 -> pinned 1, origins 1,200 and 1,024, no difference: must share 1,200 and 1,024 (at B = 1 every
+//        origin is aligned, so there is no in-page tail to differ on; neither mutant separates).
+//   derived 128 -> pinned 1, origin 1,200, differs on [1,152, 1,200): must share 0 (the restoring span, 1,200,
+//        covers the difference). The saving grain's span is 1,152, which stops short of it: that mutant passes the
+//        compare and shares. This is the saving-grain mutant's separation in the derived -> pinned 1 direction.
+//   The span of `origin` is the correct span at B = 1 (floor(origin/1) * 1 = origin), an equivalent mutant in this
+//   direction by arithmetic; it is separated in the 16 -> derived direction above, and nowhere else.
+// (Executed on 2ebe5e3 with the engine's B set by CFG1, both grains: the record's F-1 row.)
 void Cell67Reshare() {
-	struct Dir { int64_t from_pin, to_pin; };
-	for (Dir d : {Dir{16, 0}, Dir{0, 1}})
-		for (int32_t origin : {1200, 1024}) {
-			Side from, to;
-			if (!MakeSide(d.from_pin, &from) || !MakeSide(d.to_pin, &to)) continue;
-			const int64_t Bt = to.B, keep = (origin / Bt) * Bt;
-			// The source prefix agrees with the live prefix on [0, keep) and differs after it.
-			std::vector<int32_t> live = Stream(51, origin, to.fx.vocab), src = live;
-			for (int64_t i = keep; i < origin; ++i) src[static_cast<size_t>(i)] = (src[static_cast<size_t>(i)] + 1) % to.fx.vocab;
-			if (keep == origin) src.back() = (src.back() + 1) % to.fx.vocab;  // aligned: keep the tail different too
-			const Lay yf = LayoutOf(from.fx.geo, 1, from.B), yt = LayoutOf(to.fx.geo, 1, to.B);
-			PagePoolOf pf(from.fx.model, static_cast<uint32_t>(2 * yf.pages + 4), yf.page_bytes);
-			PagePoolOf pt(to.fx.model, static_cast<uint32_t>(2 * yt.pages + 4), yt.page_bytes);
-			if (pf.status != SSLM_OK || pt.status != SSLM_OK) {
-				PKV_CHECK_MSG(false, "pools: %s / %s", AbiStatusName(pf.status), AbiStatusName(pt.status));
-				continue;
-			}
-			sslm_prefix sp = bc::BudgetPrefix(from.fx, &pf.pool, src);
-			sslm_prefix lp = bc::BudgetPrefix(to.fx, &pt.pool, live);
-			sslm_seq s = nullptr, r = nullptr;
-			PKV_CHECK_EQ(sslm_seq_create_budgeted(from.fx.model, &pf.pool, 64, &s), SSLM_OK);
-			if (sp && lp && s) {
-				PKV_CHECK_EQ(sslm_seq_adopt_prefix(s, sp), SSLM_OK);
-				bc::DecodeN(from.fx.model, s, 4);
-				const std::vector<uint8_t> blob = bc::Save(s);
-				uint32_t shared = 999;
-				PKV_CHECK_EQ(sslm_seq_restore_shared(to.fx.model, &pt.pool, blob.data(), blob.size(), lp, &r, &shared), SSLM_OK);
-				// diagnostic count, cross-checked by the table: the leading floor(origin/B) entries are lp's
-				const uint32_t owed = static_cast<uint32_t>(origin / Bt);
-				PKV_CHECK_MSG(shared == owed, "%lld -> %lld at origin %d: shared %u pages, %u owed (a compare span at the "
-				              "saving grain or of `origin` takes the private path)", static_cast<long long>(from.B),
-				              static_cast<long long>(Bt), origin, shared, owed);
-				if (r) {
-					std::vector<uint8_t> rows, blob_rows;
-					const int64_t L = origin + 3;
-					PKV_CHECK_MSG(SeqRows(pt.pool, r, to.fx.geo, 1, Bt, L, Rot::kRotated, &rows) &&
-					                  BlobRows(blob, from.fx, HiddenSize(from.fx), L, &blob_rows) && rows == blob_rows,
-					              "origin %d: the restored rows equal the blob's", origin);
-					sslm_seq_release(r);
-				}
-			}
-			if (s) sslm_seq_release(s);
-			if (sp) sslm_prefix_release(sp);
-			if (lp) sslm_prefix_release(lp);
+	struct Member { int64_t from_pin, to_pin; int32_t origin, differ_from; int64_t owed; const char* kills; };
+	const Member members[] = {
+	    {16, 0, 1200, 1152, 9, "the saving-grain span and the span of origin"},
+	    {16, 0, 1024, 1024, 8, "-"},
+	    {0, 1, 1200, 1200, 1200, "-"},
+	    {0, 1, 1024, 1024, 1024, "-"},
+	    {0, 1, 1200, 1152, 0, "the saving-grain span"},
+	};
+	for (const Member& m : members) {
+		Side from, to;
+		if (!MakeSide(m.from_pin, &from) || !MakeSide(m.to_pin, &to)) continue;
+		const int64_t Bt = to.B;
+		// The source prefix agrees with the live prefix on [0, differ_from) and differs on [differ_from, origin).
+		std::vector<int32_t> live = Stream(51, m.origin, to.fx.vocab), src = live;
+		for (int64_t i = m.differ_from; i < m.origin; ++i)
+			src[static_cast<size_t>(i)] = (src[static_cast<size_t>(i)] + 1) % to.fx.vocab;
+		const bool must_share = m.owed > 0;
+		PKV_CHECK_MSG(must_share == (m.differ_from >= (m.origin / Bt) * Bt),
+		              "construction: the difference [%d, %d) lies %s the restoring span [0, %lld)", m.differ_from, m.origin,
+		              must_share ? "outside" : "inside", static_cast<long long>((m.origin / Bt) * Bt));
+		const Lay yf = LayoutOf(from.fx.geo, 1, from.B), yt = LayoutOf(to.fx.geo, 1, to.B);
+		PagePoolOf pf(from.fx.model, static_cast<uint32_t>(2 * yf.pages + 4), yf.page_bytes);
+		PagePoolOf pt(to.fx.model, static_cast<uint32_t>(2 * yt.pages + 4), yt.page_bytes);
+		if (pf.status != SSLM_OK || pt.status != SSLM_OK) {
+			PKV_CHECK_MSG(false, "pools: %s / %s", AbiStatusName(pf.status), AbiStatusName(pt.status));
+			continue;
 		}
+		sslm_prefix sp = bc::BudgetPrefix(from.fx, &pf.pool, src);
+		sslm_prefix lp = bc::BudgetPrefix(to.fx, &pt.pool, live);
+		sslm_seq s = nullptr, r = nullptr;
+		PKV_CHECK_EQ(sslm_seq_create_budgeted(from.fx.model, &pf.pool, 64, &s), SSLM_OK);
+		if (sp && lp && s) {
+			PKV_CHECK_EQ(sslm_seq_adopt_prefix(s, sp), SSLM_OK);
+			bc::DecodeN(from.fx.model, s, 4);
+			const std::vector<uint8_t> blob = bc::Save(s);
+			uint32_t shared = 999;
+			PKV_CHECK_EQ(sslm_seq_restore_shared(to.fx.model, &pt.pool, blob.data(), blob.size(), lp, &r, &shared), SSLM_OK);
+			PKV_CHECK_MSG(shared == static_cast<uint32_t>(m.owed),
+			              "%lld -> %lld at origin %d, differing on [%d, %d): shared %u pages, %lld owed (kills: %s)",
+			              static_cast<long long>(from.B), static_cast<long long>(Bt), m.origin, m.differ_from, m.origin,
+			              shared, static_cast<long long>(m.owed), m.kills);
+			if (r) {
+				std::vector<uint8_t> rows, blob_rows;
+				const int64_t L = m.origin + 3;
+				PKV_CHECK_MSG(SeqRows(pt.pool, r, to.fx.geo, 1, Bt, L, Rot::kRotated, &rows) &&
+				                  BlobRows(blob, from.fx, HiddenSize(from.fx), L, &blob_rows) && rows == blob_rows,
+				              "origin %d: the restored rows equal the blob's", m.origin);
+				PKV_CHECK_MSG(bc::DecodeN(to.fx.model, r, 4) == bc::DecodeN(from.fx.model, s, 4),
+				              "origin %d: the restored holder's next 4 tokens equal the source's", m.origin);
+				sslm_seq_release(r);
+			}
+		}
+		if (s) sslm_seq_release(s);
+		if (sp) sslm_prefix_release(sp);
+		if (lp) sslm_prefix_release(lp);
+	}
 }
 
 // ---- 6.8 -----------------------------------------------------------------------------------------

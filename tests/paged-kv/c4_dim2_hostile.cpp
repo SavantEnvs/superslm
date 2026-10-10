@@ -302,6 +302,7 @@ void Cell29() {
 // (SSLM_BUFFER_TOO_SMALL against a deliberately tiny buffer, nothing drawn, the buffer untouched), and
 // the overhead verb sizes it without saturating. UINT32_MAX - 1 behaves the same. (Review S1: an
 // earlier fix refused the exact maximum too; its module twin is "2.9b/C3" in superslm_pkv_c3.)
+#if !defined(PKV_T2_FALLBACK_RETIRED)  // D-SLM8448: retires at T2 with the one-page fallback (PKV_T2_FALLBACK_RETIRED, SUPERSLM_PKV_T2_FALLBACK_RETIRED); 2.9c carries the property
 void Cell29b() {
 	const Fixture& fx = GetFixture("pkv_odd");
 	if (!fx.ok) return;
@@ -333,10 +334,13 @@ void Cell29b() {
 		PKV_CHECK_MSG(untouched, "the refused create (block_count %u) wrote nothing into the caller's buffer", n);
 	}
 }
+#endif
 
 PKV_CELL("2.3/C4", "C4", Cell23Legacy);
 PKV_CELL("2.4", "C4", Cell24);
 PKV_CELL("2.9", "C4", Cell29);
+#if !defined(PKV_T2_FALLBACK_RETIRED)
 PKV_CELL("2.9b", "C4", Cell29b);
+#endif
 
 }  // namespace

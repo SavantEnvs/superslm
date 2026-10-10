@@ -14,6 +14,17 @@
 
 set(PKV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests/paged-kv)
 
+# Paged-KV plan rev 16.24: the two test-side switches the R9 builder flips, each in the commit that lands the
+# behaviour it follows. Both default to 2ebe5e3's behaviour, so every C2 to C6 and R0 suite stays green there.
+#   SUPERSLM_PKV_T1_ROTATED_LAYOUT (D-SLM8449): ON in the T1 commit that lands rotation. Every test-side in-page
+#     address (pkv_common.h, PageRunOffset) becomes §3.1's rotated slot (r + j) mod runs, and the C2 engine view
+#     carries the run count.
+#   SUPERSLM_PKV_T2_FALLBACK_RETIRED (D-SLM8448): ON in the T2 commit that removes the one-page fallback. The eight
+#     C4, C5 and R0 cells' pkv_odd fallback assertions retire (plan §26.5's table), and Fixture::B() reads the rule's
+#     256 for pkv_odd.
+option(SUPERSLM_PKV_T1_ROTATED_LAYOUT "Paged-KV tests address pages rotated (R9 T1, D-SLM8449)" OFF)
+option(SUPERSLM_PKV_T2_FALLBACK_RETIRED "Paged-KV tests retire pkv_odd's one-page fallback cells (R9 T2, D-SLM8448)" OFF)
+
 function(superslm_pkv_target name)
 	cmake_parse_arguments(PKV "" "LIBRARY" "SOURCES" ${ARGN})
 	if(NOT PKV_LIBRARY)
@@ -23,6 +34,12 @@ function(superslm_pkv_target name)
 	target_link_libraries(${name} PRIVATE ${PKV_LIBRARY})
 	target_include_directories(${name} PRIVATE ${PKV_DIR} include src tests)
 	target_compile_definitions(${name} PRIVATE PKV_REFERENCE_DIR="${PKV_DIR}/reference")
+	if(SUPERSLM_PKV_T1_ROTATED_LAYOUT)
+		target_compile_definitions(${name} PRIVATE PKV_T1_ROTATED_LAYOUT=1)
+	endif()
+	if(SUPERSLM_PKV_T2_FALLBACK_RETIRED)
+		target_compile_definitions(${name} PRIVATE PKV_T2_FALLBACK_RETIRED=1)
+	endif()
 	if(MSVC)
 		target_compile_options(${name} PRIVATE /W4 /fp:precise)
 	else()
@@ -154,13 +171,14 @@ add_executable(superslm_pkv_r9_pin_link_probe EXCLUDE_FROM_ALL ${PKV_DIR}/pkv_r9
 target_link_libraries(superslm_pkv_r9_pin_link_probe PRIVATE superslm)
 target_include_directories(superslm_pkv_r9_pin_link_probe PRIVATE ${PKV_DIR} include)
 
-# Cell 4.13 [T1]'s forced-SIMD half: the derived-B crossing (tests/paged-kv/r9_t1_crossing.cpp) linked
-# against each forced-tier library, as the C5 tier legs are; run by id, e.g.
-#   superslm_pkv_r9_avx2_forced 4.13/T1 4.6/T1
+# Cell 4.13's forced-SIMD half: the derived-B crossing (tests/paged-kv/r9_t1_crossing.cpp, T1) and the cap-4,100
+# member at the partial last page (tests/paged-kv/r9_t2_partial.cpp, 4.13/T2:cap4100; T-3196 F-13) linked against each
+# forced-tier library, as the C5 tier legs are; run by id, e.g.
+#   superslm_pkv_r9_avx2_forced 4.13/T1 4.6/T1 4.13/T2:cap4100
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|X64)$")
 	foreach(tier sse2 avx2 avx512)
 		superslm_pkv_target(superslm_pkv_r9_${tier}_forced LIBRARY superslm_${tier}_forced
-			SOURCES ${PKV_DIR}/r9_t1_crossing.cpp ${PKV_DIR}/pkv_r9_stubs.cpp)
+			SOURCES ${PKV_DIR}/r9_t1_crossing.cpp ${PKV_DIR}/r9_t2_partial.cpp ${PKV_DIR}/pkv_r9_stubs.cpp)
 		if(SUPERSLM_PKV_R9_STUB_CONTIGUOUS)
 			target_compile_definitions(superslm_pkv_r9_${tier}_forced PRIVATE PKV_R9_STUB_CONTIGUOUS=1)
 		endif()
@@ -181,5 +199,21 @@ foreach(t superslm_pkv_c4 superslm_pkv_c5 superslm_pkv_c5_sse2_forced superslm_p
 			target_sources(${t} PRIVATE ${PKV_DIR}/pkv_r9_stubs.cpp)
 			target_compile_definitions(${t} PRIVATE PKV_R9_STUB_PIN=1)
 		endif()
+	endif()
+endforeach()
+
+# Paged-KV plan rev 16.24, D-SLM8447: the C6 cells read B from §3.1's rule (PKV_FIXTURE_B_FROM_RULE), never the C4
+# and C5 pinned 16, so their cloud twins run the box cells' code at the box's B (red on 2ebe5e3, green from T1). 7.4
+# alone pins (64 on the box, 16 on the twin, D-SLM8298) on its own mapping, so the 7.4 executables link the pin stub
+# until T1, as C4 and C5 do. The lifecycle production leg links `superslm`, which has no pin, and never pins.
+foreach(t superslm_pkv_c6 superslm_pkv_74_no_tsc superslm_pkv_74_no_subtraction superslm_pkv_lifecycle_prod)
+	if(TARGET ${t})
+		target_compile_definitions(${t} PRIVATE PKV_FIXTURE_B_FROM_RULE=1)
+	endif()
+endforeach()
+foreach(t superslm_pkv_c6 superslm_pkv_74_no_tsc superslm_pkv_74_no_subtraction)
+	if(TARGET ${t} AND SUPERSLM_PKV_R9_STUB_PIN)
+		target_sources(${t} PRIVATE ${PKV_DIR}/pkv_r9_stubs.cpp)
+		target_compile_definitions(${t} PRIVATE PKV_R9_STUB_PIN=1)
 	endif()
 endforeach()

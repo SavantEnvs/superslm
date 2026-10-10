@@ -7,6 +7,7 @@
 //   4.10/T1:extremes      the floor, the element width, the cap term's boundary, a non-power-of-two D
 //   4.10/T1:hostile-d     D = 2^20 and 2^31 on CFG1-only fixtures (model gap: they do not map)
 //   4.10/T1:generality    every §17.1 model row's (D, cap, elem)
+//   4.10/T1:seam-refusals the seam's null out, null artifact and refused artifact (D-SLM8446), out untouched
 //   4.11/T1               CFG1 kv_block_size in {1, 16, 32, 4,096, 0xFFFFFFFF} gives the rule's B; 0 refused
 //   4.12/T1:refusals      the pin's refusals and hostile pins, the model left unchanged
 //   4.12/T1:pins          a pin that takes: 16, 1 (the hand-built B = 1 geometry), the cap
@@ -547,6 +548,57 @@ void Cell412Pins() {
 	}
 }
 
+// The geometry seam's refusals (plan §25.6, §25.7 dimension 2, §26.5 N-3 / D-SLM8446; T-3196 F-8). A null `out` or a null `artifact` returns
+// SSLM_INVALID_ARGUMENT; an artifact the loader refuses (an odd head_dim, model.cpp's parity check) returns the
+// load's refusal, read as the status sslm_model_map gives the same bytes (SSLM_ARTIFACT_REJECTED), and writes nothing
+// through `out`. The positive control, the same call over an admitted artifact returning SSLM_OK, is what keeps a seam
+// that refuses everything (2ebe5e3's stub) from passing the two refusals: it is this cell's red reason there.
+void Cell410SeamRefusals() {
+	const std::vector<uint8_t> good = Cfg1OnlyArtifact(SmallCfg1(2, 1, 1, 64, 4096, 0));
+	const std::vector<uint8_t> odd = Cfg1OnlyArtifact(SmallCfg1(2, 1, 1, 47, 4096, 0));
+	std::string err;
+	PKV_CHECK_MSG(LoadStatus(good, &err) == superslm::SslmModelStatus::Ok, "the admitted artifact: %s", err.c_str());
+	PKV_CHECK_MSG(LoadStatus(odd, &err) == superslm::SslmModelStatus::BadConfigHeadDimParity,
+	              "the loader does not refuse head_dim 47 on parity: %s", err.c_str());
+	// the status the map gives the refused bytes (the reading the seam's refusal is held to)
+	sslm_status map_status = SSLM_OK;
+	{
+		AlignedBuf b(odd.size(), 0);
+		std::memcpy(b.p, odd.data(), odd.size());
+		sslm_model m = nullptr;
+		map_status = sslm_model_map(b.p, odd.size(), &m);
+		if (m) sslm_model_unmap(m);
+	}
+	PKV_CHECK_EQ(map_status, SSLM_ARTIFACT_REJECTED);
+	// positive control
+	KvPagesTestPoolGeometryOut g;
+	PKV_CHECK_MSG(SeamOf(good, 1, &g, "the admitted artifact (D = 64, cap 4,096)") && g.page_positions == 64,
+	              "the seam over an admitted artifact: B = %lld, the rule's 64 owed", static_cast<long long>(g.page_positions));
+	// a null out, and a null artifact (D-SLM8446: both SSLM_INVALID_ARGUMENT, checked before the load, out untouched)
+	PKV_CHECK_EQ(KvPagesTestPoolGeometry(good.data(), good.size(), 1, nullptr), SSLM_INVALID_ARGUMENT);
+	{
+		KvPagesTestPoolGeometryOut s0;
+		std::memset(&s0, 0xA5, sizeof s0);
+		KvPagesTestPoolGeometryOut o0 = s0;
+		PKV_CHECK_EQ(KvPagesTestPoolGeometry(nullptr, good.size(), 1, &o0), SSLM_INVALID_ARGUMENT);
+		PKV_CHECK_MSG(std::memcmp(&o0, &s0, sizeof o0) == 0, "a null artifact: the seam wrote through out");
+	}
+	// a refused artifact: the load's refusal, and nothing written
+	KvPagesTestPoolGeometryOut sentinel;
+	std::memset(&sentinel, 0xA5, sizeof sentinel);
+	KvPagesTestPoolGeometryOut out = sentinel;
+	const sslm_status st = KvPagesTestPoolGeometry(odd.data(), odd.size(), 1, &out);
+	PKV_CHECK_MSG(st == map_status, "head_dim 47: the seam returned %s; the map's %s owed", AbiStatusName(st),
+	              AbiStatusName(map_status));
+	PKV_CHECK_MSG(std::memcmp(&out, &sentinel, sizeof out) == 0, "head_dim 47: the refusing seam wrote through out");
+	// a truncated image: the load refuses it too, the same way
+	out = sentinel;
+	const sslm_status tr = KvPagesTestPoolGeometry(good.data(), good.size() / 2, 1, &out);
+	PKV_CHECK_MSG(tr != SSLM_OK && std::memcmp(&out, &sentinel, sizeof out) == 0,
+	              "a truncated image: the seam returned %s and %s through out", AbiStatusName(tr),
+	              std::memcmp(&out, &sentinel, sizeof out) == 0 ? "wrote nothing" : "wrote");
+}
+
 PKV_CELL("4.10/T1:grid", "T1", Cell410Grid);
 PKV_CELL("4.10/T1:below-page", "T1", Cell410BelowPage);
 PKV_CELL("4.10/T1:boundary", "T1", Cell410Boundary);
@@ -554,6 +606,7 @@ PKV_CELL("4.10/T1:extremes", "T1", Cell410Extremes);
 PKV_CELL("4.10/T1:hostile-d", "T1", Cell410HostileD);
 PKV_CELL("4.10/T1:generality", "T1", Cell410Generality);
 PKV_CELL("4.10/T1:seam-tie", "T1", Cell410SeamTie);
+PKV_CELL("4.10/T1:seam-refusals", "T1", Cell410SeamRefusals);
 PKV_CELL("4.11/T1", "T1", Cell411);
 PKV_CELL("4.12/T1:refusals", "T1", Cell412Refusals);
 PKV_CELL("4.12/T1:pins", "T1", Cell412Pins);

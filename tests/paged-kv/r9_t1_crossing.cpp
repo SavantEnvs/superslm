@@ -59,7 +59,9 @@ void Cell413Legacy() {
 		for (const char* sc : {"widths", "prefix_lengths"})
 			ExpectMatchesReference("v1.11.0", fx, sc, RunScenario(fx, sc), Compare::kTokensRowsAndBlob);
 		PersistRowsAtDerived(fx, B);
-		PKV_CHECK_EQ(1024 % B, 0);  // the re-chosen aligned prefix length is aligned at every derived B here
+		// 4.1's widths and 4.2's prefix lengths re-chosen at the derived B (the scenarios above are B = 16's), the
+		// aligned length 1,024 run, not asserted (T-3196 F-2)
+		DerivedBoundaries(fx, B, kBoundaryWidths | kBoundaryPrefixes, "4.13/T1:legacy");
 	}
 }
 
@@ -171,6 +173,7 @@ void Cell46() {
 		for (const char* sc : scenarios)
 			ExpectMatchesReference("v1.11.0", fx, sc, RunScenario(fx, sc), Compare::kTokensRowsAndBlob);
 		PersistRowsAtDerived(fx, B);
+		DerivedBoundaries(fx, B, kBoundaryWidths | kBoundaryPrefixes, "4.6/T1");  // each branch across every page edge (F-2)
 	}
 }
 

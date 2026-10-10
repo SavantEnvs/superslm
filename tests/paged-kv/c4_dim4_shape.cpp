@@ -104,14 +104,18 @@ void Cell42Legacy() {
 void Cell44Legacy() {
 	const Fixture& fx = GetFixture("pkv_odd");
 	if (!fx.ok) return;
+#if !defined(PKV_T2_FALLBACK_RETIRED)  // D-SLM8448: retires at T2 with the one-page fallback (PKV_T2_FALLBACK_RETIRED, SUPERSLM_PKV_T2_FALLBACK_RETIRED); 4.4/T2 carries the rows at 256
 	PKV_CHECK_EQ(fx.B(), 4100);
 	PKV_CHECK_EQ(fx.CapPages(), 1);
 	PKV_CHECK_EQ(fx.PageBytes(), sslm_kv_block_size(fx.model));  // one page is one block
+#endif
 	// kills: B = kv_block_size taken without the divisibility test (257 pages a reservation,
 	// 256.25 pages a block: the scenarios' pools refuse their creates)
 	for (const char* sc : kAllScenarios)
 		ExpectMatchesReference("v1.11.0", fx, sc, RunScenario(fx, sc), Compare::kTokensRowsAndBlob);
+#if !defined(PKV_T2_FALLBACK_RETIRED)
 	PagesHoldReferenceRows(fx, fx.B(), fx);
+#endif
 	LegacyPool pool(fx.model, 3);
 	PKV_CHECK_EQ(pool.status, SSLM_OK);
 	if (pool.pool) PKV_CHECK_EQ(CountLegacyCreates(fx.model, &pool.pool), 3);  // N blocks admit N handles (§3.5)

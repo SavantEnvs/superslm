@@ -43,6 +43,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -236,6 +238,9 @@ inline uint64_t Slot(uint64_t r, uint64_t j, uint64_t runs, Rot m, uint64_t phys
 // Byte offset of (l, half, h, pos) inside its page, at page size B.
 inline size_t InPage(const Geometry& g, size_t elem, int64_t B, uint32_t l, uint32_t half, uint32_t h, int64_t pos,
                      Rot m = Rot::kRotated, uint64_t physical = 0, uint64_t pages = 1) {
+	// the formula itself is the suites' one helper (pkv_common.h, D-SLM8449); the R9 cells name the layout explicitly
+	if (m == Rot::kRotated || m == Rot::kNone)
+		return PageRunOffset(g.layers, g.kv_heads, size_t{g.head_dim} * elem, B, l, half, h, pos, m == Rot::kRotated);
 	const uint64_t runs = uint64_t{g.layers} * 2u * g.kv_heads;
 	const uint64_t r = (uint64_t{l} * 2u + half) * g.kv_heads + h;
 	const uint64_t j = static_cast<uint64_t>(pos / B);
@@ -566,6 +571,243 @@ inline std::unique_ptr<pkv_engine::EngineFixture> EngineOf(const Fixture& fx) {
 // The flat twin's widths run at width W: tokens ready and decode1, and the canonical rows' digests.
 inline pkv_engine::WidthRun FlatTwin(const pkv_engine::EngineFixture& e, int64_t W) {
 	return pkv_engine::RunWidthUncached(e, e.Cap(), pkv_engine::Drive::kChunked, W);
+}
+
+// ---- 4.1 and 4.2 at the derived B (T-3196 F-2) -----------------------------------------------------
+
+// The reference tool's `widths` and `prefix_lengths` scenarios are fixed at B = 16's boundaries ({1, 15, 16, 17,
+// 32, 1,064, cap - 1, cap} and {0, 1, 15, 16, 17, 1,000, 1,008}), so at a derived B every one of them sits mid-page.
+// Plan 4.1 and 4.2 define them from the run's B; these are those sets at the B the engine reports, graded against
+// the flat twin (B = cap, table {0}), which has no page boundary to be off by one at.
+
+// 4.1's widths at B: 1, B - 1, B, B + 1, 2B, 1,000 + max(64, 2B), and cap - 1, cap when the cap is at most 4,100 (as
+// the scenario: the 32k fixture's cap-sized widths cost minutes; pkv_def, pkv_qk and pkv_odd carry the cap edge).
+inline std::vector<int64_t> WidthsAt(int64_t B, int64_t cap) {
+	std::vector<int64_t> w = {1, B - 1, B, B + 1, 2 * B, 1000 + std::max<int64_t>(64, 2 * B)};
+	if (cap <= 4100) {
+		w.push_back(cap - 1);
+		w.push_back(cap);
+	}
+	std::vector<int64_t> out;
+	for (int64_t x : w)
+		if (x >= 1 && x <= cap && std::find(out.begin(), out.end(), x) == out.end()) out.push_back(x);
+	return out;
+}
+
+// 4.2's prefix lengths at B, with the aligned length re-chosen as 1,024 (plan 4.13): 0, 1, B - 1, B, B + 1, 1,000,
+// 1,024.
+inline std::vector<int32_t> PrefixLengthsAt(int64_t B) {
+	std::vector<int32_t> out;
+	for (int64_t x : {int64_t{0}, int64_t{1}, B - 1, B, B + 1, int64_t{1000}, int64_t{1024}})
+		if (x >= 0 && std::find(out.begin(), out.end(), static_cast<int32_t>(x)) == out.end())
+			out.push_back(static_cast<int32_t>(x));
+	return out;
+}
+
+// The flat twin's run at width W for a fixture, computed once per process.
+inline const pkv_engine::WidthRun& TwinRun(const Fixture& fx, int64_t W) {
+	static std::map<std::string, std::unique_ptr<pkv_engine::EngineFixture>> engines;
+	static std::map<std::pair<std::string, int64_t>, pkv_engine::WidthRun> runs;
+	const auto key = std::make_pair(fx.stem, W);
+	auto it = runs.find(key);
+	if (it != runs.end()) return it->second;
+	auto& e = engines[fx.stem];
+	if (!e) e = EngineOf(fx);
+	pkv_engine::WidthRun r = e->ok ? FlatTwin(*e, W) : pkv_engine::WidthRun{};
+	if (!e->ok) r.fail = "the flat twin did not build";
+	return runs.emplace(key, std::move(r)).first->second;
+}
+
+enum BoundaryParts { kBoundaryWidths = 1, kBoundaryPrefixes = 2 };
+
+// 4.1 and/or 4.2 at `B`, which the engine must report for `fx` (sslm_kv_page_positions): every width and prefix
+// length below is placed from it. Widths: a legacy holder prefills W tokens of the widths stream in 64-token chunks;
+// the ready token, the next token, and rows [0, W) and [0, W + 1) read through the peek at B rotated equal the flat
+// twin's. Prefix lengths: a frozen legacy prefix of the stream's first P tokens, adopted (a legacy copy adopt,
+// aligned at P = B and 1,024); rows [0, P) equal the twin's at P, then 20 more tokens prefilled and the ready and
+// next tokens and rows [0, P + 21) equal the twin's at P + 20 (chunk boundaries do not change the result:
+// c2_engine_widths.cpp's chunked and per-token drives grade against one record). Kills: a page-boundary map off by
+// one at B, the tail copy of an aligned adopt, and a coverage guard off by one at a page edge.
+inline void DerivedBoundaries(const Fixture& fx, int64_t B, int parts, const char* cell, Rot rot = Rot::kRotated) {
+	const int64_t got = sslm_kv_page_positions(fx.model);
+	PKV_CHECK_MSG(got == B, "%s %s: the engine reports B = %lld; the widths below sit on the boundaries of %lld", cell,
+	              fx.stem.c_str(), static_cast<long long>(got), static_cast<long long>(B));
+	const int64_t cap = fx.geo.context_cap;
+	if (parts & kBoundaryWidths) {
+		for (int64_t W : WidthsAt(B, cap)) {
+			const pkv_engine::WidthRun& twin = TwinRun(fx, W);
+			PKV_CHECK_MSG(twin.fail.empty(), "%s %s W = %lld: the flat twin: %s", cell, fx.stem.c_str(),
+			              static_cast<long long>(W), twin.fail.c_str());
+			if (!twin.fail.empty()) continue;
+			LegacyPool pool(fx.model, 1);
+			sslm_seq s = nullptr;
+			PKV_CHECK_EQ(pool.status, SSLM_OK);
+			if (!pool.pool || sslm_seq_create(fx.model, &pool.pool, &s) != SSLM_OK) {
+				PKV_CHECK_MSG(false, "%s %s W = %lld: no legacy holder", cell, fx.stem.c_str(), static_cast<long long>(W));
+				continue;
+			}
+			const AbiWidth w = RunAbiWidth(fx.model, s, W, fx.vocab, false);
+			std::vector<uint8_t> rows;
+			PKV_CHECK_MSG(w.prefill == SSLM_OK && w.ready == twin.ready, "%s %s W = %lld (W mod B = %lld): prefill %s, "
+			              "ready %d, the twin's %d", cell, fx.stem.c_str(), static_cast<long long>(W),
+			              static_cast<long long>(W % B), AbiStatusName(w.prefill), w.ready, twin.ready);
+			PKV_CHECK_MSG(SeqRows(pool.pool, s, fx.geo, 1, B, W, rot, &rows) &&
+			                  Sha(rows.data(), rows.size()) == twin.rows_prefill,
+			              "%s %s W = %lld: rows [0, W) through the peek at B = %lld (%s) differ from the twin's", cell,
+			              fx.stem.c_str(), static_cast<long long>(W), static_cast<long long>(B), RotName(rot));
+			if (W < cap) {
+				sslm_status st = SSLM_OK;
+				const int32_t d1 = Next(fx.model, s, &st);
+				PKV_CHECK_MSG(d1 == twin.decode1, "%s %s W = %lld: the next token %d, the twin's %d", cell, fx.stem.c_str(),
+				              static_cast<long long>(W), d1, twin.decode1);
+				PKV_CHECK_MSG(SeqRows(pool.pool, s, fx.geo, 1, B, W + 1, rot, &rows) &&
+				                  Sha(rows.data(), rows.size()) == twin.rows_decode1,
+				              "%s %s W = %lld: rows [0, W + 1) differ from the twin's", cell, fx.stem.c_str(),
+				              static_cast<long long>(W));
+			}
+			sslm_seq_release(s);
+		}
+	}
+	if (parts & kBoundaryPrefixes) {
+		for (int32_t P : PrefixLengthsAt(B)) {
+			const std::vector<int32_t> toks = Stream(pkv_engine::kWidthsSeed, P + 20, fx.vocab);
+			LegacyPool pool(fx.model, 2);
+			PKV_CHECK_EQ(pool.status, SSLM_OK);
+			if (!pool.pool) continue;
+			sslm_prefix p = bc::LegacyPrefix(fx, &pool.pool, std::vector<int32_t>(toks.begin(), toks.begin() + P));
+			sslm_seq s = nullptr;
+			PKV_CHECK_EQ(sslm_seq_create(fx.model, &pool.pool, &s), SSLM_OK);
+			PKV_CHECK_MSG(p && s, "%s %s P = %d: the prefix or the adopter was not made", cell, fx.stem.c_str(), P);
+			if (p && s) {
+				PKV_CHECK_EQ(sslm_seq_adopt_prefix(s, p), SSLM_OK);
+				std::vector<uint8_t> rows;
+				if (P > 0) {
+					const pkv_engine::WidthRun& at_p = TwinRun(fx, P);
+					PKV_CHECK_MSG(at_p.fail.empty() && SeqRows(pool.pool, s, fx.geo, 1, B, P, rot, &rows) &&
+					                  Sha(rows.data(), rows.size()) == at_p.rows_prefill,
+					              "%s %s P = %d (P mod B = %lld): the adopted rows [0, P) differ from the twin's", cell,
+					              fx.stem.c_str(), P, static_cast<long long>(P % B));
+				}
+				const pkv_engine::WidthRun& at = TwinRun(fx, P + 20);
+				const sslm_status pf = PrefillAll(fx.model, s, std::vector<int32_t>(toks.begin() + P, toks.end()), pkv_engine::kChunk);
+				sslm_status st = SSLM_OK;
+				const int32_t ready = pf == SSLM_OK ? Next(fx.model, s, &st) : -1;
+				const int32_t d1 = ready >= 0 ? Next(fx.model, s, &st) : -1;
+				PKV_CHECK_MSG(at.fail.empty() && ready == at.ready && d1 == at.decode1,
+				              "%s %s P = %d, then 20: tokens %d, %d; the twin's %d, %d (%s)", cell, fx.stem.c_str(), P,
+				              ready, d1, at.ready, at.decode1, AbiStatusName(pf));
+				PKV_CHECK_MSG(SeqRows(pool.pool, s, fx.geo, 1, B, P + 21, rot, &rows) &&
+				                  Sha(rows.data(), rows.size()) == at.rows_decode1,
+				              "%s %s P = %d, then 20: rows [0, P + 21) differ from the twin's", cell, fx.stem.c_str(), P);
+			}
+			if (s) sslm_seq_release(s);
+			if (p) sslm_prefix_release(p);
+		}
+	}
+}
+
+// ---- batch decode across pool kinds and the partial last page (plan rev 16.24 §26.1, D-SLM8441) ------
+
+// A legacy blob of the widths stream at width W, saved from a holder in a one-block page pool at the rule's B.
+inline std::vector<uint8_t> WidthsBlob(const Fixture& fx, int64_t B, int64_t W) {
+	const Lay y = LayoutOf(fx.geo, 1, B);
+	BlockPoolOf pool(fx.model, 1, y);
+	sslm_seq s = nullptr;
+	std::vector<uint8_t> blob;
+	if (pool.pool && sslm_seq_create(fx.model, &pool.pool, &s) == SSLM_OK) {
+		if (PrefillAll(fx.model, s, Stream(pkv_engine::kWidthsSeed, static_cast<int32_t>(W), fx.vocab), pkv_engine::kChunk) ==
+		    SSLM_OK)
+			blob = bc::Save(s);
+		sslm_seq_release(s);
+	}
+	PKV_CHECK_MSG(!blob.empty(), "%s: the width-%lld blob was not made", fx.stem.c_str(), static_cast<long long>(W));
+	return blob;
+}
+
+struct BatchArm {
+	sslm_kv_pool* pool;
+	int64_t B;  // the page size of this holder's pool: the rule's B for a page pool, the cap for the option
+	const char* kind;
+};
+
+constexpr int kBatchSteps = 13;  // the first step emits the restored ready token (no row); 12 more write rows W..W+11
+
+// §26.1's member: `blob` (width W) restored into both arms' pools, which are 0x5A-filled; the two holders decode
+// together, one sslm_decode_step per token, for kBatchSteps steps. The oracle is the single-sequence twin, a third
+// restore into a fresh 0x5A-filled one-block page pool at `twin_B`, decoded alone with n = 1. Asserted: tokens equal
+// across the batch and with the twin; each holder's rows [W, W + 12), read through the peek at its own pool's B
+// rotated, equal the twin's; its rows [0, W) equal the blob's; precondition, no twin row of [W, W + 12) is D bytes
+// of 0x5A. With `cap_after`, one more call returns SSLM_CONTEXT_CAP_EXCEEDED with out_tokens[0] = -1.
+// Kills (§26.1, executed by the planner's probe): H1, the batch taking page_positions and page_bytes once from the
+// first sequence's pool; H2, the batch taking them from the model.
+inline void BatchAgainstTwin(const Fixture& fx, const std::vector<uint8_t>& blob, int64_t W, int64_t twin_B,
+                             const BatchArm& a0, const BatchArm& a1, bool cap_after, const std::string& what,
+                             Rot rot = Rot::kRotated) {
+	if (blob.empty()) return;
+	const size_t D = fx.geo.head_dim;
+	const size_t per_pos = size_t{fx.geo.layers} * 2u * fx.geo.kv_heads * D;
+	const int64_t L = W + kBatchSteps - 1;
+	std::vector<int32_t> twin_tokens;
+	std::vector<uint8_t> twin_rows;
+	{
+		BlockPoolOf tp(fx.model, 1, LayoutOf(fx.geo, 1, twin_B), 0x5A);
+		sslm_seq t = nullptr;
+		PKV_CHECK_EQ(tp.pool ? sslm_seq_restore(fx.model, &tp.pool, blob.data(), blob.size(), &t) : tp.status, SSLM_OK);
+		if (!t) return;
+		for (int i = 0; i < kBatchSteps; ++i) twin_tokens.push_back(Next(fx.model, t));
+		std::vector<uint8_t> all;
+		PKV_CHECK_MSG(SeqRows(tp.pool, t, fx.geo, 1, twin_B, L, rot, &all) && all.size() == size_t(L) * per_pos,
+		              "%s: the twin's rows are unreadable", what.c_str());
+		if (all.size() == size_t(L) * per_pos) twin_rows.assign(all.begin() + W * static_cast<int64_t>(per_pos), all.end());
+		sslm_seq_release(t);
+	}
+	size_t fill_rows = 0;
+	for (size_t at = 0; at + D <= twin_rows.size(); at += D)
+		fill_rows += std::all_of(twin_rows.begin() + at, twin_rows.begin() + at + D, [](uint8_t b) { return b == 0x5A; });
+	PKV_CHECK_MSG(!twin_rows.empty() && fill_rows == 0, "%s: construction: %zu twin rows are D bytes of 0x5A", what.c_str(),
+	              fill_rows);
+	sslm_seq s[2] = {nullptr, nullptr};
+	const BatchArm* arm[2] = {&a0, &a1};
+	for (int i = 0; i < 2; ++i) {
+		const sslm_status st = sslm_seq_restore(fx.model, arm[i]->pool, blob.data(), blob.size(), &s[i]);
+		PKV_CHECK_MSG(st == SSLM_OK, "%s: the restore into the %s pool: %s", what.c_str(), arm[i]->kind, AbiStatusName(st));
+	}
+	if (s[0] && s[1]) {
+		sslm_decode_params p{};
+		p.layer_budget = static_cast<int32_t>(fx.geo.layers);
+		std::vector<int32_t> got[2];
+		for (int i = 0; i < kBatchSteps; ++i) {
+			int32_t out[2] = {-1, -1};
+			const sslm_status st = sslm_decode_step(fx.model, s, 2, &p, nullptr, out);
+			PKV_CHECK_MSG(st == SSLM_OK, "%s: step %d: %s", what.c_str(), i, AbiStatusName(st));
+			got[0].push_back(out[0]);
+			got[1].push_back(out[1]);
+		}
+		for (int i = 0; i < 2; ++i) {
+			PKV_CHECK_MSG(got[i] == twin_tokens, "%s: the %s holder's batch tokens differ from the n = 1 twin's", what.c_str(),
+			              arm[i]->kind);
+			std::vector<uint8_t> rows, brows;
+			const bool read = SeqRows(*arm[i]->pool, s[i], fx.geo, 1, arm[i]->B, L, rot, &rows) &&
+			                  rows.size() == size_t(L) * per_pos;
+			PKV_CHECK_MSG(read && BlobRows(blob, fx, HiddenSize(fx), W, &brows) &&
+			                  std::equal(brows.begin(), brows.end(), rows.begin()),
+			              "%s: the %s holder's restored rows [0, %lld) differ from the blob's (B = %lld)", what.c_str(),
+			              arm[i]->kind, static_cast<long long>(W), static_cast<long long>(arm[i]->B));
+			PKV_CHECK_MSG(read && std::equal(twin_rows.begin(), twin_rows.end(), rows.begin() + W * static_cast<int64_t>(per_pos)),
+			              "%s: the %s holder's rows [%lld, %lld), read at its pool's B = %lld, differ from the twin's",
+			              what.c_str(), arm[i]->kind, static_cast<long long>(W), static_cast<long long>(L),
+			              static_cast<long long>(arm[i]->B));
+		}
+		if (cap_after) {
+			int32_t out[2] = {7, 7};
+			const sslm_status st = sslm_decode_step(fx.model, s, 2, &p, nullptr, out);
+			PKV_CHECK_MSG(st == SSLM_CONTEXT_CAP_EXCEEDED && out[0] == -1,
+			              "%s: the step past the cap: %s, out_tokens[0] = %d (SSLM_CONTEXT_CAP_EXCEEDED, -1 owed)", what.c_str(),
+			              AbiStatusName(st), out[0]);
+		}
+	}
+	for (sslm_seq x : s)
+		if (x) sslm_seq_release(x);
 }
 
 // ---- engine-level rotation (6.6a) -----------------------------------------------------------------

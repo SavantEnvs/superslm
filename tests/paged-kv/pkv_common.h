@@ -42,8 +42,9 @@
 static_assert(SSLM_KV_BUDGET_EXCEEDED == PKV_KV_BUDGET_EXCEEDED, "§3.6: SSLM_KV_BUDGET_EXCEEDED is ordinal 29");
 #endif
 
-#if defined(PKV_PIN_GENERATED_FIXTURES)
-// The test-only pin (paged-KV plan §3.1, D-SLM8440; declared beside the R9 surface in pkv_r9.h).
+#if defined(PKV_PIN_GENERATED_FIXTURES) || defined(PKV_FIXTURE_B_FROM_RULE)
+// The test-only pin (paged-KV plan §3.1, D-SLM8440; declared beside the R9 surface in pkv_r9.h): the C4 and C5 loader
+// pins (D-SLM8439), and 7.4/C6 pins its own mappings (D-SLM8447).
 extern "C" sslm_status KvPagesTestPinPagePositions(sslm_model model, int64_t page_positions);
 #endif
 
@@ -150,6 +151,40 @@ struct AlignedBuf {
 	}
 };
 
+// ---- §3.1's page-size rule and in-page address, written once for every suite (rev 16.24) ------------
+
+// The page-size rule (§3.1), written here: S = 4 KiB when D <= 64 and cap <= 4,096, else 8 KiB; B is the smallest
+// power of two >= 16 with B * D * elem >= S, and the cap when that exceeds it. tests/paged-kv/pkv_r9.h's RuleB
+// carries the same rule with its mutants; the C6 cells read B from this one (D-SLM8447).
+inline int64_t PageRuleB(uint64_t D, uint64_t cap, uint64_t elem) {
+	const uint64_t S = (D <= 64 && cap <= 4096) ? 4096 : 8192;
+	uint64_t B = 16;
+	while (B * D * elem < S) B *= 2;
+	return static_cast<int64_t>(B > cap ? cap : B);
+}
+
+// The T1 switch (D-SLM8449). From T1 every page is rotated at every B, pinned or not: run r = (layer * 2 + half) *
+// kv_heads + h of logical page j = pos / B sits in slot (r + j) mod runs, runs = layers * 2 * kv_heads. At 2ebe5e3 it
+// sits in slot r. PKV_T1_ROTATED_LAYOUT is set by the CMake option SUPERSLM_PKV_T1_ROTATED_LAYOUT (default OFF: the
+// 2ebe5e3 layout, so the C2 to C6 suites stay green there); the builder turns it ON in the T1 commit that lands
+// rotation. Flipped late, the C2 to C6 raw-byte reads go red at T1; flipped early, they go red on 2ebe5e3.
+#if defined(PKV_T1_ROTATED_LAYOUT)
+constexpr bool kRotatedLayout = true;
+#else
+constexpr bool kRotatedLayout = false;
+#endif
+
+// The byte offset of (layer, half, h, pos) inside its page at page size B, rows of `row_bytes` (head_dim * elem):
+// §3.1's formula. Every test-side in-page address in tests/paged-kv goes through this function (the census is the
+// test author's record, T-3189 §7); `rotated` defaults to the T1 switch.
+inline size_t PageRunOffset(uint32_t layers, uint32_t kv_heads, size_t row_bytes, int64_t B, uint32_t layer,
+                            uint32_t half, size_t h, int64_t pos, bool rotated = kRotatedLayout) {
+	const uint64_t runs = uint64_t{layers} * 2u * kv_heads;
+	uint64_t slot = (uint64_t{layer} * 2u + half) * kv_heads + h;
+	if (rotated && runs) slot = (slot + static_cast<uint64_t>(pos / B)) % runs;
+	return static_cast<size_t>(slot * static_cast<uint64_t>(B) * row_bytes + static_cast<uint64_t>(pos % B) * row_bytes);
+}
+
 // ---- fixtures -------------------------------------------------------------------------------
 
 // The four fixtures of tools/gen_paged_kv_fixture.py, by stem: "pkv_def", "pkv_qk", "pkv_odd",
@@ -163,10 +198,25 @@ struct Fixture {
 	Geometry geo{};
 	std::string sha;  // the file's SHA-256, matched against each .ref header
 	int32_t vocab = 256;
-	// The page size the C2 to C6 cells were written at: 16 on the generated fixtures, which the loader pins in the
-	// C4 and C5 suites (paged-KV plan rev 16.23, D-SLM8439), and the cap on pkv_odd, which stays unpinned. A pinned
-	// value, not the rule (the rule's B is tests/paged-kv/pkv_r9.h's RuleB).
-	int64_t B() const { return geo.context_cap % 16 == 0 ? 16 : geo.context_cap; }
+	// A B read back from the engine after a test-only pin on this fixture's own mapping (7.4/C6, D-SLM8447); 0: none.
+	int64_t pinned = 0;
+	// The page size the cells were written at.
+	// - A pinned fixture: the pinned value.
+	// - The C6 suite (PKV_FIXTURE_B_FROM_RULE, D-SLM8447): §3.1's rule, PageRuleB, never a pinned 16. Its cloud twins
+	//   run the box cells' own code at the B the box runs, so they are red on 2ebe5e3 (B = 16) and green from T1.
+	// - Otherwise, the C2 to C5 cells: 16 on the generated fixtures, which the loader pins in the C4 and C5 suites (rev
+	//   16.23, D-SLM8439), and on pkv_odd the cap (the one-page fallback) until the T2 switch, then the rule's 256
+	//   (D-SLM8448: PKV_T2_FALLBACK_RETIRED, the CMake option SUPERSLM_PKV_T2_FALLBACK_RETIRED).
+	int64_t B() const {
+		if (pinned > 0) return pinned;
+#if defined(PKV_FIXTURE_B_FROM_RULE)
+		return PageRuleB(geo.head_dim, static_cast<uint64_t>(geo.context_cap), 1);
+#elif defined(PKV_T2_FALLBACK_RETIRED)
+		return geo.context_cap % 16 == 0 ? 16 : PageRuleB(geo.head_dim, static_cast<uint64_t>(geo.context_cap), 1);
+#else
+		return geo.context_cap % 16 == 0 ? 16 : geo.context_cap;
+#endif
+	}
 	int64_t CapPages() const { return (geo.context_cap + B() - 1) / B(); }
 	// §3.4's R(budget), written here: min(ceil(budget / B) + 1, ceil(cap / B)).
 	int64_t R(int64_t budget) const {

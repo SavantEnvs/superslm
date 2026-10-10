@@ -13,6 +13,8 @@
 //   2.9d/T2             the block product's overflow at a non-dividing cap, through the geometry seam
 //                       (rev 16.23, D-SLM8437: the CFG1-only fixture loads and does not map)
 //   10.9/T2             admission at a non-dividing cap, the writes to the cap, save, adopt, state size
+//   10.9/T2:batch       two page holders in one 34-page pool through the partial last page and the cap refusal,
+//                       against the n = 1 twin: 4.4/T3:batch's attribution control (rev 16.24, D-SLM8441)
 //   4.13/T2:cap4100     4.2 (prefix lengths) whole on pkv_odd at B = 256
 //   6.7/T2:non-dividing a pin of 4 -> the derived B = 256 page pool, the 17-page reservation, the legacy size
 //   (rev 16.22: 2.4, 7.11, 9.2b and 9.3 at cap 4,100 are in r9_t2_saves.cpp)
@@ -47,6 +49,9 @@ void Cell44() {
 	PKV_CHECK_EQ(y.slack, 252);
 	for (const char* sc : kAllScenarios)
 		ExpectMatchesReference("v1.11.0", odd, sc, RunScenario(odd, sc), Compare::kTokensAndRows);
+	// 4.1's widths at B = 256 (1, 255, 256, 257, 512, 1,512, 4,099, 4,100: the last two in the partial page), against
+	// the flat twin; the `widths` scenario above runs B = 16's (T-3196 F-2)
+	DerivedBoundaries(odd, B, kBoundaryWidths, "4.4/T2");
 	const RefRecord* saved = RefLookup(Reference("v1.11.0", odd), "persist", "saved");
 	BlockPoolOf pool(odd.model, 1, y);
 	PKV_CHECK_EQ(pool.status, SSLM_OK);
@@ -394,7 +399,8 @@ void Cell413Cap4100() {
 	if (!odd.ok) return;
 	RequireOddB(odd);
 	ExpectMatchesReference("v1.11.0", odd, "prefix_lengths", RunScenario(odd, "prefix_lengths"), Compare::kTokensAndRows);
-	PKV_CHECK_EQ(1024 % OddB(), 0);
+	// 4.2's lengths at B = 256 (0, 1, 255, 256, 257, 1,000, 1,024), the aligned 1,024 run (T-3196 F-2)
+	DerivedBoundaries(odd, OddB(), kBoundaryPrefixes, "4.13/T2:cap4100");
 }
 
 // 6.7 [T2]. At a non-dividing cap (T-3172 G-9), the page-pool half (rev 16.23, T-3189 G-3: the option directions
@@ -419,21 +425,34 @@ void Cell67NonDividing() {
 			sslm_seq_release(s);
 		}
 	}
-	// the restoring legacy holder reserves ceil(cap/B) = 17 pages: a 17-page page pool takes exactly one
+	// the restoring legacy holder reserves ceil(cap/B) = 17 pages (T-3196 F-3). A budget-1 create needs R(1) = 2
+	// pages, so the observable is an 18-page pool: 17 reserved leave 1 and the create is refused; the floor's 16
+	// leave 2 and it is admitted (the floor mutant dies here, where a 17-page pool refuses at both). A 19-page pool
+	// admits it, so the refusal is the reservation's and not the pool's.
 	{
-		PagePoolOf p(odd.model, 17, y.page_bytes);
-		PKV_CHECK_EQ(p.status, SSLM_OK);
 		BlockPoolOf src(odd.model, 1, y);
-		sslm_seq s = nullptr, r = nullptr;
+		sslm_seq s = nullptr;
+		std::vector<uint8_t> blob;
 		if (src.pool && sslm_seq_create(odd.model, &src.pool, &s) == SSLM_OK) {
-			PrefillAll(odd.model, s, Stream(41, 300, odd.vocab), 64);
-			const std::vector<uint8_t> blob = bc::Save(s);
+			PKV_CHECK_EQ(PrefillAll(odd.model, s, Stream(41, 300, odd.vocab), 64), SSLM_OK);
+			blob = bc::Save(s);
+			sslm_seq_release(s);
+		}
+		PKV_CHECK_MSG(!blob.empty(), "the legacy holder to restore was not made");
+		PKV_CHECK_EQ(Reservation(1, 4100, B), 2);
+		for (uint32_t pages : {18u, 19u}) {
+			if (blob.empty()) break;
+			PagePoolOf p(odd.model, pages, y.page_bytes);
+			PKV_CHECK_EQ(p.status, SSLM_OK);
+			if (!p.pool) continue;
+			sslm_seq r = nullptr, extra = nullptr;
 			PKV_CHECK_EQ(sslm_seq_restore(odd.model, &p.pool, blob.data(), blob.size(), &r), SSLM_OK);
-			sslm_seq extra = nullptr;
-			PKV_CHECK_EQ(sslm_seq_create_budgeted(odd.model, &p.pool, 1, &extra), SSLM_KV_POOL_EXHAUSTED);
+			const sslm_status cs = sslm_seq_create_budgeted(odd.model, &p.pool, 1, &extra);
+			const sslm_status want = pages == 18 ? SSLM_KV_POOL_EXHAUSTED : SSLM_OK;
+			PKV_CHECK_MSG(r && cs == want, "a %u-page pool after the restore: budget-1 create %s, %s owed (17 pages "
+			              "reserved; a floor reservation of 16 admits it at 18)", pages, AbiStatusName(cs), AbiStatusName(want));
 			if (extra) sslm_seq_release(extra);
 			if (r) sslm_seq_release(r);
-			sslm_seq_release(s);
 		}
 	}
 	// the third direction: pinned B = 4 (divides 4,100) -> derived 256
@@ -470,7 +489,25 @@ void Cell67NonDividing() {
 	}
 }
 
+// 10.9 [T2] batch (plan rev 16.24 §26.1, §26.8 item 3; D-SLM8441): 4.4/T3:batch's construction with both holders in one
+// two-block page pool (34 pages) on pkv_odd at B = 256, through rows 4,088 to 4,099 and the cap refusal. It names no
+// mutant: it is the attribution control for 4.4/T3:batch, so a 4.4 failure with a 10.9 pass is the pool kinds'.
+void Cell109Batch() {
+	const Fixture& odd = GetFixture("pkv_odd");
+	if (!odd.ok) return;
+	RequireOddB(odd);
+	const int64_t B = OddB();
+	const Lay y = LayoutOf(odd.geo, 1, B);
+	const int64_t W = 4088;
+	const std::vector<uint8_t> blob = WidthsBlob(odd, B, W);
+	BlockPoolOf pp(odd.model, 2, y, 0x5A);
+	PKV_CHECK_EQ(pp.status, SSLM_OK);
+	if (!pp.pool) return;
+	BatchAgainstTwin(odd, blob, W, B, {&pp.pool, B, "page"}, {&pp.pool, B, "page"}, true, "10.9 page + page");
+}
+
 PKV_CELL("4.4/T2", "T2", Cell44);
+PKV_CELL("10.9/T2:batch", "T2", Cell109Batch);
 PKV_CELL("4.10/T2:non-dividing", "T2", Cell410NonDividing);
 PKV_CELL("4.12/T2:cap4100", "T2", Cell412Cap4100);
 PKV_CELL("2.9/T2", "T2", Cell29);

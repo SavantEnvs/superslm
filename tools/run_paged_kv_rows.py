@@ -9,6 +9,7 @@ the bodies at T4; a renamed function changes this file and the cells together, n
 """
 
 from pathlib import Path
+import sys
 
 
 class Refusal(RuntimeError):
@@ -107,3 +108,27 @@ def grade_row(processes):
     A row is graded only on five complete processes: {"graded": True, "verdict": row_verdict(...), "record": {...}};
     otherwise {"graded": False, "verdict": None, "record": None, "exit_code": EXIT_CODES[kind of the first refusal]}."""
     return None
+
+
+def main(argv=None):
+    """The process loop, cell 7.9's driver, as a command (rev 16.23 G-4; T-3196 F-6: the refusals' process-level
+    consequences are graded through this entry, not only through the functions above):
+
+        run_paged_kv_rows.py --pair-cmd JSON --manifest M --model F --restore N --slot S --result R [--lock L]
+
+    --pair-cmd is a JSON list, the pair executable's command line. For each process k in 1..5, under timing_lock(R, L):
+      1. check_row_blob(M, F, N) before the process restores the blob (79-6);
+      2. run pair-cmd + ["--blob", <blob>, "--model", F, "--process", k, "--pairs", "104", "--warmup", "4"];
+      3. its stdout: the first line is the identity line, checked by check_build_identity before any pair is read
+         (79-7); then one "PAIR <paged_ns> <contiguous_ns> <paged_token> <contiguous_token>" line per timed pair; then
+         "IDS <id> <id> ..." (the measured holder's page ids, for the guard);
+      4. a process with other than 104 PAIR lines is 79-9, one whose arms' tokens differ in any pair is 79-8;
+      5. a complete process's record is written (write_record) to R's sibling "<R stem>.p<k>.json".
+    The row's record, carrying grade_row's verdict, is written to R only when five complete processes are graded. A
+    refusal returns EXIT_CODES[kind], writes no record for the refused process and no row record. Returns the exit
+    code, 0 for a graded row; under __main__ it is the process's exit status."""
+    return None
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -3,6 +3,9 @@
 // positions, one page per sequence, through the same page module.
 //
 //   4.14/T3:bit-identity   tokens and K/V rows equal the page pool's at 4.1's widths, cap - 1 and cap
+//   4.14/T3:batch          batch decode with the option: two contiguous holders, and a page holder beside a
+//                          contiguous one in both orders, against the n = 1 twin (rev 16.24, D-SLM8441)
+//   4.4/T3:batch           the same at pkv_odd across the partial last page, then the cap refusal
 //   4.14/T3:admission      N blocks admit exactly N legacy and N budget creates of any budget
 //   4.14/T3:sizing         the size verb equals the test's N * cap * q + 8N + 32
 //   4.14/T3:saves          SSB6 and SSB5 save and restore across pool kinds with rows equal
@@ -275,6 +278,9 @@ void Cell414Hostile() {
 	    {"null buffer", fx.model, nullptr, need, 2, SSLM_INVALID_ARGUMENT},
 	    {"one byte below", fx.model, mem.p, need - 1, 2, SSLM_BUFFER_TOO_SMALL},
 	    {"misaligned", fx.model, mem.p + 1, need, 2, SSLM_MISALIGNED_BUFFER},
+	    // both faults: sslm_kv_pool_create's precedence, the size before the alignment (src/sslm_abi.cpp, the
+	    // too-small-and-misaligned case); kills an option that checks the alignment first (T-3196 F-4)
+	    {"one byte below and misaligned", fx.model, mem.p + 1, need - 1, 2, SSLM_BUFFER_TOO_SMALL},
 	};
 	for (const Case& c : cases) {
 		sslm_kv_pool out = legacy_a::OutSentinel<sslm_kv_pool>();
@@ -285,6 +291,13 @@ void Cell414Hostile() {
 	}
 	PKV_CHECK_MSG(std::equal(before.begin(), before.end(), mem.p), "a refusal wrote into the caller's buffer");
 	PKV_CHECK_EQ(sslm_kv_pool_create_contiguous(fx.model, mem.p, need, 2, nullptr), SSLM_INVALID_ARGUMENT);  // null out
+	PKV_CHECK_MSG(std::equal(before.begin(), before.end(), mem.p), "the null-out refusal wrote into the caller's buffer");
+	// the precedence against the existing create's, on the same both-faults buffer (green on 2ebe5e3: the reading)
+	{
+		sslm_kv_pool out = legacy_a::OutSentinel<sslm_kv_pool>();
+		PKV_CHECK_EQ(sslm_kv_pool_create(fx.model, mem.p + 1, 1, 2, &out), SSLM_BUFFER_TOO_SMALL);
+		PKV_CHECK(out == nullptr);
+	}
 	{
 		sslm_kv_pool out = nullptr;
 		PKV_CHECK_EQ(sslm_kv_pool_create_contiguous(fx.model, mem.p, need, 2, &out), SSLM_OK);  // exactly the size
@@ -315,9 +328,12 @@ void Cell414Hostile() {
 	// kills: the sum with the overhead unchecked (nonzero at 3,054,198,962), the product unchecked
 	PKV_CHECK_MSG(sslm_kv_pool_contiguous_size(big.model, 3054198962u) == 0, "the size at 3,054,198,962 is not 0");
 	{
+		const std::vector<uint8_t> before_overflow(mem.p, mem.p + mem.n);  // the admitted create above wrote its pool
 		sslm_kv_pool out = legacy_a::OutSentinel<sslm_kv_pool>();
 		PKV_CHECK_EQ(sslm_kv_pool_create_contiguous(big.model, mem.p, SIZE_MAX, 3054198962u, &out), SSLM_INVALID_ARGUMENT);
 		PKV_CHECK(out == nullptr);
+		PKV_CHECK_MSG(std::equal(before_overflow.begin(), before_overflow.end(), mem.p),
+		              "the overflow refusal wrote into the caller's buffer");
 	}
 }
 
@@ -560,7 +576,9 @@ void Cell415() {
 			sslm_kv_pool* pp = dir == 0 ? &k.contig->pool : &k.page->pool;
 			sslm_prefix p = LegacyPrefixOf(one, pp, len);
 			sslm_seq s = nullptr;
-			if (p && sslm_seq_create(one.model, sp, &s) == SSLM_OK)
+			const bool made = p && sslm_seq_create(one.model, sp, &s) == SSLM_OK;
+			PKV_CHECK_MSG(made, "cap 100: the prefix of %d or its adopter was not made", len);
+			if (made)
 				ExpectAdmitted(one, *sp, 100, *pp, 100, s, p, len,
 				               std::string("cap 100 (one geometry): ") + (dir == 0 ? "page from contiguous" : "contiguous from page") +
 				                   ", len " + std::to_string(len));
@@ -570,7 +588,62 @@ void Cell415() {
 	}
 }
 
+// 4.14 [T3] batch (plan rev 16.24 §26.1, §26.8 item 1; D-SLM8441). pkv_def, a blob at width 1,020: (a) two legacy
+// holders in one two-block contiguous pool; (b) one in a one-block page pool and one in a one-block contiguous pool,
+// in both batch orders. Rows 1,020 to 1,031. Kills H1 by (b), H2 by (a) and (b).
+void Cell414Batch() {
+	const Fixture& fx = Def();
+	if (!fx.ok) return;
+	const int64_t B = DefB();
+	const Lay y = DefLay(B);
+	const int64_t W = 1020;
+	const std::vector<uint8_t> blob = WidthsBlob(fx, B, W);
+	{
+		ContigPoolOf cp(fx.model, 2, ContigBytes(y, 2), 0x5A);
+		PKV_CHECK_MSG(cp.status == SSLM_OK, "(a): the two-block option create: %s", AbiStatusName(cp.status));
+		if (cp.pool)
+			BatchAgainstTwin(fx, blob, W, B, {&cp.pool, kCap, "contiguous"}, {&cp.pool, kCap, "contiguous"}, false,
+			                 "4.14 (a) contiguous + contiguous");
+	}
+	for (bool page_first : {true, false}) {
+		BlockPoolOf pp(fx.model, 1, y, 0x5A);
+		ContigPoolOf cp(fx.model, 1, ContigBytes(y, 1), 0x5A);
+		PKV_CHECK_MSG(pp.status == SSLM_OK && cp.status == SSLM_OK, "(b): pools: page %s, option %s", AbiStatusName(pp.status),
+		              AbiStatusName(cp.status));
+		if (!pp.pool || !cp.pool) continue;
+		const BatchArm page{&pp.pool, B, "page"}, contig{&cp.pool, kCap, "contiguous"};
+		BatchAgainstTwin(fx, blob, W, B, page_first ? page : contig, page_first ? contig : page, false,
+		                 page_first ? "4.14 (b) page first" : "4.14 (b) contiguous first");
+	}
+}
+
+// 4.4 [T3] batch (§26.1, §26.8 item 2). pkv_odd (B = 256, 17 pages), a blob at width 4,088: a page holder (one-block
+// page pool) beside a contiguous holder (one-block option pool), both orders, through rows 4,088 to 4,099 in the
+// partial last page; then the step past the cap is refused. Kills H1 and H2.
+void Cell44Batch() {
+	const Fixture& odd = GetFixture("pkv_odd");
+	if (!odd.ok) return;
+	const int64_t B = RuleB(48, 4100, 1);
+	const Lay y = LayoutOf(odd.geo, 1, B);
+	const int64_t W = 4088;
+	PKV_CHECK_EQ(y.pages, 17);
+	const std::vector<uint8_t> blob = WidthsBlob(odd, B, W);
+	for (bool page_first : {true, false}) {
+		BlockPoolOf pp(odd.model, 1, y, 0x5A);
+		bool fits = false;
+		ContigPoolOf cp(odd.model, 1, static_cast<size_t>(ContiguousSize(y, 1, &fits)), 0x5A);
+		PKV_CHECK_MSG(pp.status == SSLM_OK && cp.status == SSLM_OK, "pools: page %s, option %s", AbiStatusName(pp.status),
+		              AbiStatusName(cp.status));
+		if (!pp.pool || !cp.pool) continue;
+		const BatchArm page{&pp.pool, B, "page"}, contig{&cp.pool, 4100, "contiguous"};
+		BatchAgainstTwin(odd, blob, W, B, page_first ? page : contig, page_first ? contig : page, true,
+		                 page_first ? "4.4 page first" : "4.4 contiguous first");
+	}
+}
+
 PKV_CELL("4.14/T3:bit-identity", "T3", Cell414BitIdentity);
+PKV_CELL("4.14/T3:batch", "T3", Cell414Batch);
+PKV_CELL("4.4/T3:batch", "T3", Cell44Batch);
 PKV_CELL("4.15/T3", "T3", Cell415);
 PKV_CELL("6.7/T3:non-dividing", "T3", Cell67NonDividingOption);
 PKV_CELL("4.14/T3:admission", "T3", Cell414Admission);

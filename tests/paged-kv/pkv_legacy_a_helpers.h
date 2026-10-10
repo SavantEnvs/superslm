@@ -85,8 +85,7 @@ inline bool RowsFromPages(sslm_kv_pool pool, sslm_seq s, const Geometry& g, int6
 		for (uint32_t l = 0; l < g.layers; ++l)
 			for (uint32_t half = 0; half < 2; ++half)
 				for (uint32_t h = 0; h < g.kv_heads; ++h) {
-					const size_t at = ((size_t{l} * 2 + half) * g.kv_heads + h) * static_cast<size_t>(B) * D +
-					                  static_cast<size_t>(p % B) * D;
+					const size_t at = PageRunOffset(g.layers, g.kv_heads, D, B, l, half, h, p);
 					rows->insert(rows->end(), it->second.begin() + static_cast<std::ptrdiff_t>(at),
 					             it->second.begin() + static_cast<std::ptrdiff_t>(at + D));
 				}

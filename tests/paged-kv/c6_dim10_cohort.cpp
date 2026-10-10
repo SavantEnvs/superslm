@@ -176,9 +176,8 @@ std::string CohortRows(const Fixture& fx, sslm_kv_pool pool, sslm_seq seq, int64
 		for (uint32_t layer = 0; layer < fx.geo.layers; ++layer)
 			for (uint32_t half = 0; half < 2; ++half)
 				for (uint32_t head = 0; head < fx.geo.kv_heads; ++head) {
-					const size_t offset = ((static_cast<size_t>(layer) * 2 + half) * fx.geo.kv_heads + head) *
-					                      static_cast<size_t>(fx.B()) * fx.geo.head_dim +
-					                      static_cast<size_t>(pos % fx.B()) * fx.geo.head_dim;
+					const size_t offset =
+					    PageRunOffset(fx.geo.layers, fx.geo.kv_heads, fx.geo.head_dim, fx.B(), layer, half, head, pos);
 					rows.insert(rows.end(), page.begin() + offset, page.begin() + offset + fx.geo.head_dim);
 				}
 	}

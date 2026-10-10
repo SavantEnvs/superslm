@@ -319,10 +319,37 @@ void Run74(const Fixture& low,const Fixture& large){
 void Run74(const Fixture&,const Fixture&){Refuse(73,"x86 invariant TSC required");}
 void TimerLive(){Refuse(73,"x86 invariant TSC required");}
 #endif
-void Box(){Lock74();const char* large=std::getenv("SUPERSLM_PAGED_KV_74_CAP32768_FILE");Run74(GetArtifact("qwen2.5-0.5b-instruct-cap4096-aex.sslm",Geometry{24,2,64,4096}),
-  GetArtifact(large?large:"qwen2.5-0.5b-instruct-cap32768-aex.sslm",Geometry{24,2,64,32768}));}
+// Paged-KV plan rev 16.24 (D-SLM8447, D-SLM8298): 7.4 pins both sides to one B, 64 on the box and 16 on the twin, and
+// reads the pinned B back. The pin goes on a private mapping of each artifact, so no shared fixture (the other C6
+// cells read the rule's B) is pinned, and the pin precedes every pool on that mapping. The pin's SSLM_OK is required
+// once the T0 stub is gone (SUPERSLM_PKV_R9_STUB_PIN OFF); the read-back B is required always.
+bool PinnedCopy(const Fixture& src,int64_t B,Fixture* out){
+	if(!src.ok)return false;
+	out->stem=src.stem;out->geo=src.geo;out->vocab=src.vocab;out->sha=src.sha;out->size=src.size;
+	out->bytes.Reset(src.size);std::memcpy(out->bytes.p,src.bytes.p,src.size);
+	const sslm_status st=sslm_model_map(out->bytes.p,out->size,&out->model);
+	PKV_CHECK_MSG(st==SSLM_OK,"7.4: the private mapping of %s: %d",src.stem.c_str(),static_cast<int>(st));
+	if(st!=SSLM_OK)return false;
+	const sslm_status pin=KvPagesTestPinPagePositions(out->model,B);
+#if !defined(PKV_R9_STUB_PIN)
+	PKV_CHECK_MSG(pin==SSLM_OK,"7.4: the pin of %s to B = %lld is refused (%d)",src.stem.c_str(),static_cast<long long>(B),static_cast<int>(pin));
+#else
+	(void)pin;
+#endif
+	out->pinned=sslm_kv_page_positions(out->model);
+	PKV_CHECK_MSG(out->pinned==B,"7.4: %s runs at B = %lld after its pin, %lld owed",src.stem.c_str(),static_cast<long long>(out->pinned),static_cast<long long>(B));
+	out->ok=out->pinned==B;
+	return out->ok;
+}
+void RunPinned74(const Fixture& low,const Fixture& large,int64_t B){
+	Fixture a,b;
+	if(!PinnedCopy(low,B,&a)||!PinnedCopy(large,B,&b))Refuse(71,"the 7.4 pin did not take");
+	Run74(a,b);
+}
+void Box(){Lock74();const char* large=std::getenv("SUPERSLM_PAGED_KV_74_CAP32768_FILE");RunPinned74(GetArtifact("qwen2.5-0.5b-instruct-cap4096-aex.sslm",Geometry{24,2,64,4096}),
+  GetArtifact(large?large:"qwen2.5-0.5b-instruct-cap32768-aex.sslm",Geometry{24,2,64,32768}),64);}
 void Fixtures(){Lock74();const char* low=std::getenv("SUPERSLM_PAGED_KV_74_FIXTURE_LOW");const char* large=std::getenv("SUPERSLM_PAGED_KV_74_FIXTURE_LARGE");
-	Run74(GetFixture(low?low:"pkv_def"),GetFixture(large?large:"pkv_32k"));}
+	RunPinned74(GetFixture(low?low:"pkv_def"),GetFixture(large?large:"pkv_32k"),16);}
 PKV_CELL("7.4/C6","C6",Box);
 PKV_CELL("7.4/C6:fixtures","C6",Fixtures);
 PKV_CELL("7.4t/C6:constructions","C6",Constructions);

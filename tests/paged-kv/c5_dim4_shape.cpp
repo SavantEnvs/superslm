@@ -142,6 +142,7 @@ void Cell43() {
 //
 // The fill probe is not used here: its create sizes are 2 to ceil(cap/B) pages (§8), and at
 // ceil(cap/B) = 1 no create spans 2 pages, so it cannot run at B = cap. Admission counts grade instead.
+#if !defined(PKV_T2_FALLBACK_RETIRED)  // D-SLM8448: retires at T2 with the one-page fallback (PKV_T2_FALLBACK_RETIRED, SUPERSLM_PKV_T2_FALLBACK_RETIRED); 4.4/T2's budget member and 10.9/T2 carry it
 void Cell44Budget() {
 	const Fixture& fx = GetFixture("pkv_odd");
 	if (!fx.ok) return;
@@ -198,6 +199,7 @@ void Cell44Budget() {
 	// kills: begin_from at B = cap sharing a page it should copy (the child's writes land in the world).
 	PKV_CHECK_MSG(got.size() == 8 && got == want, "4.4: the begin_from child's adopter differs from the unshared twin");
 }
+#endif
 
 // ---- 4.5 [C5] -----------------------------------------------------------------------------------
 // Page pools of 1 page, of exactly one reservation, and of the maximum.
@@ -229,6 +231,7 @@ void Cell45() {
 		PKV_CHECK_EQ(sslm_seq_create(fx.model, &pool.pool, &s), SSLM_KV_POOL_EXHAUSTED);
 		PKV_CHECK_EQ(sslm_prefix_begin(fx.model, &pool.pool, &p), SSLM_KV_POOL_EXHAUSTED);
 	}
+#if !defined(PKV_T2_FALLBACK_RETIRED)  // D-SLM8448: retires at T2 with the one-page fallback (PKV_T2_FALLBACK_RETIRED, SUPERSLM_PKV_T2_FALLBACK_RETIRED); at T2 a one-page pool admits no budget holder (the pkv_def member)
 	{
 		Scene sc;
 		PagePool& pool = sc.AddPool(odd.model, 1);
@@ -244,6 +247,7 @@ void Cell45() {
 		if (s) ReleaseSeq(sc.h, s);
 		PKV_CHECK(BudgetSeq(odd, &pool.pool, 1, sc.h) != nullptr);
 	}
+#endif
 	{
 		const uint32_t pages = static_cast<uint32_t>(fx.R(512));
 		Scene sc;
@@ -340,7 +344,9 @@ void Cell47() {
 PKV_CELL("4.1/C5", "C5", Cell41Budget);
 PKV_CELL("4.2/C5", "C5", Cell42Budget);
 PKV_CELL("4.3/C5", "C5", Cell43);
+#if !defined(PKV_T2_FALLBACK_RETIRED)
 PKV_CELL("4.4/C5", "C5", Cell44Budget);
+#endif
 PKV_CELL("4.5/C5", "C5", Cell45);
 PKV_CELL("4.7/C5", "C5", Cell47);
 

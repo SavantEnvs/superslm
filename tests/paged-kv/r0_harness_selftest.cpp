@@ -95,7 +95,9 @@ void SelfAdmissionCount() {
 	PKV_CHECK_EQ(fx.R(512), 33);
 	PKV_CHECK_EQ(fx.R(4096), 256);
 	PKV_CHECK_EQ(fx.PageBytes() * 256, sslm_kv_block_size(fx.model));
+#if !defined(PKV_T2_FALLBACK_RETIRED)  // D-SLM8448: retires at T2 with the one-page fallback (PKV_T2_FALLBACK_RETIRED, SUPERSLM_PKV_T2_FALLBACK_RETIRED); nothing carries it: pkv_odd's consumers read the rule's B
 	PKV_CHECK_EQ(GetFixture("pkv_odd").B(), 4100);
+#endif
 }
 
 // A .ref reads the same with LF and CRLF line endings. A Windows checkout with core.autocrlf=true

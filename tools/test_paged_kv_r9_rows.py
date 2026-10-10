@@ -15,6 +15,15 @@ Cells (cell 7.9's text; the 79-series rows of the instrument table):
           manifest chain, the model binding; refused before restore, its own exit code, no record, row ungraded
   79-7    a seam-library build, checked once per process before timing
   per-process refusals: each kind its own non-zero exit code; a row is never graded on four processes
+  loop    (T-3196 F-6) 79-6 to 79-9 through the driver's process loop, as a process: five processes against a
+          stand-in pair executable, each refusal injected into process 3 (a blob changed after process 2, a seam
+          identity line, a token mismatch at pair 57, 103 pairs); the exit status is EXIT_CODES[kind], the refused
+          process writes no record, no row record or verdict exists, processes 1 and 2 keep their records, and the
+          blob refusal fires before process 3 runs;
+          a healthy row exits 0 with five process records and a graded row record
+
+PKV_ROWS_DRIVER, when set, names the driver file under test instead of tools/run_paged_kv_rows.py (the test author's
+scratch reference and its mutants run through it); unset, the shipped driver is what every cell grades.
 """
 import collections
 import importlib.util
@@ -28,7 +37,7 @@ import sys
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).with_name("run_paged_kv_rows.py")
+SCRIPT = Path(os.environ.get("PKV_ROWS_DRIVER") or Path(__file__).with_name("run_paged_kv_rows.py"))
 spec = importlib.util.spec_from_file_location("paged_kv_rows", SCRIPT)
 rows = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rows)
@@ -203,6 +212,24 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def row_inputs(root):
+    """A model file and a two-piece blob chain with its manifest (restore 1,200), healthy. Returns (model, manifest,
+    manifest data)."""
+    model = root / "model.sslm"
+    model.write_bytes(b"model bytes")
+    prev, at, pieces = "-", 0, []
+    for i, count in enumerate((700, 500)):
+        f = root / f"piece{i}.ssb"
+        f.write_bytes(f"blob after {at + count}".encode())
+        pieces.append({"file": f.name, "start": at, "count": count, "input_sha256": prev, "sha256": sha(f)})
+        prev, at = sha(f), at + count
+    data = {"complete": True, "model_sha256": sha(model), "stream": {"seed": 79, "restore": 1200},
+            "pieces": pieces, "final_blob": pieces[-1]["file"], "final_sha256": pieces[-1]["sha256"]}
+    manifest = root / "manifest.json"
+    manifest.write_text(json.dumps(data))
+    return model, manifest, data
+
+
 class Refusals(unittest.TestCase):
     """79-6, 79-7 and the per-process refusal rule (cell 7.9, rev 16.23)."""
 
@@ -210,17 +237,7 @@ class Refusals(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="t3189-r9-refusals-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.model = self.root / "model.sslm"
-        self.model.write_bytes(b"model bytes")
-        prev, at, pieces = "-", 0, []
-        for i, count in enumerate((700, 500)):
-            f = self.root / f"piece{i}.ssb"
-            f.write_bytes(f"blob after {at + count}".encode())
-            pieces.append({"file": f.name, "start": at, "count": count, "input_sha256": prev, "sha256": sha(f)})
-            prev, at = sha(f), at + count
-        self.manifest = self.root / "manifest.json"
-        self.write({"complete": True, "model_sha256": sha(self.model), "stream": {"seed": 79, "restore": 1200},
-                    "pieces": pieces, "final_blob": pieces[-1]["file"], "final_sha256": pieces[-1]["sha256"]})
+        self.model, self.manifest, self.data = row_inputs(self.root)
 
     def write(self, data):
         self.data = data
@@ -275,6 +292,98 @@ class Refusals(unittest.TestCase):
                 self.assertEqual(g["exit_code"], rows.EXIT_CODES[kind])
         g = rows.grade_row(ok[:4])  # never graded on four
         self.assertEqual((g["graded"], g["verdict"]), (False, None))
+
+
+# The stand-in pair executable: prints the identity line, 104 timed pairs (slowdown 1%, tokens equal) and the
+# measured holder's ids; PKV_STANDIN_INJECT="<kind>@<k>" injects one refusal into process k. A "blob" injection
+# changes the blob's bytes at the end of process k - 1, so process k's pre-restore check is what must see it.
+STANDIN = r"""
+import argparse, json, os, sys
+from pathlib import Path
+ap = argparse.ArgumentParser()
+for flag in ("--blob", "--model", "--warmup"):
+    ap.add_argument(flag)
+ap.add_argument("--process", type=int)
+ap.add_argument("--pairs", type=int)
+a = ap.parse_args()
+kind, _, at = os.environ.get("PKV_STANDIN_INJECT", "").partition("@")
+at = int(at) if at else 0
+with open(os.environ["PKV_STANDIN_LOG"], "a") as log:
+    log.write(f"{a.process}\n")
+mine = a.process == at
+print("PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE" if kind == "seam" and mine else "PKV_PAIR_PRODUCTION_V2 defs=none")
+for i in range(a.pairs - 1 if kind == "pairs" and mine else a.pairs):
+    print(f"PAIR 1010000 1000000 7 {8 if kind == 'token' and mine and i == 57 else 7}")
+print("IDS " + " ".join(str(i) for i in json.loads(os.environ["PKV_STANDIN_IDS"])))
+if kind == "blob" and a.process == at - 1:
+    Path(a.blob).write_bytes(Path(a.blob).read_bytes() + b"changed")
+"""
+
+
+class Loop(unittest.TestCase):
+    """79-6 to 79-9 through the driver's process loop, as a process (T-3196 F-6)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="t3189-r9-loop-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.model, self.manifest, _ = row_inputs(self.root)
+        self.standin = self.root / "standin_pair.py"
+        self.standin.write_text(STANDIN)
+        self.log = self.root / "standin.log"
+        self.out = self.root / "out"
+        self.out.mkdir()
+        self.result = self.out / "R2a-run1.json"
+
+    def run_row(self, inject=""):
+        env = dict(os.environ, PKV_STANDIN_INJECT=inject, PKV_STANDIN_LOG=str(self.log),
+                   PKV_STANDIN_IDS=json.dumps(proto_shuffle(64)[:21]))
+        cmd = [sys.executable, "-I", str(SCRIPT), "--pair-cmd", json.dumps([sys.executable, "-I", str(self.standin)]),
+               "--manifest", str(self.manifest), "--model", str(self.model), "--restore", "1200", "--slot", "R2a",
+               "--result", str(self.result), "--lock", str(self.root / "pkv-c6-timing.lock")]
+        done = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+        ran = [int(x) for x in self.log.read_text().split()] if self.log.exists() else []
+        return done, ran
+
+    def verdicts_written(self):
+        found = []
+        for f in self.out.rglob("*"):
+            if f.is_file():
+                try:
+                    data = json.loads(f.read_text())
+                except ValueError:
+                    continue
+                if isinstance(data, dict) and data.get("verdict") is not None:
+                    found.append(f.name)
+        return found
+
+    def test_loop_healthy_row_is_graded(self):
+        done, ran = self.run_row()
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertEqual(ran, [1, 2, 3, 4, 5])
+        self.assertEqual((rows.read_record(self.result) or {}).get("verdict"), "PASS")
+        for k in range(1, 6):
+            self.assertIsNotNone(rows.read_record(self.out / f"R2a-run1.p{k}.json"), f"process {k}'s record")
+
+    def test_loop_each_refusal_in_process_3(self):
+        for kind in ("blob", "seam", "token", "pairs"):
+            with self.subTest(kind=kind):
+                self.setUp()
+                done, ran = self.run_row(f"{kind}@3")
+                self.assertEqual(done.returncode, rows.EXIT_CODES.get(kind), f"{kind}: exit {done.returncode}")
+                self.assertNotEqual(done.returncode, 0)
+                self.assertFalse(self.result.exists(), f"{kind}: a row record was written")
+                self.assertFalse((self.out / "R2a-run1.p3.json").exists(), f"{kind}: the refused process wrote a record")
+                self.assertEqual(self.verdicts_written(), [], f"{kind}: a verdict was written")
+                # processes 1 and 2 completed on a blob checked before each restore: their records stand
+                for k in (1, 2):
+                    self.assertIsNotNone(rows.read_record(self.out / f"R2a-run1.p{k}.json"),
+                                         f"{kind}: process {k}'s record (a check after the restore refuses process 2)")
+                if kind == "blob":
+                    # checked before process 3 restores: process 3 never ran
+                    self.assertEqual(ran, [1, 2], "the blob check ran after the restore, or not per process")
+                else:
+                    self.assertIn(3, ran)
 
 
 class Process(unittest.TestCase):

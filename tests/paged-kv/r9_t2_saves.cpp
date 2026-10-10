@@ -7,6 +7,8 @@
 //   9.2b/T2   v1.11.0's and v1.8.1's pins of persist saved, lifecycle adopt300 and saturating saturated
 //             at pkv_odd: restore, rows and continuation, the re-save byte-equal (or equal-length for
 //             v1.8.1), a shared restore with 0 shared pages, and the forward digests over a 0xCD pool
+//   9.5/T2:int16  a regression pin (green on 2ebe5e3): pkv_def at Int16 rests at the cap; the SSB5 is 3,162,464
+//             bytes, sslm_seq_state_size 3,162,484, the margin exactly 20 (rev 16.24, D-SLM8443)
 //   2.4/T2    the same pins restore into exactly block + overhead(1) bytes (1,671,208); one byte short
 //             of each pin is refused with nothing drawn
 //   7.11/T2   a legacy SSB5 is exactly 160 + hidden_size + 4 * history + the flat block, at L' in
@@ -234,7 +236,65 @@ void Cell93Write() {
 	PKV_CHECK_MSG(static_cast<bool>(f), "the blob could not be written to %s", out_dir);
 }
 
+// 9.5 [T2] Int16 (plan rev 16.24 §26.3, §26.8 item 4; D-SLM8443). A regression pin, green on 2ebe5e3: R9 does not
+// change the formula, and T2 changes the sizing quantities around it (D-SLM8427). pkv_def's Int16 variant, a legacy
+// holder driven by 9.5/C4's damped-greedy drive to rest at context_length = cap with history cap, then saved. Each
+// side computed here:
+//   the legacy SSB5 at rest:   160 + hidden + 4 * history + cap * L * 2 * H_kv * D * elem = 3,162,464
+//   sslm_seq_state_size:       180 + hidden + 4 * cap     + cap * L * 2 * H_kv * D * elem = 3,162,484
+// so the margin is exactly 20 (the SSB6 header's 20 more bytes: a 24-byte tail where SSB5 carries 4).
+// Kills: the block term without elem (1,589,620, the bound fails by 1,572,844), and 1.11.0's state size (the bound
+// holds, the exact 20 fails).
+void Cell95Int16() {
+	const Fixture& def = GetFixture("pkv_def");
+	if (!def.ok) return;
+	Fixture fx;
+	Variant v;
+	v.kv_precision = 1;
+	sslm_status ms = SSLM_OK;
+	PKV_CHECK_MSG(MakeVariant(def, v, &fx, &ms), "pkv_def at Int16 maps (%s)", AbiStatusName(ms));
+	if (!fx.ok) return;
+	const uint64_t cap = 4096, elem = 2, hidden = HiddenSize(fx);
+	const uint64_t block = cap * fx.geo.layers * 2u * fx.geo.kv_heads * fx.geo.head_dim * elem;
+	const uint64_t want_blob = 160 + hidden + 4 * cap + block, want_state = 180 + hidden + 4 * cap + block;
+	PKV_CHECK_EQ(want_blob, 3162464u);
+	PKV_CHECK_EQ(want_state, 3162484u);
+	const size_t state = sslm_seq_state_size(fx.model);
+	PKV_CHECK_MSG(state == want_state, "sslm_seq_state_size at Int16 is %zu, %llu owed", state,
+	              static_cast<unsigned long long>(want_state));
+	LegacyPool pool(fx.model, 1);
+	sslm_seq s = nullptr;
+	PKV_CHECK_EQ(pool.status == SSLM_OK ? sslm_seq_create(fx.model, &pool.pool, &s) : pool.status, SSLM_OK);
+	if (!s) return;
+	const int32_t seed = 5;
+	int32_t consumed = 0;
+	PKV_CHECK_EQ(sslm_prefill(fx.model, s, &seed, 1, 1, SSLM_SPAN_PROMPT, nullptr, &consumed), SSLM_OK);
+	sslm_decode_params p{};
+	PKV_CHECK_EQ(sslm_decode_params_init(fx.model, SSLM_DECODE_MODE_DAMPED_GREEDY, static_cast<int32_t>(fx.geo.layers), &p),
+	             SSLM_OK);
+	sslm_seq b[1] = {s};
+	int64_t emitted = 0;
+	sslm_status st = SSLM_OK;
+	while (emitted < static_cast<int64_t>(cap)) {  // the ready token, then whole tokens until it rests at the cap
+		int32_t tok = -1;
+		st = sslm_decode_step_v2(fx.model, b, 1, &p, nullptr, &tok);
+		if (st != SSLM_OK) break;
+		if (tok >= 0) ++emitted;
+	}
+	PKV_CHECK_MSG(st == SSLM_OK, "the damped drive was refused at %lld tokens (%s)", static_cast<long long>(emitted),
+	              AbiStatusName(st));
+	const std::vector<uint8_t> rest = bc::Save(s);
+	PKV_CHECK_MSG(rest.size() > 120 && Le64(rest, 60) == cap && Le64(rest, 112) == cap,
+	              "the holder does not rest at context_length = cap with history cap");
+	PKV_CHECK_MSG(IsMagic(rest, "SSB5") && rest.size() == want_blob, "the resting legacy save is %zu bytes, %llu owed",
+	              rest.size(), static_cast<unsigned long long>(want_blob));
+	PKV_CHECK_MSG(state >= rest.size() && state - rest.size() == 20, "the margin is %lld, exactly 20 owed",
+	              static_cast<long long>(state) - static_cast<long long>(rest.size()));
+	sslm_seq_release(s);
+}
+
 PKV_CELL("9.2b/T2", "T2", Cell92b);
+PKV_CELL("9.5/T2:int16", "T2", Cell95Int16);
 PKV_CELL("9.3/T2:write", "T2", Cell93Write);
 PKV_CELL("2.4/T2", "T2", Cell24);
 PKV_CELL("7.11/T2", "T2", Cell711);

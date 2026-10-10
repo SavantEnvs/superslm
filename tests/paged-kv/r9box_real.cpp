@@ -145,7 +145,8 @@ void Box415() {
 	pkv::r9::c415::Cell415On(fx, 64, 64, 100);
 }
 
-PKV_CELL("4.6/box", "T1", Box46);
+// bracketed T3 (plan rev 16.24 §26.4, D-SLM8444): its reference arm is the contiguous create, T3's verb
+PKV_CELL("4.6/box", "T3", Box46);
 PKV_CELL("4.15/box", "T3", Box415);
 PKV_CELL("2.9b/box", "T2", Box29b);
 PKV_CELL("7.4c/box", "T1", Box74c);

@@ -92,6 +92,7 @@ inline void ExpectRefused(const Fixture& fx, KindPools& k, bool seq_in_page, int
 	};
 	if (prefix_last) other(pre_pool);  // the prefix is then its pool's last holder
 	sslm_prefix p = LegacyPrefixOf(fx, pre_pool, len);
+	PKV_CHECK_MSG(p != nullptr, "%s: the prefix of %d was not made, so the member did not run", what.c_str(), len);
 	if (!prefix_last) other(pre_pool);  // the prefix is its pool's first holder
 	sslm_seq s = nullptr;
 	PKV_CHECK_EQ(sslm_seq_create(fx.model, seq_pool, &s), SSLM_OK);
@@ -115,9 +116,11 @@ inline void ExpectRefused(const Fixture& fx, KindPools& k, bool seq_in_page, int
 		PKV_CHECK_MSG(CountCreates(fx.model, &k.page->pool, 0, &r1) == page_admits &&
 		                  CountCreates(fx.model, &k.contig->pool, 0, &r1) == contig_admits,
 		              "%s: the admission count of a pool moved", what.c_str());
-		if (schema) PKV_CHECK_MSG(sslm_seq_set_schema(s, schema) == SSLM_OK, "%s: the bind permission was revoked", what.c_str());
+		PKV_CHECK_MSG(schema && sslm_seq_set_schema(s, schema) == SSLM_OK, "%s: the bind permission was revoked%s",
+		              what.c_str(), schema ? "" : " (no schema to bind: the member did not run)");
 		// after the refusal the sequence adopts a prefix of its own pool, rows equal
 		sslm_prefix own = LegacyPrefixOf(fx, seq_pool, std::min<int32_t>(len, 64), 53);
+		PKV_CHECK_MSG(own != nullptr, "%s: its own pool's prefix was not made", what.c_str());
 		if (own) {
 			ExpectAdmitted(fx, *seq_pool, seq_B, *seq_pool, seq_B, s, own, std::min<int32_t>(len, 64), what + ", then its own pool's prefix");
 			sslm_prefix_release(own);
@@ -133,7 +136,9 @@ inline void Cell415On(const Fixture& fx, int64_t B, int32_t page_from_contig_len
 	PKV_CHECK_MSG(sslm_kv_page_positions(fx.model) == B, "%s runs at B = %lld, the rule's %lld owed", fx.stem.c_str(),
 	              static_cast<long long>(sslm_kv_page_positions(fx.model)), static_cast<long long>(B));
 	sslm_schema schema = nullptr;
-	sslm_schema_lookup(fx.model, "g5_minimal_one_field", &schema);
+	const sslm_status ls = sslm_schema_lookup(fx.model, "g5_minimal_one_field", &schema);
+	PKV_CHECK_MSG(ls == SSLM_OK && schema, "%s: the schema lookup returned %s; the bind and precedence members need it",
+	              fx.stem.c_str(), AbiStatusName(ls));
 	const int64_t cap = fx.geo.context_cap;
 	// Both directions refused.
 	for (int32_t len : {page_from_contig_len_base, page_from_contig_len_base + 1}) {
@@ -143,6 +148,7 @@ inline void Cell415On(const Fixture& fx, int64_t B, int32_t page_from_contig_len
 	}
 	for (bool last : {false, true}) {
 		KindPools k(fx, B, 3);
+		PKV_CHECK_MSG(k.Ok(), "%s: the pools (contiguous from page)", fx.stem.c_str());
 		if (k.Ok())
 			ExpectRefused(fx, k, false, contig_from_page_len, last, B, schema,
 			              fx.stem + ": contiguous from page, the prefix its pool's " + (last ? "last" : "first") + " holder");
@@ -150,6 +156,7 @@ inline void Cell415On(const Fixture& fx, int64_t B, int32_t page_from_contig_len
 	// Admitted: the same adopts within one kind.
 	for (int32_t len : {page_from_contig_len_base, page_from_contig_len_base + 1, contig_from_page_len}) {
 		KindPools k(fx, B, 3);
+		PKV_CHECK_MSG(k.Ok(), "%s: the control pools", fx.stem.c_str());
 		if (!k.Ok()) continue;
 		for (int kind = 0; kind < 2; ++kind) {
 			sslm_kv_pool* sp = kind == 0 ? &k.page->pool : &k.contig->pool;
@@ -157,7 +164,9 @@ inline void Cell415On(const Fixture& fx, int64_t B, int32_t page_from_contig_len
 			const int64_t b = kind == 0 ? B : cap;
 			sslm_prefix p = LegacyPrefixOf(fx, pp, len);
 			sslm_seq s = nullptr;
-			if (p && sslm_seq_create(fx.model, sp, &s) == SSLM_OK)
+			const bool made = p && sslm_seq_create(fx.model, sp, &s) == SSLM_OK;
+			PKV_CHECK_MSG(made, "%s: the within-kind control (kind %d, len %d) was not made", fx.stem.c_str(), kind, len);
+			if (made)
 				ExpectAdmitted(fx, *sp, b, *pp, b, s, p, len,
 				               fx.stem + (kind == 0 ? ": page from page" : ": contiguous from contiguous") + ", len " + std::to_string(len));
 			if (s) sslm_seq_release(s);
