@@ -685,7 +685,16 @@ size_t KvElementBytes(superslm::SslmKvPrecision p) {
 int64_t PageRuleB(uint64_t head_dim, uint64_t context_cap, uint64_t elem) {
 	const uint64_t target = (head_dim <= 64 && context_cap <= 4096) ? 4096 : 8192;
 	uint64_t B = 16;
+#if defined(SUPERSLM_MUTANT_PKV_MR_OPT)
+	// Cell 7.9's must-reject, 7.9-MR-OPT (D-SLM8423): the shipped 1.11.0-era page size, B = 16, in the R9 tree. Built
+	// only into the superslm_mr_opt library (tests/paged-kv/paged_kv.cmake); the production library refuses the
+	// definition at configure time.
+	(void)target;
+	(void)elem;
+	(void)head_dim;
+#else
 	while (B * head_dim * elem < target) B *= 2;
+#endif
 	if (B > context_cap) B = context_cap;
 	return static_cast<int64_t>(B);
 }

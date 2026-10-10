@@ -1150,7 +1150,15 @@ struct KvPageView {
 // runs` for `run < runs`, and `run` itself when `runs` is 0 or 1. Neither operand of the sum reaches
 // `runs`, so it cannot wrap.
 inline size_t KvPageRunSlot(size_t run, size_t logical_page, size_t runs) noexcept {
+#if defined(SUPERSLM_MUTANT_PKV_MR_OPT)
+	// Cell 7.9's must-reject, 7.9-MR-OPT (D-SLM8423): the slot ignores the logical page (the unrotated layout). Built
+	// only into the superslm_mr_opt library; the production library refuses the definition at configure time.
+	(void)logical_page;
+	(void)runs;
+	return run;
+#else
 	return runs > 1 ? (run + logical_page % runs) % runs : run;
+#endif
 }
 
 // §3.1's in-page byte offset of run `run` at `position`, pages of `page_positions` (B) positions and

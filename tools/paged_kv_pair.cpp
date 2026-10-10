@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 
 namespace {
@@ -51,11 +52,19 @@ void Prefill(int argc,char** argv) {
 	Write(argv[11],Save(seq));Require(State().failures==0,"save failed");sslm_seq_release(seq);
 	std::cout<<"PREFILL_OK start="<<start<<" count="<<count<<" model_sha="<<fx.sha<<"\n";
 }
+// The contiguous pool option (paged-KV plan §21.2): one page of `cap` positions per block, 1.11.0's layout, sized by
+// sslm_kv_pool_contiguous_size.
+struct ContiguousPool {
+	AlignedBuf mem;sslm_kv_pool pool=nullptr;sslm_status status=SSLM_INVALID_ARGUMENT;
+	ContiguousPool(sslm_model model,uint32_t blocks){const size_t size=sslm_kv_pool_contiguous_size(model,blocks);
+		if(size){mem.Reset(size);status=sslm_kv_pool_create_contiguous(model,mem.p,mem.n,blocks,&pool);}}
+	~ContiguousPool(){if(pool)sslm_kv_pool_destroy(pool);}
+};
 struct Arm {
-	const Fixture& fx;std::unique_ptr<LegacyPool> legacy;std::unique_ptr<PagePool> page;
+	const Fixture& fx;std::unique_ptr<LegacyPool> legacy;std::unique_ptr<PagePool> page;std::unique_ptr<ContiguousPool> contiguous;
 	sslm_prefix world=nullptr,persona=nullptr;sslm_seq seq=nullptr;
 	explicit Arm(const Fixture& f):fx(f){}
-	sslm_kv_pool* Pool() {return legacy?&legacy->pool:&page->pool;}
+	sslm_kv_pool* Pool() {return contiguous?&contiguous->pool:legacy?&legacy->pool:&page->pool;}
 	~Arm(){if(seq)sslm_seq_release(seq);if(persona)sslm_prefix_release(persona);if(world)sslm_prefix_release(world);}
 	void Restore(const char* path,int expected){legacy=std::make_unique<LegacyPool>(fx.model,1);Require(legacy->status==SSLM_OK,"pool failed");
 		auto blob=Blob(path);Require(IsMagic(blob,"SSB5"),"prompt blob is not SSB5");
@@ -71,7 +80,9 @@ struct Arm {
 		Require(sslm_prefix_freeze(persona)==SSLM_OK,"persona freeze failed");
 		Require(sslm_seq_create_budgeted(fx.model,Pool(),512,&seq)==SSLM_OK,"budget sequence failed");
 		Require(sslm_seq_adopt_prefix(seq,persona)==SSLM_OK,"persona adopt failed");}
-	void Contiguous(){legacy=std::make_unique<LegacyPool>(fx.model,1);Require(legacy->status==SSLM_OK,"contiguous pool failed");
+	// 7.9b's arm two (D-SLM8438): a legacy holder in a contiguous-option pool, prefilled in-process (a legacy holder in
+	// a page pool pages at the derived B, and copy adopt from a page pool into the option is refused, D-SLM8434).
+	void Contiguous(){contiguous=std::make_unique<ContiguousPool>(fx.model,1);Require(contiguous->status==SSLM_OK,"contiguous pool failed");
 		Require(sslm_seq_create(fx.model,Pool(),&seq)==SSLM_OK,"contiguous sequence failed");
 		auto prompt=WorldTokens();auto persona_tokens=PersonaTokens(0);prompt.insert(prompt.end(),persona_tokens.begin(),persona_tokens.end());
 		Require(PrefillAll(fx.model,seq,prompt,kChunk)==SSLM_OK,"contiguous prefill failed");}
@@ -111,6 +122,61 @@ void Pairs(int argc,char** argv,bool shared){
 	out.flush();Require(bool(out),"pair output flush failed");
 	std::cout<<"PAIR_OK kind="<<(shared?"79b":"79")<<" pairs="<<pairs<<" model_a="<<fa->sha<<" model_b="<<fb->sha<<"\n";
 }
+// Cell 7.9 on the R9 build (rev 16.21; T4): one process of tools/run_paged_kv_rows.py's row.
+//   row79 CAP LAYERS HEADS DIM SEED --blob BLOB --model FILE --process K --pairs N --warmup W
+// One model; the row's one blob restored into a legacy holder in a page pool at the derived B (one block, the pool's P
+// pages), rotated, and into a legacy holder in a one-block contiguous-option pool. Stdout, in order: the identity line;
+// one "PAIR <paged_ns> <contiguous_ns> <paged_token> <contiguous_token>" line per timed pair (W untimed warm-up tokens
+// per arm first; each pair's order drawn at random from SEED + K; each token one sslm_decode_step, timed alone); then
+// "IDS ..." with the paged holder's mapped page ids in logical order (the scatter guard's input). The driver grades
+// tokens and pair counts; this executable reports them. The paged arm's reserve is the pool's fresh order: the
+// scattered-reserve construction cell 7.9 needs is the test author's (plan §20.2), so until it lands the guard reads
+// ascending ids and the driver records the row NO RESULT.
+void Row79(int argc,char** argv){
+	Require(argc==17,"row79 argument count");
+	const char *blob_path=nullptr,*model_path=nullptr;int process=-1,pairs=-1,warmup=-1;
+	for(int i=7;i+1<argc;i+=2){const std::string flag=argv[i];
+		if(flag=="--blob")blob_path=argv[i+1];else if(flag=="--model")model_path=argv[i+1];
+		else if(flag=="--process")process=Number(argv[i+1]);else if(flag=="--pairs")pairs=Number(argv[i+1]);
+		else if(flag=="--warmup")warmup=Number(argv[i+1]);else throw std::runtime_error("unknown row79 flag "+flag);}
+	Require(blob_path&&model_path&&process>=1&&pairs>=1&&pairs<=508&&warmup>=0,"row79 flags");
+	const std::string model_file(model_path);const size_t cut=model_file.find_last_of("/\\");
+	const std::string dir=cut==std::string::npos?".":model_file.substr(0,cut),name=cut==std::string::npos?model_file:model_file.substr(cut+1);
+#if defined(_WIN32)
+	Require(_putenv_s("SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR",dir.c_str())==0,"cannot set the artifact directory");
+#else
+	Require(setenv("SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR",dir.c_str(),1)==0,"cannot set the artifact directory");
+#endif
+	const Fixture& fx=Model(name.c_str(),Number(argv[2]),Number(argv[3]),Number(argv[4]),Number(argv[5]));
+	const uint32_t seed=Seed(argv[6]);
+	const std::vector<uint8_t> blob=Blob(blob_path);Require(IsMagic(blob,"SSB5"),"row blob is not a legacy SSB5");
+	LegacyPool page(fx.model,1);Require(page.status==SSLM_OK,"page pool failed");
+	ContiguousPool contig(fx.model,1);Require(contig.status==SSLM_OK,"contiguous pool failed");
+	sslm_seq paged=nullptr,contiguous=nullptr;
+	Require(sslm_seq_restore(fx.model,&page.pool,blob.data(),blob.size(),&paged)==SSLM_OK,"paged restore failed");
+	Require(sslm_seq_restore(fx.model,&contig.pool,blob.data(),blob.size(),&contiguous)==SSLM_OK,"contiguous restore failed");
+	auto one=[&](sslm_seq s)->std::pair<double,int32_t>{sslm_decode_params p{};p.layer_budget=static_cast<int32_t>(fx.geo.layers);
+		sslm_seq batch[1]={s};int32_t token=-1;const auto begin=clock_type::now();
+		const sslm_status status=sslm_decode_step(fx.model,batch,1,&p,nullptr,&token);
+		const double ns=std::chrono::duration<double,std::nano>(clock_type::now()-begin).count();
+		Require(status==SSLM_OK&&token>=0,"one-call token decode failed");return {ns,token};};
+	// identity first: the driver checks it before it reads any pair (79-7)
+#if defined(PKV_C6_IDENTITY_PROBE)
+	std::cout<<"PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE\n";
+#else
+	std::cout<<"PKV_PAIR_PRODUCTION_V2 defs=none\n";
+#endif
+	for(int i=0;i<warmup;++i){one(paged);one(contiguous);}
+	std::mt19937 random(seed+static_cast<uint32_t>(process));
+	for(int i=0;i<pairs;++i){std::pair<double,int32_t> x,y;
+		if((random()&1)!=0){x=one(paged);y=one(contiguous);}else{y=one(contiguous);x=one(paged);}
+		std::cout<<"PAIR "<<x.first<<' '<<y.first<<' '<<x.second<<' '<<y.second<<'\n';}
+	uint32_t mapped=0,id=0;std::ostringstream ids;ids<<"IDS";
+	Require(sslm_pkv_test_only_seq_table_entry(paged,0,&id,&mapped)==SSLM_OK,"table read failed");
+	for(uint32_t i=0;i<mapped;++i){Require(sslm_pkv_test_only_seq_table_entry(paged,i,&id,nullptr)==SSLM_OK,"table read failed");ids<<' '<<id;}
+	std::cout<<ids.str()<<'\n'<<std::flush;
+	sslm_seq_release(paged);sslm_seq_release(contiguous);
+}
 }
 int main(int argc,char** argv){
 	try{Require(argc>=2,"mode required");const std::string mode=argv[1];
@@ -121,7 +187,7 @@ int main(int argc,char** argv){
 			std::cout<<"PKV_PAIR_PRODUCTION_V2 defs=none\n";
 #endif
 		}
-		else if(mode=="prefill")Prefill(argc,argv);else if(mode=="pair79")Pairs(argc,argv,false);else if(mode=="pair79b")Pairs(argc,argv,true);else throw std::runtime_error("unknown mode");
+		else if(mode=="prefill")Prefill(argc,argv);else if(mode=="pair79")Pairs(argc,argv,false);else if(mode=="pair79b")Pairs(argc,argv,true);else if(mode=="row79")Row79(argc,argv);else throw std::runtime_error("unknown mode");
 		return 0;
 	}catch(const std::exception& error){std::cerr<<"INFRASTRUCTURE: "<<error.what()<<'\n';return 40;}
 }

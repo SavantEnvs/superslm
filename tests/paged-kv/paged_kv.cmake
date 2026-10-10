@@ -82,6 +82,26 @@ else()
 	target_compile_options(superslm_pkv_pair PRIVATE -Wall -Wextra -ffp-contract=off)
 endif()
 
+# Cell 7.9's must-reject, 7.9-MR-OPT (plan rev 16.21, D-SLM8423; slot R79MR): a mutant build of the production sources
+# in which ComputePageGeometry yields B = 16 and the slot ignores the logical page (SUPERSLM_MUTANT_PKV_MR_OPT, read by
+# src/sslm_abi.cpp and include/superslm/forward_sites.h), and the production pair executable built from the same source
+# against it. The pair carries no definition of its own, so its identity line is "defs=none" and it runs through the
+# C6 driver (tools/run_paged_kv_rows.py --page-positions 16) as production's pair does. Box-owed; EXCLUDE_FROM_ALL.
+add_library(superslm_mr_opt STATIC EXCLUDE_FROM_ALL ${SUPERSLM_CORE_SOURCES})
+target_include_directories(superslm_mr_opt PUBLIC include)
+target_compile_definitions(superslm_mr_opt PRIVATE SUPERSLM_MUTANT_PKV_MR_OPT)
+add_executable(superslm_pkv_pair_mr_opt EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_pair.cpp)
+target_link_libraries(superslm_pkv_pair_mr_opt PRIVATE superslm_mr_opt)
+target_include_directories(superslm_pkv_pair_mr_opt PRIVATE ${PKV_DIR} include src tests)
+target_compile_definitions(superslm_pkv_pair_mr_opt PRIVATE PKV_REFERENCE_DIR="${PKV_DIR}/reference")
+if(MSVC)
+	target_compile_options(superslm_mr_opt PRIVATE /W4 /fp:precise)
+	target_compile_options(superslm_pkv_pair_mr_opt PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(superslm_mr_opt PRIVATE -Wall -Wextra -ffp-contract=off)
+	target_compile_options(superslm_pkv_pair_mr_opt PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
 # Lifecycle cost has a frozen v1.11.0 baseline and a paged leg linked to the
 # production library. Its result cannot carry a seam or injection definition.
 superslm_pkv_target(superslm_pkv_lifecycle_prod LIBRARY superslm SOURCES ${PKV_DIR}/c6_lifecycle_timing.cpp)
@@ -116,8 +136,8 @@ pkv_source_manifest(superslm_pkv_pair superslm ${CMAKE_CURRENT_SOURCE_DIR}/tools
 	${PKV_DIR}/pkv_common.h ${PKV_DIR}/pkv_budget_c_helpers.h
 	${CMAKE_CURRENT_SOURCE_DIR}/tools/run_paged_kv_pairs.py ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_load.py)
 get_target_property(PKV_PROD_DEFS superslm COMPILE_DEFINITIONS)
-if("${PKV_PROD_DEFS}" MATCHES "SUPERSLM_.*(SEAM|INJECTION|INSTRUMENT|BENCH)")
-	message(FATAL_ERROR "production superslm library carries a seam/injection definition; lifecycle grading refused")
+if("${PKV_PROD_DEFS}" MATCHES "SUPERSLM_.*(SEAM|INJECTION|INSTRUMENT|BENCH|MUTANT)")
+	message(FATAL_ERROR "production superslm library carries a seam, injection or mutant definition; lifecycle grading refused")
 endif()
 
 # Cells 4.7/C5 and 6.3/C5: the DotRow tiers. superslm_pkv_c5's sources linked against each forced-tier
