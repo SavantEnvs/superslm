@@ -530,12 +530,20 @@ struct World {
 		prefixes.push_back(p);
 		pools[pi].drawn += s.art.R(budget);
 		if (!toks.empty()) {
-			int32_t consumed = -1;
-			const SslmGpuStatus pf = sslm_gpu_prefix_prefill(s.ctx, p, toks.data(), static_cast<int32_t>(toks.size()), 0,
-			                                                 s.one_layer, &consumed);
-			G1C_CHECK(pf == SSLM_OK && consumed == static_cast<int32_t>(toks.size()),
-			          "sslm_gpu_prefix_prefill(%zu) -> %s consumed %d", toks.size(), St(pf), consumed);
-			ok = ok && pf == SSLM_OK;
+			// §7 5.8: the verb's dispatch_budget may stop mid-span and the call resumes, so the build loops
+			// on *consumed; each call passes one token's cost (full depth), so each admits at least one.
+			int32_t consumed = 0;
+			SslmGpuStatus pf = SSLM_OK;
+			const int32_t n = static_cast<int32_t>(toks.size());
+			while (consumed < n) {
+				int32_t c = -1;
+				pf = sslm_gpu_prefix_prefill(s.ctx, p, toks.data() + consumed, n - consumed, 0, s.full_depth, &c);
+				if (c > 0) consumed += c;
+				if (pf != SSLM_OK || c <= 0) break;
+			}
+			G1C_CHECK(pf == SSLM_OK && consumed == n, "sslm_gpu_prefix_prefill(%zu) -> %s consumed %d", toks.size(),
+			          St(pf), consumed);
+			ok = ok && pf == SSLM_OK && consumed == n;
 		}
 		if (freeze) {
 			const SslmGpuStatus fz = sslm_gpu_prefix_freeze(s.ctx, p);

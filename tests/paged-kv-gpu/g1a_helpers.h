@@ -839,6 +839,29 @@ struct GpuPooledBackend : GpuBackendBase {
 
 // The pooled backend with GPU prefixes (G4): sslm_gpu_prefix_begin/_begin_from/_prefill/_freeze/
 // _release and sslm_gpu_seq_adopt_prefix. Only G4 and G5 cells construct it.
+// Every token of `t` into GPU prefix `p` through sslm_gpu_prefix_prefill, looping on `*consumed`
+// (§7 5.8: the verb's dispatch_budget may stop mid-span and the call is resumable). Each call passes
+// a full-depth budget, i.e. one token's cost (dispatches per layer x layers), so every call admits at
+// least one token. `*total` is the tokens that landed; returns the first non-OK status, or a call that
+// admitted nothing as SSLM_SEQUENCE_REJECTED.
+inline SslmGpuStatus GpuPrefixPrefillAll(const Fx& fx, SslmGpuPrefixHandle* p, const int32_t* t, int32_t n, int32_t kind,
+                                         int32_t* total = nullptr) {
+	int32_t done = 0;
+	SslmGpuStatus st = GS::SSLM_OK;
+	while (done < n) {
+		int32_t consumed = 0;
+		st = sslm_gpu_prefix_prefill(Ctx(), p, t + done, n - done, kind, fx.full_depth, &consumed);
+		if (consumed > 0) done += consumed;
+		if (st != GS::SSLM_OK) break;
+		if (consumed <= 0) {
+			st = GS::SSLM_SEQUENCE_REJECTED;
+			break;
+		}
+	}
+	if (total) *total = done;
+	return st;
+}
+
 struct GpuPrefixBackend : GpuPooledBackend {
 	using GpuPooledBackend::GpuPooledBackend;
 	const char* Name() const override { return "gpu-pooled+prefix"; }
@@ -857,8 +880,8 @@ struct GpuPrefixBackend : GpuPooledBackend {
 	int PrefixPrefill(void* p, const std::vector<int32_t>& t) override {
 		if (t.empty()) return 0;
 		int32_t consumed = 0;
-		const SslmGpuStatus st = sslm_gpu_prefix_prefill(Ctx(), static_cast<SslmGpuPrefixHandle*>(p), t.data(),
-		                                                 static_cast<int32_t>(t.size()), /*kind=*/0, fx.one_layer, &consumed);
+		const SslmGpuStatus st = GpuPrefixPrefillAll(fx, static_cast<SslmGpuPrefixHandle*>(p), t.data(),
+		                                             static_cast<int32_t>(t.size()), /*kind=*/0, &consumed);
 		if (st != GS::SSLM_OK) return AsInt(st);
 		return consumed == static_cast<int32_t>(t.size()) ? 0 : AsInt(GS::SSLM_SEQUENCE_REJECTED);
 	}

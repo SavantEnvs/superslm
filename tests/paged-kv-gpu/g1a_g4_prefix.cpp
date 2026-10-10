@@ -67,7 +67,7 @@ SslmGpuPrefixHandle* FrozenPrefix(const Fx& fx, SslmGpuKvPoolHandle* pool, uint3
 	if (sslm_gpu_prefix_begin(Ctx(), fx.gpu, pool, len, &p) != GS::SSLM_OK || !p) return nullptr;
 	const std::vector<int32_t> t = pkv::Stream(seed, len, fx.vocab);
 	int32_t consumed = 0;
-	const bool ok = sslm_gpu_prefix_prefill(Ctx(), p, t.data(), len, 0, fx.one_layer, &consumed) == GS::SSLM_OK &&
+	const bool ok = GpuPrefixPrefillAll(fx, p, t.data(), len, 0, &consumed) == GS::SSLM_OK &&
 	                consumed == len && sslm_gpu_prefix_freeze(Ctx(), p) == GS::SSLM_OK;
 	G1A_CHECK_MSG(ok, "1.9: a GPU prefix of %d tokens did not build", len);
 	if (!ok) {
@@ -399,6 +399,26 @@ void Cell815() {
 // CPU twin's (the same calls on the CPU's budget prefix, child and adopter). kills: a GPU adopt or
 // begin_from that drops the walk state or the binding; a forced row written to the wrong page at the
 // boundary.
+//
+// CONSTRUCTION (G4 cells fix): pkv_def's schema accepts exactly one document, spelled by one token, so the
+// admitted token completes it and no continuation exists under the schema after it -- on both twins the
+// adopter's decode is the defined dead end (`-2`, SSLM_OK, retry-stable: the walk and the ready token are
+// unchanged). The decode is therefore graded the CPU twin's way (c5_dim8_composition.cpp 8.3, CensusGreedy):
+// one outcome per step, the token or the dead end's -2, six steps on each twin, byte-equal. That outcome is
+// the walk's own observable: an adopt or begin_from that drops the walk restarts it and emits the admitted
+// token, and one that drops the binding decodes unmasked -- either gives real tokens where the twin
+// dead-ends. The rows graded are [0, L) with L the chain's n0 + 1 + 20 rows plus one per emitted token a
+// later step embedded (Rows816).
+constexpr int k816Steps = 6;
+
+// The rows a decode of `toks` (one outcome per step) wrote past the adopted length: a real token's row is
+// written by the next step's embed, so every real token but a final one counts.
+int64_t Rows816(const std::vector<int32_t>& toks) {
+	int64_t n = 0;
+	for (size_t i = 0; i + 1 < toks.size(); ++i) n += toks[i] >= 0 ? 1 : 0;
+	return n;
+}
+
 int32_t AdmittedToken(const Fx& fx, sslm_schema schema) {
 	CpuPagedBackend legacy(fx, static_cast<uint32_t>(fx.CapPages()), true);
 	sslm_seq d = nullptr;
@@ -433,13 +453,13 @@ SchemaOut SchemaRunGpu(const Fx& fx, int32_t schema, int32_t n0, int32_t admitte
 	G1A_CHECK_GPU(sslm_gpu_prefix_set_schema(Ctx(), root, schema), GS::SSLM_OK);
 	const std::vector<int32_t> p0 = pkv::Stream(84, n0, V), p1 = pkv::Stream(85, 20, V);
 	int32_t c = 0;
-	G1A_CHECK_GPU(sslm_gpu_prefix_prefill(Ctx(), root, p0.data(), n0, 0, fx.one_layer, &c), GS::SSLM_OK);
-	G1A_CHECK_GPU(sslm_gpu_prefix_prefill(Ctx(), root, &admitted, 1, /*kind=*/1, fx.one_layer, &c), GS::SSLM_OK);
+	G1A_CHECK_GPU(GpuPrefixPrefillAll(fx, root, p0.data(), n0, 0, &c), GS::SSLM_OK);
+	G1A_CHECK_GPU(sslm_gpu_prefix_prefill(Ctx(), root, &admitted, 1, /*kind=*/1, fx.full_depth, &c), GS::SSLM_OK);
 	G1A_CHECK_EQ(c, 1);
 	G1A_CHECK_GPU(sslm_gpu_prefix_freeze(Ctx(), root), GS::SSLM_OK);
 	G1A_CHECK_GPU(sslm_gpu_prefix_begin_from(Ctx(), root, 32, &child), GS::SSLM_OK);
 	if (child) {
-		G1A_CHECK_GPU(sslm_gpu_prefix_prefill(Ctx(), child, p1.data(), 20, 0, fx.one_layer, &c), GS::SSLM_OK);
+		G1A_CHECK_GPU(GpuPrefixPrefillAll(fx, child, p1.data(), 20, 0, &c), GS::SSLM_OK);
 		G1A_CHECK_GPU(sslm_gpu_prefix_freeze(Ctx(), child), GS::SSLM_OK);
 		G1A_CHECK_GPU(sslm_gpu_seq_create_budgeted(Ctx(), fx.gpu, gpu.pool, 32, &s), GS::SSLM_OK);
 	}
@@ -447,10 +467,16 @@ SchemaOut SchemaRunGpu(const Fx& fx, int32_t schema, int32_t n0, int32_t admitte
 		G1A_CHECK_GPU(SslmGpuSeqSetSchemaForG5Bridge(Ctx(), s, schema), GS::SSLM_OK);
 		G1A_CHECK_GPU(sslm_gpu_seq_adopt_prefix(Ctx(), s, child), GS::SSLM_OK);
 		G1A_CHECK_GPU(SslmGpuSeqSchemaAcceptingForG5Bridge(Ctx(), s, &o.accepting), GS::SSLM_OK);
-		std::vector<int32_t> toks;
-		G1A_CHECK_EQ(gpu.Decode(s, 6, &toks), 0);
-		o.tokens = toks;
-		o.L = n0 + 1 + 20 + 5;  // the forced row, the child's 20, five decoded rows after the ready token
+		int32_t last = -1;
+		for (int i = 0; i < k816Steps; ++i) {
+			int32_t tok = -1;
+			const SslmGpuStatus st = GpuNextToken(fx, s, last, GpuDecodeMode::kBridge, fx.full_depth, &tok);
+			G1A_CHECK_GPU(st, GS::SSLM_OK);
+			if (st != GS::SSLM_OK) break;
+			o.tokens.push_back(tok);
+			if (tok >= 0) last = tok;
+		}
+		o.L = n0 + 1 + 20 + Rows816(o.tokens);  // the forced row, the child's 20, the decoded rows
 		G1A_CHECK_MSG(gpu.Rows(s, o.L, &o.rows), "8.16: rows unreadable");
 		gpu.Release(s);
 	}
@@ -484,15 +510,28 @@ SchemaOut SchemaRunCpu(const Fx& fx, sslm_schema schema, int32_t n0, int32_t adm
 		sslm_stats_out st{};
 		G1A_CHECK_EQ(sslm_stats(fx.cpu, s, &st), SSLM_OK);
 		o.accepting = st.schema_accepting;
-		std::vector<int32_t> toks;
-		G1A_CHECK_EQ(cpu.Decode(s, 6, &toks), SSLM_OK);
-		o.tokens = toks;
-		o.L = n0 + 1 + 20 + 5;
+		sslm_decode_params p{};
+		p.layer_budget = static_cast<int32_t>(fx.geo.layers);
+		sslm_seq b[1] = {s};
+		for (int i = 0; i < k816Steps; ++i) {
+			int32_t tok = -7;
+			const sslm_status st = sslm_decode_step(fx.cpu, b, 1, &p, nullptr, &tok);
+			G1A_CHECK_EQ(st, SSLM_OK);
+			if (st != SSLM_OK) break;
+			o.tokens.push_back(tok);
+		}
+		o.L = n0 + 1 + 20 + Rows816(o.tokens);
 		G1A_CHECK_MSG(cpu.Rows(s, o.L, &o.rows), "8.16: CPU rows unreadable");
 		sslm_seq_release(s);
 	}
 	if (child) sslm_prefix_release(child);
 	sslm_prefix_release(root);
+	return o;
+}
+
+std::string Join816(const std::vector<int32_t>& t) {
+	std::string o;
+	for (size_t i = 0; i < t.size(); ++i) o += (i ? "," : "") + std::to_string(t[i]);
 	return o;
 }
 
@@ -509,7 +548,9 @@ void Cell816() {
 	for (int32_t n0 : {15, 16}) {
 		const SchemaOut g = SchemaRunGpu(fx, gpu_schema, n0, admitted);
 		const SchemaOut c = SchemaRunCpu(fx, cpu_schema, n0, admitted);
-		G1A_CHECK_MSG(g.tokens == c.tokens && !g.tokens.empty(), "8.16 forced token at %d: tokens differ from the CPU twin", n0);
+		G1A_CHECK_MSG(g.tokens == c.tokens && g.tokens.size() == static_cast<size_t>(k816Steps),
+		              "8.16 forced token at %d: decode outcomes [%s] differ from the CPU twin's [%s]", n0,
+		              Join816(g.tokens).c_str(), Join816(c.tokens).c_str());
 		G1A_CHECK_MSG(g.accepting == c.accepting, "8.16 forced token at %d: schema_accepting %d vs %d", n0, g.accepting, c.accepting);
 		G1A_CHECK_MSG(g.rows == c.rows && !g.rows.empty(), "8.16 forced token at %d: rows differ from the CPU twin", n0);
 	}

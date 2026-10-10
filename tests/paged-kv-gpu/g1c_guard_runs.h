@@ -459,8 +459,9 @@ inline GuardedSpec SpecPrefixPrefill(AKind a) {
 	};
 	g.call = [](World& w) {
 		w.i32 = -1;
+		// One call that covers the whole span: per-token cost is full depth (dispatches per layer x layers).
 		return sslm_gpu_prefix_prefill(w.s.ctx, w.Q, w.toks.data(), static_cast<int32_t>(w.toks.size()), 0,
-		                               w.s.one_layer, &w.i32);
+		                               w.s.full_depth * static_cast<uint32_t>(w.toks.size()), &w.i32);
 	};
 	g.check_refused = [](World& w) { G1C_CHECK(w.i32 == 0, "prefix prefill: *consumed %d on the refusal", w.i32); };
 	g.output = [](World& w, SslmGpuStatus) {

@@ -94,7 +94,8 @@ struct Run {
 			return Fail("prefix_begin");
 		b.prefixes.push_back(x);
 		int32_t consumed = -1;
-		const SslmGpuStatus st = sslm_gpu_prefix_prefill(b.ctx, x, prefix_toks.data(), kPrefixLen, /*kind=*/0, 64, &consumed);
+		const SslmGpuStatus st = sslm_gpu_prefix_prefill(b.ctx, x, prefix_toks.data(), kPrefixLen, /*kind=*/0,
+		                                                   b.FullDepthBudget(), &consumed);
 		if (st != SSLM_OK || consumed != kPrefixLen) return Fail("prefix_prefill of 1,000 tokens");
 		if (sslm_gpu_prefix_freeze(b.ctx, x) != SSLM_OK) return Fail("prefix_freeze");
 		*out = x;
@@ -151,7 +152,7 @@ std::vector<uint8_t> ForeignBlob(Run& r, Bench& b2) {
 	int32_t consumed = -1;
 	if (sslm_gpu_prefix_begin(b2.ctx, b2.fx.model, p2, kPrefixLen + 32, &x2) != SSLM_OK || !x2) return {};
 	b2.prefixes.push_back(x2);
-	if (sslm_gpu_prefix_prefill(b2.ctx, x2, r.prefix_toks.data(), kPrefixLen, 0, 64, &consumed) != SSLM_OK ||
+	if (sslm_gpu_prefix_prefill(b2.ctx, x2, r.prefix_toks.data(), kPrefixLen, 0, b2.FullDepthBudget(), &consumed) != SSLM_OK ||
 	    sslm_gpu_prefix_freeze(b2.ctx, x2) != SSLM_OK)
 		return {};
 	SslmGpuSequenceHandle* s2 = b2.Budgeted(p2, kPrefixLen + 64);
@@ -240,7 +241,11 @@ void RunG4OrTwin(bool latch_set, bool twin) {
 	Expect("A", g1d::NextTokens(r.b, A, r.q, kNext), TwinA(r, latch_set));
 	Expect("B", g1d::NextTokens(r.b, B, r.q, kNext), TwinPrefix(r, 0));
 	if (C) {
-		SslmGpuSequenceHandle* E = r.Adopt(C);
+		// Sec3.9 A17: only a frozen prefix is adoptable. Freeze submits nothing (no dispatch, no upload), so the
+		// adopt below is still the latch-set upload the construction intends.
+		const SslmGpuStatus fz = sslm_gpu_prefix_freeze(r.b.ctx, C);
+		CHECK_MSG(fz == SSLM_OK, "freeze(C) returned %s", StatusName(fz));
+		SslmGpuSequenceHandle* E = fz == SSLM_OK ? r.Adopt(C) : nullptr;
 		if (E) Expect("C (through E's adopt)", g1d::NextTokens(r.b, E, r.q, kNext), TwinPrefix(r, 0));
 	}
 	if (R) Expect("the restored sequence", g1d::NextTokens(r.b, R, r.q, kNext), TwinPrefix(r, 2));
