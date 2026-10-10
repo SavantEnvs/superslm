@@ -5308,7 +5308,7 @@ SslmGpuStatus sslm_gpu_prefix_beginImpl(SslmGpuContext* ctx, SslmGpuModelHandle*
 // no pool, so it cannot cross pools, and no refusal is written for it). Refusals, in §4.4's order, each
 // changing nothing: a null out-handle, a null or another context's parent, a budget outside [1, cap]
 // (SSLM_SEQUENCE_KV_BUFFER_MISMATCH); a parent that is not frozen (SSLM_GPU_PREFIX_REJECTED); then the
-// interim guard (before the draw); then SSLM_GPU_KV_POOL_EXHAUSTED with nothing drawn. It shares the
+// entry guard (EntrySubmitGuard) (before the draw); then SSLM_GPU_KV_POOL_EXHAUSTED with nothing drawn. It shares the
 // parent's floor(len/B) full pages, copies the partial tail page through the host mirror into a page of
 // its own reserve and uploads that page (the pool upload, on the process's device), and copies the
 // parent's state verbatim -- the bind permission and the ready flag included (gap 4b) -- with origin =
@@ -5416,7 +5416,7 @@ SslmGpuStatus sslm_gpu_prefix_set_schemaImpl(SslmGpuContext* ctx, SslmGpuPrefixH
 // guard (§4.4's table): the arguments (SSLM_SEQUENCE_KV_BUFFER_MISMATCH: a null `consumed`, context or
 // prefix, another context's prefix, a negative count, null tokens, a zero budget, a kind other than 0 or
 // 1); after freeze, SSLM_GPU_PREFIX_REJECTED; and, as the decode call's budget refusal, a dispatch_budget
-// below one token at full depth while count > 0: SSLM_DISPATCH_BUDGET_TOO_SMALL. Then the interim guard
+// below one token at full depth while count > 0: SSLM_DISPATCH_BUDGET_TOO_SMALL. Then the entry guard (EntrySubmitGuard)
 // (after the freeze check). The call admits n = min(count, floor(dispatch_budget / (dispatches per layer
 // * layers))) tokens and hands them to the bridge, whose statuses it returns unchanged; `*consumed` counts
 // the tokens that landed (the schema bridge's own count, or the prompt bridge's context-length advance).
@@ -5473,9 +5473,14 @@ SslmGpuStatus sslm_gpu_prefix_releaseImpl(SslmGpuContext* ctx, SslmGpuPrefixHand
 	if (!prefix) return SSLM_OK;
 	if (prefix->ctx != ctx) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	if (prefix->seq != nullptr) {
+		// Only SSLM_BUSY leaves the internal sequence alive; every other status (a refcount underflow's
+		// SSLM_SEQUENCE_KV_BUFFER_MISMATCH included) has already consumed and deleted it, so the handle
+		// is finished too, as the sequence release finishes (G4 review F2).
 		const SslmGpuStatus st = sslm_gpu_seq_releaseImpl(ctx, prefix->seq);
-		if (st != SSLM_OK) return st;
+		if (st == SSLM_BUSY) return st;
 		prefix->seq = nullptr;
+		delete prefix;
+		return st;
 	}
 	delete prefix;
 	return SSLM_OK;
@@ -5489,7 +5494,7 @@ SslmGpuStatus sslm_gpu_prefix_releaseImpl(SslmGpuContext* ctx, SslmGpuPrefixHand
 // a null or another context's handle, or a prefix of another model (SSLM_SEQUENCE_KV_BUFFER_MISMATCH); a
 // dedicated `seq` (SSLM_GPU_HOLDER_MODE_MISMATCH, A15); a prefix that is not frozen, or of another pool
 // (SSLM_GPU_PREFIX_REJECTED, A16/A17); the schema rule (SSLM_GPU_PREFIX_SCHEMA_MISMATCH, A18); then the
-// interim guard, which also refuses an adopt onto a Submitted `seq` (SSLM_BUSY). On success the CPU adopt's
+// entry guard (EntrySubmitGuard), which also refuses an adopt onto a Submitted `seq` (SSLM_BUSY). On success the CPU adopt's
 // field rules: the forward state copied, the walk state transferred iff the prefix carries real schema
 // progress (else reset to the bound schema's start), the binding kept, origin = the prefix's length, and
 // the bind permission revoked (gap 4d); a refusal revokes nothing. A failure of the upload's staging buffer
