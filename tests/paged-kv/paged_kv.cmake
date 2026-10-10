@@ -117,3 +117,39 @@ if(PKV_C5_SOURCES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|X
 		superslm_pkv_target(superslm_pkv_c5_${tier}_forced LIBRARY superslm_${tier}_forced SOURCES ${PKV_C5_SOURCES})
 	endforeach()
 endif()
+
+# Paged-KV plan rev 16.21 §23.8, step T0: the R9 red suite for steps T1 to T3 (the page-size rule and
+# rotation, the partial last page, the contiguous pool option). Cells are tagged with their R9 step
+# (T1, T2, T3) and their §7 id. Two executables:
+#   superslm_pkv_r9      every bench cell: generated and CFG1-patched fixtures, no real artifact
+#   superslm_pkv_r9_box  the real-artifact cells (SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR); authored and
+#                        compiled at T0, run on the box only
+# Both are EXCLUDE_FROM_ALL. The R9 verbs and the pin seam are declared in tests/paged-kv/pkv_r9.h.
+# Until the builder defines them, pkv_r9_stubs.cpp defines each as an unimplemented stub (a refusal,
+# nothing written), so the cells link and fail at their assertions. The builder turns each option
+# OFF in the commit that defines the real symbol; a stub left ON beside a real definition fails the
+# link with a duplicate symbol, so the two cannot coexist.
+option(SUPERSLM_PKV_R9_STUB_CONTIGUOUS "T0 stubs for sslm_kv_pool_contiguous_size and sslm_kv_pool_create_contiguous" ON)
+option(SUPERSLM_PKV_R9_STUB_PIN "T0 stub for the test-only pin KvPagesTestPinPagePositions" ON)
+file(GLOB PKV_R9_SOURCES CONFIGURE_DEPENDS ${PKV_DIR}/r9_*.cpp)
+file(GLOB PKV_R9_BOX_SOURCES CONFIGURE_DEPENDS ${PKV_DIR}/r9box_*.cpp)
+foreach(r9 superslm_pkv_r9 superslm_pkv_r9_box)
+	if(r9 STREQUAL "superslm_pkv_r9")
+		superslm_pkv_target(${r9} SOURCES ${PKV_R9_SOURCES} ${PKV_DIR}/pkv_r9_stubs.cpp)
+	else()
+		superslm_pkv_target(${r9} SOURCES ${PKV_R9_BOX_SOURCES} ${PKV_DIR}/pkv_r9_stubs.cpp)
+	endif()
+	if(SUPERSLM_PKV_R9_STUB_CONTIGUOUS)
+		target_compile_definitions(${r9} PRIVATE PKV_R9_STUB_CONTIGUOUS=1)
+	endif()
+	if(SUPERSLM_PKV_R9_STUB_PIN)
+		target_compile_definitions(${r9} PRIVATE PKV_R9_STUB_PIN=1)
+	endif()
+endforeach()
+
+# Cell 4.12's link half: a unit that references the pin, linked to the production `superslm`
+# library, must FAIL to link (tests/paged-kv/r9_pin_reach.py builds this target and expects a link
+# error naming the pin). It never carries the stub.
+add_executable(superslm_pkv_r9_pin_link_probe EXCLUDE_FROM_ALL ${PKV_DIR}/pkv_r9_pin_link_probe.cpp)
+target_link_libraries(superslm_pkv_r9_pin_link_probe PRIVATE superslm)
+target_include_directories(superslm_pkv_r9_pin_link_probe PRIVATE ${PKV_DIR} include)
