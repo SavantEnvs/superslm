@@ -1437,7 +1437,7 @@ extern "C" sslm_status sslm_kv_page_pool_create(sslm_model model, void* buf, siz
 // per block, through the same page module: every holder in it is one page (1.11.0's layout), and every verb works
 // on it as on a page pool with B = cap. Its size is block_count * (block + 8) + 32: 1.11.0's flat block per block,
 // plus the page module's 8 bytes a page and 32 (§3.6). 0 on a null model, a zero count, or where the product or the
-// sum overflows (rev 16.21, D-SLM8422: the sum is the binding term).
+// sum overflows. The product N * (block + 8) is checked first; at cell 4.14's geometry it binds (D-SLM8499).
 namespace {
 size_t ContiguousSize(const sslm_model_s* model, uint32_t block_count) {
 	if (!model || block_count == 0) return 0;

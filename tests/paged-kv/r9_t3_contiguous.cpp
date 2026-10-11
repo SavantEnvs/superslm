@@ -325,9 +325,9 @@ void Cell414Hostile() {
 	PKV_CHECK(!fits);
 	PKV_CHECK(3054198966ull <= UINT64_MAX / 6039797760ull && 3054198967ull > UINT64_MAX / 6039797760ull);  // the product
 	PKV_CHECK_MSG(sslm_kv_pool_contiguous_size(big.model, 3054198961u) != 0, "the size at 3,054,198,961 is 0");
-	// At 3,054,198,962 the sum overflows first. Kills: the sum with the overhead unchecked (nonzero there), in the
-	// engine's decomposition N * (block + 8) + 32 and in the plan's N * block + (8N + 32) (§23.3); and the engine's
-	// product N * (block + 8) unchecked, which already wraps there.
+	// At 3,054,198,962 the engine's product N * (block + 8) overflows first; it is checked before the + 32 (D-SLM8499).
+	// Kills: that product unchecked, and the plan's sum N * block + (8N + 32) unchecked (§23.3). Not the engine's + 32
+	// unchecked: at 961 the product is 6,033,832,567 below 2^64 - 1, so the + 32 cannot carry, and no cell kills it.
 	PKV_CHECK_MSG(sslm_kv_pool_contiguous_size(big.model, 3054198962u) == 0, "the size at 3,054,198,962 is not 0");
 	// At 3,054,198,967 the bare product N * block overflows (T-3212 C-2). Kills: the plan's product N * block unchecked
 	// with 8N + 32 added checked, which reads 0 at 962 to 966 (its checked sum catches them) and a wrapped size from
