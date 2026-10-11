@@ -23,9 +23,10 @@ Environment (all required; unset or missing fails the cells, never skips them):
   PKV_BFR              the build directory: B-FR, the Ninja Release build of the fix-round tip (plan §30.3)
   PKV_BFR_REPO         a clean checkout of SuperSLM at the manifests' git_head (79-18)
   PKV_COMMISSION_TOOL  the registrar of the Wizard tree under test, instrument-commission.ps1 (79-18; T-3210 O-5).
-                       bound() reads a fixed path (verify_paged_kv_binding.py, D:/Wizard/Claude/Tooling/...); 79-18
-                       redirects that one path, in its own process, to this file, so it grades the tree under test
-                       and never the main checkout's copy by default
+                       bound() grades the registrar beside the registry it is handed (SuperSLM cb7dd42, no fallback),
+                       so 79-18 copies this file beside each fixture registry
+  PKV_BINDING_VERIFIER optional: the verify_paged_kv_binding.py under test (default this checkout's; the test author
+                       runs the pre-cb7dd42 verifier through it)
 The real link-line mutant and the check-8 mutant (§30.2, §31) are executed once and cited in the test author's record
 (T-3189 §17); never committed.
 """
@@ -45,12 +46,15 @@ CHECKER = TOOLS / "check_paged_kv_pair_link.py"
 BFR = os.environ.get("PKV_BFR", "")
 REPO = os.environ.get("PKV_BFR_REPO", "")
 REGISTRAR = os.environ.get("PKV_COMMISSION_TOOL", "")
-BOUND_VERIFIER = "D:/Wizard/Claude/Tooling/instrument-commission.ps1"  # the path bound() reads (T-3210 O-5)
+# The main checkout's registrar: the path the verifier before cb7dd42 read whatever registry it was handed. 79-18's two
+# sibling pins claim these bytes, so a verifier that still reads this path reads them bound and fails the pins.
+MAIN_REGISTRAR = Path("D:/Wizard/Claude/Tooling/instrument-commission.ps1")
 MA, PAIR, MR = "superslm_pkv_pair_ma.exe", "superslm_pkv_pair.exe", "superslm_pkv_pair_mr_opt.exe"
 LIB = "superslm.lib"
 IDENTITY = {"ma1": "PKV_PAIR_MA1_V1 defs=none", "ma2": "PKV_PAIR_MA2_V1 defs=none"}
 
-_spec = importlib.util.spec_from_file_location("pkv_binding", TOOLS / "verify_paged_kv_binding.py")
+_spec = importlib.util.spec_from_file_location(
+    "pkv_binding", os.environ.get("PKV_BINDING_VERIFIER") or TOOLS / "verify_paged_kv_binding.py")
 binding = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(binding)
 
@@ -224,33 +228,29 @@ class Cell7918(Build):
                       "(T-3210 O-5); there is no default")
         self.registrar = Path(REGISTRAR)
 
-    def bound(self, binary, registry, registrar=None):
-        """verify_paged_kv_binding.bound(), with its one fixed path (the registrar it hashes) redirected to `registrar`
-        (default PKV_COMMISSION_TOOL) for this call only."""
-        real = binding.Path
-        target = Path(registrar or self.registrar)
+    def bound(self, binary, registry):
+        return binding.bound(binary, self.repo, registry, "SUCCESSOR")[0]
 
-        def path(*parts):
-            if len(parts) == 1 and str(parts[0]) == BOUND_VERIFIER:
-                return target
-            return real(*parts)
-        binding.Path = path
-        try:
-            return binding.bound(binary, self.repo, registry, "SUCCESSOR")[0]
-        finally:
-            binding.Path = real
-
-    def entry(self, manifest_path):
+    def entry(self, manifest_path, claim=None, sibling=b"registrar"):
+        """A fixture registry in its own directory naming the driver, its source_binding taken from `manifest_path`, its
+        verifier_sha256 the hash of `claim` (default PKV_COMMISSION_TOOL). Beside it, instrument-commission.ps1 holds
+        `sibling`: the claimed registrar's bytes by default, other bytes when given, or nothing when None."""
+        claim = Path(claim or self.registrar)
         m = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
         driver = self.repo / "tools" / "run_paged_kv_rows.py"
-        registry = self.root / "registry.json"
+        d = Path(tempfile.mkdtemp(dir=self.root))
+        registry = d / "registry.json"
         registry.write_text(json.dumps({"SUCCESSOR": {
             "instrument": str(driver),
             "instrument_sha256": m["sources"].get("tools/run_paged_kv_rows.py") or binding.sha(driver, normalized=True),
             "source_binding": {"manifest_sha256": sha(manifest_path), "git_head": m["git_head"],
                                "git_tree": m["git_tree"], "build_recipe_sha256": binding.canonical(m["build_recipe"]),
                                "measurement_env": binding.measurement_env(),
-                               "verifier_sha256": sha(self.registrar)}}}))
+                               "verifier_sha256": sha(claim)}}}))
+        if sibling == b"registrar":
+            sibling = claim.read_bytes()
+        if sibling is not None:
+            (d / "instrument-commission.ps1").write_bytes(sibling)
         return registry
 
     def test_79_18_driver_in_the_production_manifest(self):
@@ -258,17 +258,27 @@ class Cell7918(Build):
         self.assertIn("tools/run_paged_kv_rows.py", m["sources"])
         self.assertIn("run_paged_kv_rows.py", m["invoked"])
 
+    # cb7dd42: bound() grades the registrar beside the registry it is handed, with no fallback. Both members claim the
+    # main checkout's registrar, the one the earlier verifier read whatever the registry: that verifier reads them bound
+    def test_79_18_registrar_is_the_registrys_sibling(self):
+        if not MAIN_REGISTRAR.is_file():
+            self.fail(f"{MAIN_REGISTRAR} is the claim these members name; it does not exist here")
+        manifest = self.build / f"{PAIR}.source-set.json"
+        with self.subTest(sibling="one byte different"):
+            registry = self.entry(manifest, MAIN_REGISTRAR, MAIN_REGISTRAR.read_bytes() + b"#")
+            self.assertFalse(self.bound(self.build / PAIR, registry),
+                             "bound() read a registrar other than the registry's sibling")
+        with self.subTest(sibling="missing"):
+            registry = self.entry(manifest, MAIN_REGISTRAR, None)
+            self.assertFalse(self.bound(self.build / PAIR, registry),
+                             "bound() fell back to a registrar when none sits beside the registry")
+
     def test_79_18_bound_with_the_driver_and_not_without(self):
         head = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"], capture_output=True, text=True)
         self.assertEqual(head.stdout.strip(), self.manifest(PAIR)["git_head"], "PKV_BFR_REPO is not at the head")
-        registry = self.entry(self.build / f"{PAIR}.source-set.json")
-        self.assertTrue(self.bound(self.build / PAIR, registry),
-                        "bound() is false for the driver entry against the build's manifest")
-        # the redirect is real: a registrar other than the one the entry names makes the same entry unbound (O-5)
-        other = self.root / "instrument-commission.ps1"
-        other.write_bytes(self.registrar.read_bytes() + b"\n# another registrar\n")
-        self.assertFalse(self.bound(self.build / PAIR, registry, other),
-                         "bound() did not read the registrar the cell names")
+        manifest = self.build / f"{PAIR}.source-set.json"
+        self.assertTrue(self.bound(self.build / PAIR, self.entry(manifest)),
+                        "bound() is false for the driver entry with the tree's registrar beside the registry")
         d = Path(tempfile.mkdtemp(dir=self.root))
         for name in (PAIR, LIB):
             shutil.copyfile(self.build / name, d / name)
