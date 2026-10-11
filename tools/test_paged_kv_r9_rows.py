@@ -31,6 +31,8 @@ Cells (cell 7.9's text; the 79-series rows of the instrument table):
           7.9-MR-OPT) with no ids, or an empty IDS line, refuses 62; every construction refuses every other's identity
           (62); MA rows record guard "not applicable (no paged arm)" and grade by the row rule, R79A's aggregate over
           the four standing; argv and identity in every row and process record
+  T9      (T-3206 N-2, SuperSLM c4e3bf1; class T8Remedies, test_t9_*) an MA-1 or MA-2 run printing a RESERVE line
+          refuses 62 with no record; production and 7.9-MR-OPT runs printing one record it
   loop    (T-3196 F-6) 79-6 to 79-9 through the driver's process loop, as a process: five processes against a
           stand-in pair executable, each refusal injected into process 3 (a blob changed after process 2, a seam
           identity line, a token mismatch at pair 57, 103 pairs); the exit status is EXIT_CODES[kind], the refused
@@ -898,6 +900,23 @@ class T8Remedies(unittest.TestCase):
         done = self.aggregate("R79A", self.runs(R79A_RUNS), result)
         self.assertEqual(done.returncode, 0, done.stderr[-2000:])
         self.assertEqual(self.record(result).get("status"), "STANDING")
+
+    # T-3206 N-2: a reserve is the paged arm's; an MA run printing a RESERVE line refuses (62) with no record, while
+    # the constructions with a paged arm record theirs
+    def test_t9_ma_run_printing_reserve_refuses_and_paged_runs_record_it(self):
+        for construction in ("MA-1", "MA-2"):
+            with self.subTest(construction=construction):
+                done = self.refused_62(construction, f"{construction} with a RESERVE line", reserve=RESERVE_LINE)
+                self.assertIn("RESERVE line", done.stderr)
+        want = {"seed": 1, "singles": 63, "source": "tests/paged-kv/pkv_scatter_reserve.h"}
+        for construction in WITH_PAGED_ARM:
+            with self.subTest(construction=construction):
+                result = self.root / f"{construction}.json"
+                done = self.drive(self.root, ROW_FOR[construction], result, construction, log=self.log,
+                                  reserve=RESERVE_LINE)
+                self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+                rec = self.record(result)
+                self.assertEqual((rec.get("status"), rec.get("reserve")), ("STANDING", want))
 
     # D-SLM8466 (2): argv and identity in every row and process record. The row's argv is the driver's own command line;
     # each process's is the exact pair command it ran

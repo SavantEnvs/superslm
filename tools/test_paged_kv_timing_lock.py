@@ -20,7 +20,9 @@ meets the others' real pids:
            is never visible empty. The PowerShell acquire is not observable this way (record T-3189 §14).
   boot     (D-SLM8466 (3)) a lock file modified before the last boot is stale in every holder, whatever it holds (a live
            pid, torn content); the same live pid written after the boot refuses; the driver records the reason
-  torn     (T-3204 N-2) a JSON body, or a dead pid with a sign or a digit separator, is torn in every holder
+  torn     (T-3204 N-2) a JSON body, or a dead pid with a sign or a digit separator, is torn in every holder; (T-3206
+           N-4, O-3) so is a number outside 1 to 2**31 - 1 (99999999999, 2147483648, 0, 00) and non-ASCII digits
+           (fullwidth); a dead 2147483647, the largest pid, is recovered by every holder
   sharing  (T-3204 O-3) a holder of the file without write sharing: every holder refuses, PowerShell by name
 
 PKV_ROWS_DRIVER, PKV_PAIRS_RUNNER and PKV_PROVENANCE_PS1 name the programs under test (default: this checkout's); the
@@ -297,7 +299,7 @@ class TimingLock(unittest.TestCase):
         return p.pid
 
     def write_lock(self, text, before_boot):
-        self.lock.write_bytes(text.encode("ascii"))
+        self.lock.write_bytes(text.encode("utf-8"))
         if before_boot:
             when = self.last_boot() - 3600
             os.utime(self.lock, (when, when))
@@ -334,14 +336,24 @@ class TimingLock(unittest.TestCase):
         digits = str(dead)
         for contender in PROGRAMS:
             for name, text in (("json", '{"pid": %d}' % dead), ("plus sign", "+" + digits),
-                               ("separator", digits[:1] + "_" + digits[1:]), ("minus sign", "-" + digits)):
+                               ("separator", digits[:1] + "_" + digits[1:]), ("minus sign", "-" + digits),
+                               ("above Int32", "99999999999"), ("2**31", "2147483648"), ("zero", "0"),
+                               ("zeros", "00"), ("fullwidth digits", "\uff11\uff12\uff13")):
                 with self.subTest(contender=contender, content=name):
                     self.write_lock(text, False)
                     line = self.attempt(contender)
                     self.assertTrue(line.startswith("REFUSED"), f"{contender} took a lock holding {text!r}: {line}")
                     self.assertIn("torn", line)
-                    self.assertEqual(self.content(), text, f"{contender} changed a torn lock")
+                    self.assertEqual(self.lock.read_bytes(), text.encode("utf-8"), f"{contender} changed a torn lock")
                     self.lock.unlink()
+
+    # range: 2147483647 (2**31 - 1) is a pid; dead, it is stale, recovered by every holder, and its release removes it
+    def test_largest_pid_dead_is_recovered(self):
+        for contender in PROGRAMS:
+            with self.subTest(contender=contender):
+                self.write_lock("2147483647", False)
+                self.assertEqual(self.attempt(contender), "HELD")
+                self.assertFalse(self.lock.exists())
 
     # sharing: another process holds the lock file open without write sharing. Every holder refuses; the PowerShell
     # holder names the sharing conflict (never a raw .NET error)
