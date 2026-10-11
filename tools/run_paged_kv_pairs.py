@@ -83,6 +83,7 @@ def live_load_state(record: Path) -> dict:
 
 _LOCK_BYTE = 1 << 20
 LOCK_PID_MAX = 2**31 - 1  # a pid is 1 to this (T-3206 N-4); other content is torn
+LOCK_TRIM = " \t\r\n"  # the only characters stripped around the pid, as run_paged_kv_rows.py's (T-3210 N-1)
 
 
 def _os_lock(fd: int) -> bool:
@@ -140,8 +141,8 @@ class PidLock:
     replacing, so the lock is never visible empty; an existing file is recovered only under an exclusive non-blocking OS
     lock on it; then a file modified before the system's last boot is stale whatever pid it holds (D-SLM8466 (3): that
     pid may now name an unrelated process); otherwise a pid liveness check (a live pid refuses); then an overwrite with
-    this pid. An empty file is stale; content other than ASCII digits naming a pid from 1 to LOCK_PID_MAX is torn
-    (T-3206 N-4). A release unlinks the file when it still holds this pid and never truncates it."""
+    this pid. An empty file is stale; content other than ASCII digits naming a pid from 1 to LOCK_PID_MAX, with only
+    space, tab, CR and LF stripped around it (LOCK_TRIM), is torn (T-3206 N-4, T-3210 N-1). A release unlinks the file when it still holds this pid and never truncates it."""
 
     ATTEMPTS = 3
 
@@ -177,7 +178,7 @@ class PidLock:
                 except FileNotFoundError:
                     return False
                 os.lseek(fd, 0, os.SEEK_SET)
-                text = os.read(fd, 4096).decode("ascii", "replace").strip()
+                text = os.read(fd, 4096).decode("ascii", "replace").strip(LOCK_TRIM)
                 if text and not _before_boot(fd):
                     # T-3206 N-4: ASCII digits naming a pid from 1 to 2**31 - 1, as run_paged_kv_rows.py's _read_owner
                     owner = int(text) if text.isascii() and text.isdigit() else 0
@@ -204,7 +205,7 @@ class PidLock:
 
     def __exit__(self, *_):
         try:
-            if self.path.read_bytes().strip() == str(os.getpid()).encode("ascii"):
+            if self.path.read_bytes().strip(LOCK_TRIM.encode("ascii")) == str(os.getpid()).encode("ascii"):
                 self.path.unlink()
         except OSError:
             pass  # a reader holds it open: it keeps this pid, stale once this process exits

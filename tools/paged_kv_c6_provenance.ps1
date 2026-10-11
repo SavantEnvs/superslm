@@ -34,12 +34,16 @@ $PkvC6TimingLock = 'D:\_scratch\SuperSLM\pkv-c6-timing.lock'
 # offset 1 MiB, the same byte the Python legs lock). Then a file modified before the system's last boot is stale
 # whatever pid it holds, since that pid may now name an unrelated process (D-SLM8466 (3)); otherwise a pid liveness
 # check (a live pid refuses). Then an overwrite with this pid. An empty file is stale, so a lock left empty by a crash
-# recovers; content other than ASCII digits naming a pid from 1 to [int]::MaxValue is torn (T-3206 N-4). A release
+# recovers; content other than ASCII digits naming a pid from 1 to [int]::MaxValue, with only space, tab, CR and LF
+# trimmed around it ($PkvC6LockTrim), is torn (T-3206 N-4, T-3210 N-1). A release
 # removes the file when it still holds this pid and never truncates it. A sharing conflict on the
 # recovery open (another process holding the file without write sharing) is retried, and refused by name when every
 # attempt meets one (T-3204 O-3).
 $PkvC6LockByte = 1048576
 $PkvC6LockAttempts = 3
+# T-3210 N-1 (D-SLM8494): the only characters trimmed around the pid, as the Python legs' LOCK_TRIM. .NET's bare Trim()
+# trims every Unicode white-space character, U+3000 among them.
+$PkvC6LockTrim = [char[]]@([char]0x20, [char]0x09, [char]0x0D, [char]0x0A)
 
 # The system's last boot (UTC): now less the uptime, as the Python legs read it (GetTickCount64, which counts sleep and
 # hibernation). [Environment]::TickCount64 needs PowerShell 7; Windows PowerShell falls back to the CIM boot time.
@@ -85,7 +89,7 @@ function Enter-PkvTimingLock {
                 $stale = [IO.File]::GetLastWriteTimeUtc($Path) -lt (Get-PkvBootTimeUtc)
                 $buffer = New-Object byte[] 4096
                 $read = $stream.Read($buffer, 0, $buffer.Length)
-                $text = [Text.Encoding]::ASCII.GetString($buffer, 0, $read).Trim()
+                $text = [Text.Encoding]::ASCII.GetString($buffer, 0, $read).Trim($PkvC6LockTrim)
                 if ($text -and -not $stale) {
                     # T-3206 N-4: ASCII digits naming a pid from 1 to [int]::MaxValue, as the Python legs read it;
                     # anything else (an out-of-range number, zero) is torn, never a raw conversion error
@@ -113,7 +117,7 @@ function Enter-PkvTimingLock {
 function Exit-PkvTimingLock {
     param([string]$Path)
     try {
-        if ([IO.File]::Exists($Path) -and ([IO.File]::ReadAllText($Path)).Trim() -eq "$PID") {
+        if ([IO.File]::Exists($Path) -and ([IO.File]::ReadAllText($Path)).Trim($PkvC6LockTrim) -ceq "$PID") {
             [IO.File]::Delete($Path)
         }
     } catch [IO.IOException], [UnauthorizedAccessException] {
