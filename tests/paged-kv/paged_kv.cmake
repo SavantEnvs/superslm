@@ -116,8 +116,10 @@ function(pkv_source_manifest target library)
 		list(APPEND args --source ${source})
 	endforeach()
 	if(target STREQUAL "superslm_pkv_pair")
+		# plan §30.1 (D-SLM8476): the 7.9 driver is invoked beside the 7.9b runner, so the binding verifier re-hashes it
 		list(APPEND args --invoked ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_paged_kv_pairs.py
-			--invoked ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_load.py)
+			--invoked ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_load.py
+			--invoked ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_paged_kv_rows.py)
 	endif()
 	add_custom_command(TARGET ${target} POST_BUILD
 		COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/write_paged_kv_source_manifest.py ${args}
@@ -131,13 +133,33 @@ pkv_source_manifest(superslm_pkv_c6 superslm_test_injection ${PKV_C6_SOURCES}
 pkv_source_manifest(superslm_pkv_lifecycle_prod superslm ${PKV_DIR}/c6_lifecycle_timing.cpp
 	${PKV_DECIDING_COMMON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_paged_kv_c6_box.ps1
 	${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_c6_provenance.ps1)
+# The 7.9 driver (tools/run_paged_kv_rows.py) is a source too: the timing successor's instrument, whose hash the binding
+# verifier reads from this manifest (plan §30.1, D-SLM8476).
 pkv_source_manifest(superslm_pkv_pair superslm ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_pair.cpp
 	${PKV_DIR}/pkv_common.h ${PKV_DIR}/pkv_budget_c_helpers.h
-	${CMAKE_CURRENT_SOURCE_DIR}/tools/run_paged_kv_pairs.py ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_load.py)
+	${CMAKE_CURRENT_SOURCE_DIR}/tools/run_paged_kv_pairs.py ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_load.py
+	${CMAKE_CURRENT_SOURCE_DIR}/tools/run_paged_kv_rows.py)
 get_target_property(PKV_PROD_DEFS superslm COMPILE_DEFINITIONS)
 if("${PKV_PROD_DEFS}" MATCHES "SUPERSLM_.*(SEAM|INJECTION|INSTRUMENT|BENCH|MUTANT)")
 	message(FATAL_ERROR "production superslm library carries a seam, injection or mutant definition; lifecycle grading refused")
 endif()
+
+# Cell 7.9's must-accepts MA-1 and MA-2 (slot R79A; plan rev 16.29 §29.3, §29.4, §30.5; D-SLM8471, D-SLM8472, D-SLM8479):
+# the commissioning seat's construction, tools/paged_kv_pair_ma.cpp, which prints "PKV_PAIR_MA1_V1 defs=none" or
+# "PKV_PAIR_MA2_V1 defs=none" and runs through the C6 driver as `--construction MA-1` or `MA-2`. Linked against the
+# production library superslm and nothing else from the engine; one object on its link step, compiled from that source
+# (tools/check_paged_kv_pair_link.py checks 4 and 8). Box-owed; EXCLUDE_FROM_ALL.
+add_executable(superslm_pkv_pair_ma EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_pair_ma.cpp)
+target_link_libraries(superslm_pkv_pair_ma PRIVATE superslm)
+target_include_directories(superslm_pkv_pair_ma PRIVATE ${PKV_DIR} include src tests)
+target_compile_definitions(superslm_pkv_pair_ma PRIVATE PKV_REFERENCE_DIR="${PKV_DIR}/reference")
+if(MSVC)
+	target_compile_options(superslm_pkv_pair_ma PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(superslm_pkv_pair_ma PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+pkv_source_manifest(superslm_pkv_pair_ma superslm ${CMAKE_CURRENT_SOURCE_DIR}/tools/paged_kv_pair_ma.cpp
+	${PKV_DIR}/pkv_common.h ${PKV_DIR}/pkv_budget_c_helpers.h)
 
 # Cells 4.7/C5 and 6.3/C5: the DotRow tiers. superslm_pkv_c5's sources linked against each forced-tier
 # library of CMakeLists.txt in place of superslm_test_injection (x86-64 only, like those libraries;

@@ -42,20 +42,24 @@ identity line it read); the row record carries `argv` (the driver's own command 
 --construction is checked against the identity line the pair executable prints, so a record shows which construction
 ran without trusting the label.
 
-The pair executable's contract, per construction (the identity strings are CONSTRUCTION_IDENTITY, and
-tools/paged_kv_pair.cpp's kIdentity* constants):
-    production   superslm_pkv_pair row79           PKV_PAIR_PRODUCTION_V2 defs=none   RESERVE, PAIR x 104, IDS
-    7.9-MR-OPT   superslm_pkv_pair_mr_opt row79    PKV_PAIR_MR_OPT_V1 defs=none       RESERVE, PAIR x 104, IDS
-    MA-1         the commissioning seat's (T7)     PKV_PAIR_MA1_V1 defs=none          PAIR x 104 only
-    MA-2         the commissioning seat's (T7)     PKV_PAIR_MA2_V1 defs=none          PAIR x 104 only
-An MA executable is invoked as `<--pair-cmd ...> --blob B --model F --process K --pairs 104 --warmup 4` (the arguments
-the driver appends to every pair command); it restores the blob into both of its contiguous-option arms, times W
-warm-up tokens per arm untimed and then N pairs, the order of each pair drawn from its seed and K as row79 does, and
-prints, in order: its identity line first; then one `PAIR <arm_a_ns> <arm_b_ns> <arm_a_token> <arm_b_token>` line per
-timed pair, arm_a in the paged column (the statistic is tau_a / tau_b - 1); and no IDS line and no RESERVE line (either
-from an MA run is refused, 79-7: both belong to a paged arm). It exits 0. MA-1 and MA-2 share one executable (R79A's
-runs share one exe_sha256, D-SLM8463), selecting the construction from its own command line, and each prints its own
-identity line.
+The pair executable's contract, per construction (the identity strings are CONSTRUCTION_IDENTITY; each also lives in
+one C++ source, plan §30.7: production's and 7.9-MR-OPT's in tools/paged_kv_pair.cpp, MA-1's and MA-2's in
+tools/paged_kv_pair_ma.cpp):
+    production   superslm_pkv_pair row79            PKV_PAIR_PRODUCTION_V2 defs=none   RESERVE, PAIR x 104, IDS
+    7.9-MR-OPT   superslm_pkv_pair_mr_opt row79     PKV_PAIR_MR_OPT_V1 defs=none       RESERVE, PAIR x 104, IDS
+    MA-1         superslm_pkv_pair_ma ma1           PKV_PAIR_MA1_V1 defs=none          PAIR x 104 only
+    MA-2         superslm_pkv_pair_ma ma2           PKV_PAIR_MA2_V1 defs=none          PAIR x 104 only
+The MA executable (plan §29.4, §30.5; the commissioning seat's source, tools/paged_kv_pair_ma.cpp) is
+superslm_pkv_pair_ma, linked against the production library superslm only. MA-1 and MA-2 share it (R79A's runs share one
+exe_sha256, D-SLM8463); `superslm_pkv_pair_ma identity ma1|ma2` prints the construction's identity line. Its run mode is
+`superslm_pkv_pair_ma <ma1|ma2> CAP LAYERS HEADS DIM` plus the five flags the driver appends to every pair command,
+`--blob B --model F --process K --pairs 104 --warmup 4` (16 arguments with the program name). It restores the blob into
+both of its contiguous-option arms, times W warm-up tokens per arm untimed and then N pairs, and prints, in order: its
+identity line first; then one `PAIR <arm_a_ns> <arm_b_ns> <arm_a_token> <arm_b_token>` line per timed pair, arm_a in the
+paged column (the statistic is tau_a / tau_b - 1); and no IDS line and no RESERVE line (either from an MA run is
+refused, 79-7: both belong to a paged arm). It exits 0. MA-2's offset and the pair-order seed are compile-time
+constants in its source, not arguments, and it prints `MA offset_ns=<value> seed=<value>` on stderr. What proves it
+linked the production library is its link step, read by tools/check_paged_kv_pair_link.py (plan §30.2).
 """
 
 from __future__ import annotations
@@ -134,9 +138,9 @@ MR_OPT_ROWS = {
 }
 
 # D-SLM8466 (2): each construction prints its own identity line, first on stdout, so a record shows which construction
-# ran without relying on the --construction label. Production's is unchanged; 7.9-MR-OPT's pair
-# (superslm_pkv_pair_mr_opt, built with PKV_PAIR_MR_OPT) prints its own; MA-1 and MA-2 are the commissioning seat's
-# (T7), and must print theirs. The strings are tools/paged_kv_pair.cpp's kIdentity* constants.
+# ran without relying on the --construction label. Each string lives here and in one C++ source (plan §30.7):
+# production's and 7.9-MR-OPT's in tools/paged_kv_pair.cpp (superslm_pkv_pair, and superslm_pkv_pair_mr_opt built with
+# PKV_PAIR_MR_OPT); MA-1's and MA-2's in tools/paged_kv_pair_ma.cpp (superslm_pkv_pair_ma).
 IDENTITY = "PKV_PAIR_PRODUCTION_V2 defs=none"
 CONSTRUCTION_IDENTITY = {
     "production": IDENTITY,
