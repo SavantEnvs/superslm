@@ -4,7 +4,10 @@ meets the others' real pids:
 
   driver   tools/run_paged_kv_rows.py's timing_lock (the 7.9 driver)
   pidlock  tools/run_paged_kv_pairs.py's PidLock (the 7.9b and legacy pair legs)
-  ps1      tools/paged_kv_c6_provenance.ps1's Enter-PkvTimingLock / Exit-PkvTimingLock (7.4 and lifecycle)
+  ps1      tools/paged_kv_c6_provenance.ps1's Enter-PkvTimingLock / Exit-PkvTimingLock (7.4 and lifecycle), under
+           Windows PowerShell 5.1 (`powershell`)
+  ps1-core the same script under PowerShell 7 (`pwsh`). The edition is a parameter of the command, so every cell runs
+           the PowerShell leg in both (T-3212 C-4): its boot reading takes a different branch in each
 
   live     a live holder of any program is refused by every program, and the file holds the holder's bare pid
   reader   a release while another process holds the file open leaves the releaser's pid (never an empty file); once
@@ -32,6 +35,10 @@ meets the others' real pids:
            pid padded with spaces to 4097 bytes; a dead pid placed after 4097 spaces. A file of exactly 4096 bytes is
            read as before (a dead pid padded to 4096 is recovered; '<own pid>' padded to 4096 is released), and a
            4097-byte file modified before the last boot is stale (D-SLM8466 (3): whatever it holds)
+  edition  (T-3212 C-4, T-3206 O-1) each PowerShell edition runs as itself and takes its own branch of
+           Get-PkvBootTimeUtc: Windows PowerShell 5.1 (Desktop) has no [Environment]::TickCount64 and reads the CIM
+           boot time; PowerShell 7 (Core) reads TickCount64. Each edition's boot reading is within BOOT_TOLERANCE_S of
+           this file's own reading (now less GetTickCount64)
 
 PKV_ROWS_DRIVER, PKV_PAIRS_RUNNER and PKV_PROVENANCE_PS1 name the programs under test (default: this checkout's); the
 test author runs the remedy reverted through them.
@@ -50,7 +57,9 @@ TOOLS = Path(__file__).resolve().parent
 DRIVER = Path(os.environ.get("PKV_ROWS_DRIVER") or TOOLS / "run_paged_kv_rows.py")
 PAIRS = Path(os.environ.get("PKV_PAIRS_RUNNER") or TOOLS / "run_paged_kv_pairs.py")
 PS1 = Path(os.environ.get("PKV_PROVENANCE_PS1") or TOOLS / "paged_kv_c6_provenance.ps1")
-PROGRAMS = ("driver", "pidlock", "ps1")
+# The PowerShell leg's programs and the executable that runs each (T-3212 C-4): R5's command names no edition
+PS_EDITIONS = {"ps1": "powershell", "ps1-core": "pwsh"}
+PROGRAMS = ("driver", "pidlock", "ps1", "ps1-core")
 
 PY_AGENT = textwrap.dedent(r'''
     import importlib.util, sys
@@ -100,6 +109,19 @@ PS_AGENT = textwrap.dedent(r'''
     [Console]::Out.WriteLine("RELEASED"); [Console]::Out.Flush()
 ''')
 
+# The edition, whether [Environment]::TickCount64 exists (the branch Get-PkvBootTimeUtc takes), and its boot reading in
+# milliseconds since the Unix epoch, UTC
+PS_BOOT = textwrap.dedent(r'''
+    param([string]$Script)
+    $ErrorActionPreference = 'Stop'
+    . $Script
+    $boot = Get-PkvBootTimeUtc
+    $ticks = $null
+    try { $ticks = [Environment]::TickCount64 } catch { $ticks = $null }
+    $ms = ($boot.ToUniversalTime() - [DateTime]::SpecifyKind([DateTime]'1970-01-01', 'Utc')).TotalMilliseconds
+    [Console]::Out.WriteLine("$($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion.Major) $([int]($null -ne $ticks)) $([long]$ms) $($boot.Kind)")
+''')
+
 
 class TimingLock(unittest.TestCase):
     def setUp(self):
@@ -109,6 +131,7 @@ class TimingLock(unittest.TestCase):
         self.lock = self.root / "pkv-c6-timing.lock"
         (self.root / "agent.py").write_text(PY_AGENT)
         (self.root / "agent.ps1").write_text(PS_AGENT)
+        (self.root / "boot.ps1").write_text(PS_BOOT)
         self.procs = []
         self.addCleanup(self.cleanup)
 
@@ -122,8 +145,8 @@ class TimingLock(unittest.TestCase):
                     s.close()
 
     def command(self, program, action):
-        if program == "ps1":
-            return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(self.root / "agent.ps1"),
+        if program in PS_EDITIONS:
+            return [PS_EDITIONS[program], "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(self.root / "agent.ps1"),
                     "-Script", str(PS1), "-Lock", str(self.lock), "-Action", action]
         return [sys.executable, "-I", str(self.root / "agent.py"), program, str(DRIVER if program == "driver" else PAIRS),
                 str(self.lock), action]
@@ -420,7 +443,7 @@ class TimingLock(unittest.TestCase):
             with self.subTest(contender=contender):
                 line = self.attempt(contender)
                 self.assertTrue(line.startswith("REFUSED"), f"{contender}: {line}")
-                if contender == "ps1":
+                if contender in PS_EDITIONS:
                     self.assertIn("sharing conflict", line)
                     self.assertIn("3 attempts", line)
 
@@ -478,6 +501,41 @@ class TimingLock(unittest.TestCase):
                         self.assertEqual(self.lock.read_bytes(), text.encode("ascii"),
                                          f"{holder}'s release changed a {size}-byte lock")
                         self.lock.unlink()
+
+    # ---- T-3212 C-4 (T-3206 O-1): the PowerShell leg's boot reading in each edition --------------------------------
+    # The tolerance. Measured 2026-10-11 on the bench (Windows 10, Windows PowerShell 5.1, PowerShell 7.6.6): PowerShell
+    # 7's TickCount64 reading 0.001 to 0.004 s from this file's; 5.1's CIM boot time 2.40 s from it (T-3206 measured
+    # 0.72 s on its box). The CIM time is the boot instant as recorded; "now less the uptime" moves with every clock
+    # correction since the boot, so their gap grows with uptime. 120 s holds weeks of such drift, and is 30 times
+    # smaller than the 3,600 s by which the pre-boot cells place a file before the boot. A wrong unit, sign, time zone
+    # or property in either branch is hours off
+    BOOT_TOLERANCE_S = 120
+
+    def test_powershell_boot_reading_in_each_edition(self):
+        want = {"ps1": ("Desktop", 5, 0), "ps1-core": ("Core", None, 1)}
+        for program, exe in PS_EDITIONS.items():
+            with self.subTest(program=program, exe=exe):
+                done = subprocess.run([exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                                       str(self.root / "boot.ps1"), "-Script", str(PS1)],
+                                      capture_output=True, text=True, timeout=120)
+                ours = self.last_boot()
+                self.assertEqual(done.returncode, 0, f"{exe}: {done.stdout}{done.stderr}")
+                fields = done.stdout.split()
+                self.assertEqual(len(fields), 5, f"{exe}: {done.stdout!r}")
+                edition, major, has_ticks, ms, kind = fields[0], int(fields[1]), int(fields[2]), int(fields[3]), fields[4]
+                edition_want, major_want, ticks_want = want[program]
+                self.assertEqual(edition, edition_want, f"{exe} is not the {edition_want} edition")
+                if major_want is not None:
+                    self.assertEqual(major, major_want, f"{exe} is PowerShell {major}")
+                else:
+                    self.assertGreaterEqual(major, 7, f"{exe} is PowerShell {major}")
+                self.assertEqual(has_ticks, ticks_want,
+                                 f"{exe}: [Environment]::TickCount64 {'exists' if has_ticks else 'is absent'}, so "
+                                 f"Get-PkvBootTimeUtc takes the other branch")
+                self.assertEqual(kind, "Utc", f"{exe}: Get-PkvBootTimeUtc returned a {kind} time")
+                gap = ms / 1000.0 - ours
+                self.assertLessEqual(abs(gap), self.BOOT_TOLERANCE_S,
+                                     f"{exe}'s boot reading is {gap:+.3f} s from now less GetTickCount64")
 
 
 if __name__ == "__main__":
