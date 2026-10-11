@@ -36,6 +36,11 @@ def measurement_env() -> dict[str, str]:
                        if name not in excluded and (name.startswith(prefixes) or name in exact)))
 
 
+def registrar_for(registry_path: Path) -> Path:
+    """The registrar a registry is graded against: instrument-commission.ps1 beside the registry file."""
+    return Path(registry_path).parent / "instrument-commission.ps1"
+
+
 def bound(binary: Path, repo: Path, registry_path: Path, receipt_id: str) -> tuple[bool, str | None]:
     path = Path(str(binary) + ".source-set.json")
     if not path.is_file() or not registry_path.is_file():
@@ -59,7 +64,11 @@ def bound(binary: Path, repo: Path, registry_path: Path, receipt_id: str) -> tup
             return False, digest
         if claim["measurement_env"] != measurement_env():
             return False, digest
-        verifier = Path("D:/Wizard/Claude/Tooling/instrument-commission.ps1")
+        # The registrar whose bytes verifier_sha256 binds is the sibling of the registry this call was handed (T-3198
+        # §23, D-SLM8494 scope): at R0(c) the registry is D:/Wizard/Claude/Tooling/instrument-registry.json, so it is
+        # that tree's instrument-commission.ps1; a worktree's registry grades that worktree's registrar. A missing
+        # sibling is unbound; there is no fallback to another tree's registrar.
+        verifier = registrar_for(registry_path)
         if not verifier.is_file() or sha(verifier) != claim["verifier_sha256"]:
             return False, digest
         instrument = Path(entry["instrument"]).resolve().relative_to(repo.resolve()).as_posix()
