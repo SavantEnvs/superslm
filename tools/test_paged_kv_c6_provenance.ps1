@@ -61,7 +61,15 @@ try {
         if (($variable.Name.StartsWith('SUPERSLM_PAGED_KV_') -or $variable.Name.StartsWith('PKV_DEBUNK_') -or $named -contains $variable.Name) -and
             $variable.Name -notin @('PKV_C6_REGISTRY','PKV_C6_RECEIPT_VERIFIER')) { $environment[$variable.Name] = $variable.Value }
     }
-    $verifier = 'D:/Wizard/Claude/Tooling/instrument-commission.ps1'
+    # The registrar bound() grades is the one beside the registry it is handed (SuperSLM cb7dd42, no fallback). The suite
+    # copies the Wizard tree's registrar, named by PKV_COMMISSION_TOOL (required; there is no default), beside its
+    # temporary registry and claims its hash (T-3211 N-1; the test author's record, T-3189 section 20).
+    if (-not $env:PKV_COMMISSION_TOOL -or -not (Test-Path -LiteralPath $env:PKV_COMMISSION_TOOL -PathType Leaf)) {
+        Check $false 'PKV_COMMISSION_TOOL names the instrument-commission.ps1 of the Wizard tree under test (no default)'
+        throw 'the provenance suite needs PKV_COMMISSION_TOOL: the registrar of the Wizard tree under test'
+    }
+    $verifier = Join-Path $tmp 'instrument-commission.ps1'
+    Copy-Item -LiteralPath $env:PKV_COMMISSION_TOOL -Destination $verifier
     $registry = [ordered]@{
         'PKV-TIMING-74-C6' = @{ instrument = $instrument; instrument_sha256 = $sourceSha }
         $successorId = @{ instrument = $instrument; instrument_sha256 = $sourceSha;

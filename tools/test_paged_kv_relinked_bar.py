@@ -1,9 +1,15 @@
-"""P-1: a relink cannot renew an independent 7.9 source-bound receipt."""
+"""P-1: a relink cannot renew an independent 7.9 source-bound receipt.
+
+PKV_COMMISSION_TOOL (required; unset fails the cell, there is no default) names the registrar of the Wizard tree under
+test. bound() grades the instrument-commission.ps1 beside the registry it is handed (SuperSLM cb7dd42, no fallback), so
+the cell copies that file beside its temporary registry and claims its hash (T-3211 N-1; the test author's record,
+T-3189 §20)."""
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -13,7 +19,7 @@ from verify_paged_kv_binding import bound, canonical, measurement_env, sha
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERIFIER = Path("D:/Wizard/Claude/Tooling/instrument-commission.ps1")
+REGISTRAR = os.environ.get("PKV_COMMISSION_TOOL", "")
 RECEIPT = "PKV-TIMING-79-C6-R168"
 
 
@@ -42,6 +48,9 @@ def self_certifying_manifest(binary: Path, repo: Path, registry: Path) -> bool:
 
 class RelinkedBar(unittest.TestCase):
     def test_p1_relinked_bar_refuses_old_successor_claim(self):
+        if not REGISTRAR or not Path(REGISTRAR).is_file():
+            self.fail("P-1 needs PKV_COMMISSION_TOOL: the instrument-commission.ps1 of the Wizard tree under test; "
+                      "there is no default")
         with tempfile.TemporaryDirectory(prefix="pkv-p1-") as folder:
             temp = Path(folder)
             repo = temp / "source"
@@ -55,6 +64,8 @@ class RelinkedBar(unittest.TestCase):
             original = runner.read_bytes()
             manifest_path = Path(str(binary) + ".source-set.json")
             registry_path = temp / "registry.json"
+            verifier = temp / "instrument-commission.ps1"  # the registrar bound() grades: the registry's sibling
+            verifier.write_bytes(Path(REGISTRAR).read_bytes())
             head, tree = git(repo, "rev-parse", "HEAD"), git(repo, "rev-parse", "HEAD^{tree}")
             recipe = {"commands": {binary.name: "cl /O2 /DNDEBUG paged_kv_pair.cpp"},
                       "compiler_sha256": "d" * 64}
@@ -69,7 +80,7 @@ class RelinkedBar(unittest.TestCase):
 
             relink()
             claim = {"manifest_sha256": sha(manifest_path), "git_head": head, "git_tree": tree,
-                     "build_recipe_sha256": canonical(recipe), "verifier_sha256": sha(VERIFIER),
+                     "build_recipe_sha256": canonical(recipe), "verifier_sha256": sha(verifier),
                      "measurement_env": measurement_env()}
             registry_path.write_text(json.dumps({RECEIPT: {
                 "instrument": str(instrument), "instrument_sha256": sha(instrument, normalized=True),
