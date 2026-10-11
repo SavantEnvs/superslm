@@ -11,7 +11,8 @@
 //   7.4c/box   on the unpinned 0.5B, a mid-page share adopt copies exactly page_bytes, read through the
 //              peek: 384 KiB at cap 4,096 and 768 KiB at cap 32,768; the mutant copying B = 16's page fails
 //   4.15/box   copy adopt across page geometries on the 0.5B at cap 4,096 (B = 64): page from contiguous at
-//              len 64 and 65, contiguous from page at len 100, refused; the controls admitted (rev 16.23)
+//              len 64 and 65, contiguous from page at len 100, refused; the controls admitted (rev 16.23); the bind
+//              and precedence members bind the artifact's own schema, potion_shop_order (T-3212 C-1)
 //   4.12/box   the harness check: every real-artifact cell records the B it ran at and asserts §3.1's rule
 //              (each cell above calls RecordB first)
 //
@@ -138,11 +139,15 @@ void Box74c() {
 	Box74cOn(bc::GetArtifact(k05B32k, kGeo05B32k), 768 * 1024);
 }
 
+// The 0.5B artifact carries one schema, potion_shop_order, and no g5_minimal_one_field (T-3212 C-1: its one SCM1
+// section, read at source); the bind and precedence members bind the artifact's own schema.
+constexpr const char* k05BSchema = "potion_shop_order";
+
 void Box415() {
 	const Fixture& fx = bc::GetArtifact(k05B, kGeo05B);
 	if (!fx.ok) return;
 	RecordB(fx);
-	pkv::r9::c415::Cell415On(fx, 64, 64, 100);
+	pkv::r9::c415::Cell415On(fx, 64, 64, 100, k05BSchema);
 }
 
 // bracketed T3 (plan rev 16.24 §26.4, D-SLM8444): its reference arm is the contiguous create, T3's verb

@@ -325,15 +325,26 @@ void Cell414Hostile() {
 	PKV_CHECK(!fits);
 	PKV_CHECK(3054198966ull <= UINT64_MAX / 6039797760ull && 3054198967ull > UINT64_MAX / 6039797760ull);  // the product
 	PKV_CHECK_MSG(sslm_kv_pool_contiguous_size(big.model, 3054198961u) != 0, "the size at 3,054,198,961 is 0");
-	// kills: the sum with the overhead unchecked (nonzero at 3,054,198,962), the product unchecked
+	// At 3,054,198,962 the sum overflows first. Kills: the sum with the overhead unchecked (nonzero there), in the
+	// engine's decomposition N * (block + 8) + 32 and in the plan's N * block + (8N + 32) (§23.3); and the engine's
+	// product N * (block + 8) unchecked, which already wraps there.
 	PKV_CHECK_MSG(sslm_kv_pool_contiguous_size(big.model, 3054198962u) == 0, "the size at 3,054,198,962 is not 0");
-	{
+	// At 3,054,198,967 the bare product N * block overflows (T-3212 C-2). Kills: the plan's product N * block unchecked
+	// with 8N + 32 added checked, which reads 0 at 962 to 966 (its checked sum catches them) and a wrapped size from
+	// 967 (30,204,954,072 bytes at 967, executed in T-3212 §5.1); and any decomposition whose product is unchecked.
+	PKV_CHECK_MSG(sslm_kv_pool_contiguous_size(big.model, 3054198967u) == 0, "the size at 3,054,198,967 is not 0");
+	for (uint32_t n : {3054198962u, 3054198967u}) {
+		// Where the size verb wrapped (already a failed check above), a create of n blocks over SIZE_MAX would build
+		// the pool in this small buffer and corrupt the process, so that create is not attempted.
+		if (sslm_kv_pool_contiguous_size(big.model, n) != 0) continue;
 		const std::vector<uint8_t> before_overflow(mem.p, mem.p + mem.n);  // the admitted create above wrote its pool
 		sslm_kv_pool out = legacy_a::OutSentinel<sslm_kv_pool>();
-		PKV_CHECK_EQ(sslm_kv_pool_create_contiguous(big.model, mem.p, SIZE_MAX, 3054198962u, &out), SSLM_INVALID_ARGUMENT);
-		PKV_CHECK(out == nullptr);
+		const sslm_status st = sslm_kv_pool_create_contiguous(big.model, mem.p, SIZE_MAX, n, &out);
+		PKV_CHECK_MSG(st == SSLM_INVALID_ARGUMENT, "the create at %u blocks: %s, SSLM_INVALID_ARGUMENT owed", n,
+		              AbiStatusName(st));
+		PKV_CHECK_MSG(out == nullptr, "the create at %u blocks: *out is not nulled", n);
 		PKV_CHECK_MSG(std::equal(before_overflow.begin(), before_overflow.end(), mem.p),
-		              "the overflow refusal wrote into the caller's buffer");
+		              "the overflow refusal at %u blocks wrote into the caller's buffer", n);
 	}
 }
 
@@ -561,8 +572,10 @@ void Cell414Reservation() {
 using namespace pkv::r9::c415;
 
 void Cell415() {
-	Cell415On(GetFixture("pkv_def"), RuleB(48, 4096, 1), static_cast<int32_t>(RuleB(48, 4096, 1)), 700);  // B = 128
-	Cell415On(GetFixture("pkv_odd"), RuleB(48, 4100, 1), static_cast<int32_t>(RuleB(48, 4100, 1)), 700);  // B = 256
+	Cell415On(GetFixture("pkv_def"), RuleB(48, 4096, 1), static_cast<int32_t>(RuleB(48, 4096, 1)), 700,
+	          "g5_minimal_one_field");  // B = 128
+	Cell415On(GetFixture("pkv_odd"), RuleB(48, 4100, 1), static_cast<int32_t>(RuleB(48, 4100, 1)), 700,
+	          "g5_minimal_one_field");  // B = 256
 	// One geometry: D = 48 at cap 100, where the rule's B is the cap; both directions admitted, rows equal.
 	const Fixture& one = Get("r9_d48_c100", Geometry{2, 2, 48, 100});
 	if (!one.ok) return;
