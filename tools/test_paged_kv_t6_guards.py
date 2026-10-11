@@ -64,6 +64,47 @@ class Reserve(unittest.TestCase):
                          {"seed": 1, "singles": 31, "source": "tests/paged-kv/pkv_scatter_reserve.h"})
 
 
+# T-3206 N-3 (D-SLM8466 (2), the C++ half): each real pair build prints its construction's identity line, written here
+# literally, and the driver admits it under its own --construction only. Needs a PKV_C6_BUILD from 4156b30 or later.
+PAIR_IDENTITIES = {"superslm_pkv_pair.exe": ("production", "PKV_PAIR_PRODUCTION_V2 defs=none"),
+                   "superslm_pkv_pair_mr_opt.exe": ("7.9-MR-OPT", "PKV_PAIR_MR_OPT_V1 defs=none")}
+
+
+class PairIdentity(unittest.TestCase):
+    def run_pair(self, exe, *args, env=None):
+        done = subprocess.run([str(BUILD / exe), *args], capture_output=True, text=True, timeout=300, env=env)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return done.stdout
+
+    def test_n3_each_pair_build_prints_its_constructions_identity(self):
+        for exe, (construction, line) in PAIR_IDENTITIES.items():
+            with self.subTest(exe=exe):
+                self.assertTrue((BUILD / exe).is_file(), f"{BUILD / exe} missing (PKV_C6_BUILD, 4156b30 or later)")
+                self.assertEqual(self.run_pair(exe, "identity").splitlines()[0], line)
+                for other, (other_construction, _) in PAIR_IDENTITIES.items():
+                    if other != exe:
+                        with self.assertRaises(rows.Refusal):
+                            rows.check_build_identity(line, other_construction)
+                self.assertIsNone(rows.check_build_identity(line, construction))
+
+    def test_n3_mr_opt_row79_prints_its_identity_first(self):
+        model = FIXTURES / "pkv_def.sslm"
+        env = dict(os.environ, SUPERSLM_PAGED_KV_REAL_ARTIFACT_DIR=str(FIXTURES))
+        with tempfile.TemporaryDirectory(prefix="t3189-n3-") as temp:
+            blob = Path(temp) / "r300.blob"
+            self.run_pair("superslm_pkv_pair.exe", "prefill", "pkv_def.sslm", "4096", "2", "2", "48", "812", "0", "300",
+                          "-", str(blob), env=env)
+            out = self.run_pair("superslm_pkv_pair_mr_opt.exe", "row79", "4096", "2", "2", "48", "79", "--blob",
+                                str(blob), "--model", str(model), "--process", "1", "--pairs", "3", "--warmup", "1",
+                                env=env)
+        self.assertEqual(out.splitlines()[0], "PKV_PAIR_MR_OPT_V1 defs=none")
+        identity, pairs, ids = rows.parse_process_output(out, "7.9-MR-OPT")
+        self.assertEqual((identity, len(pairs)), ("PKV_PAIR_MR_OPT_V1 defs=none", 3))
+        self.assertTrue(ids)
+        with self.assertRaises(rows.Refusal):
+            rows.parse_process_output(out, "production")
+
+
 class MrOptGuard(unittest.TestCase):
     def test_f4_compile_time_error_without_the_target_acknowledgement(self):
         with tempfile.TemporaryDirectory(prefix="t3189-f4c-") as temp:
