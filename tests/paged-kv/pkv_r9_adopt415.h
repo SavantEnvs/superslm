@@ -131,14 +131,17 @@ inline void ExpectRefused(const Fixture& fx, KindPools& k, bool seq_in_page, int
 	if (p) sslm_prefix_release(p);
 }
 
-inline void Cell415On(const Fixture& fx, int64_t B, int32_t page_from_contig_len_base, int32_t contig_from_page_len) {
+// `schema_name` is a schema the artifact carries: the bench fixtures' g5_minimal_one_field, the 0.5B artifact's
+// potion_shop_order (its one SCM1 schema; T-3212 C-1). A failed lookup is a failed check (T0 F-11).
+inline void Cell415On(const Fixture& fx, int64_t B, int32_t page_from_contig_len_base, int32_t contig_from_page_len,
+                      const char* schema_name) {
 	if (!fx.ok) return;
 	PKV_CHECK_MSG(sslm_kv_page_positions(fx.model) == B, "%s runs at B = %lld, the rule's %lld owed", fx.stem.c_str(),
 	              static_cast<long long>(sslm_kv_page_positions(fx.model)), static_cast<long long>(B));
 	sslm_schema schema = nullptr;
-	const sslm_status ls = sslm_schema_lookup(fx.model, "g5_minimal_one_field", &schema);
-	PKV_CHECK_MSG(ls == SSLM_OK && schema, "%s: the schema lookup returned %s; the bind and precedence members need it",
-	              fx.stem.c_str(), AbiStatusName(ls));
+	const sslm_status ls = sslm_schema_lookup(fx.model, schema_name, &schema);
+	PKV_CHECK_MSG(ls == SSLM_OK && schema, "%s: the lookup of schema %s returned %s; the bind and precedence members need it",
+	              fx.stem.c_str(), schema_name, AbiStatusName(ls));
 	const int64_t cap = fx.geo.context_cap;
 	// Both directions refused.
 	for (int32_t len : {page_from_contig_len_base, page_from_contig_len_base + 1}) {

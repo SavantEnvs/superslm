@@ -17,7 +17,8 @@ D-SLM8477, D-SLM8484), written by the test author blind to tools/paged_kv_pair_m
   79-18      the production pair's manifest lists tools/run_paged_kv_rows.py in `sources` and in `invoked`;
              verify_paged_kv_binding.bound() is true for a fixture entry whose instrument is the driver and whose
              source_binding is taken from that manifest, on a clean checkout at the manifest's head; the same entry
-             against a manifest without the driver is false
+             against a manifest without the driver is false; (T-3212 C-7, R0(c) §30.1) the same entry with its
+             instrument_sha256 the digest of a different driver, everything else equal, is false
 
 Environment (all required; unset or missing fails the cells, never skips them):
   PKV_BFR              the build directory: B-FR, the Ninja Release build of the fix-round tip (plan §30.3)
@@ -231,10 +232,11 @@ class Cell7918(Build):
     def bound(self, binary, registry):
         return binding.bound(binary, self.repo, registry, "SUCCESSOR")[0]
 
-    def entry(self, manifest_path, claim=None, sibling=b"registrar"):
+    def entry(self, manifest_path, claim=None, sibling=b"registrar", instrument_sha256=None):
         """A fixture registry in its own directory naming the driver, its source_binding taken from `manifest_path`, its
         verifier_sha256 the hash of `claim` (default PKV_COMMISSION_TOOL). Beside it, instrument-commission.ps1 holds
-        `sibling`: the claimed registrar's bytes by default, other bytes when given, or nothing when None."""
+        `sibling`: the claimed registrar's bytes by default, other bytes when given, or nothing when None. Its
+        instrument_sha256 is the manifest's digest for the driver unless `instrument_sha256` is given."""
         claim = Path(claim or self.registrar)
         m = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
         driver = self.repo / "tools" / "run_paged_kv_rows.py"
@@ -242,7 +244,8 @@ class Cell7918(Build):
         registry = d / "registry.json"
         registry.write_text(json.dumps({"SUCCESSOR": {
             "instrument": str(driver),
-            "instrument_sha256": m["sources"].get("tools/run_paged_kv_rows.py") or binding.sha(driver, normalized=True),
+            "instrument_sha256": instrument_sha256 or m["sources"].get("tools/run_paged_kv_rows.py")
+                                 or binding.sha(driver, normalized=True),
             "source_binding": {"manifest_sha256": sha(manifest_path), "git_head": m["git_head"],
                                "git_tree": m["git_tree"], "build_recipe_sha256": binding.canonical(m["build_recipe"]),
                                "measurement_env": binding.measurement_env(),
@@ -288,6 +291,24 @@ class Cell7918(Build):
         (d / f"{PAIR}.source-set.json").write_text(json.dumps(m, indent=2), encoding="utf-8")
         self.assertFalse(self.bound(d / PAIR, self.entry(d / f"{PAIR}.source-set.json")),
                          "bound() is true against a manifest without the driver")
+
+    # T-3212 C-7 (R0(c), plan §30.1): the registry entry's instrument_sha256 must equal the manifest's digest for the
+    # instrument. The member differs from the bound entry in that one field: the registered digest of a different
+    # driver (this driver's normalized bytes with one line appended). It kills the comparison dropped with the lookup
+    # kept (D:/_scratch/T-3212/vmut/verify_drop_cmp.py), which every other cell passes
+    def test_79_18_instrument_digest_differing_from_the_manifest_is_unbound(self):
+        manifest = self.build / f"{PAIR}.source-set.json"
+        listed = self.manifest(PAIR)["sources"]["tools/run_paged_kv_rows.py"]
+        driver = self.repo / "tools" / "run_paged_kv_rows.py"
+        other = hashlib.sha256(driver.read_bytes().replace(b"\r\n", b"\n") + b"# a different driver\n").hexdigest()
+        self.assertNotEqual(other, listed)
+        with self.subTest(instrument_sha256="the manifest's (control)"):
+            self.assertTrue(self.bound(self.build / PAIR, self.entry(manifest, instrument_sha256=listed)),
+                            "bound() is false for the entry whose instrument digest is the manifest's")
+        with self.subTest(instrument_sha256="a different driver's"):
+            self.assertFalse(self.bound(self.build / PAIR, self.entry(manifest, instrument_sha256=other)),
+                             "bound() is true for an entry whose instrument_sha256 is not the manifest's digest for "
+                             "the instrument")
 
 
 if __name__ == "__main__":
