@@ -27,6 +27,11 @@ meets the others' real pids:
            \x1f, U+3000, \x1c, \x0b, \x0c or U+00A0 are torn in every holder; '<pid>\r\n' and ' <pid>\t' still read
            as the pid (recovered when dead). A release removes '<own pid>\r\n' and leaves '<own pid>\x0b'
   sharing  (T-3204 O-3) a holder of the file without write sharing: every holder refuses, PowerShell by name
+  length   (T-3211 O-1, D-SLM8496 (2)) a lock file longer than 4096 bytes is torn in every holder, on the recovery read
+           and on the release check, whatever its first 4096 bytes hold: a dead pid then 4200 spaces then 'x'; a dead
+           pid padded with spaces to 4097 bytes; a dead pid placed after 4097 spaces. A file of exactly 4096 bytes is
+           read as before (a dead pid padded to 4096 is recovered; '<own pid>' padded to 4096 is released), and a
+           4097-byte file modified before the last boot is stale (D-SLM8466 (3): whatever it holds)
 
 PKV_ROWS_DRIVER, PKV_PAIRS_RUNNER and PKV_PROVENANCE_PS1 name the programs under test (default: this checkout's); the
 test author runs the remedy reverted through them.
@@ -418,6 +423,61 @@ class TimingLock(unittest.TestCase):
                 if contender == "ps1":
                     self.assertIn("sharing conflict", line)
                     self.assertIn("3 attempts", line)
+
+    # ---- T-3211 O-1 (D-SLM8496 (2)): a lock file longer than 4096 bytes is torn in every holder --------------------
+    # The digits are a dead pid's, so a holder that reads a window of the file and finds the pid there (or finds only
+    # stripped characters, read as empty) recovers it (HELD), where it must refuse it as torn.
+    LOCK_SPAN = 4096
+
+    def test_lock_longer_than_4096_bytes_is_torn(self):
+        digits = str(self.dead_pid())
+        span = self.LOCK_SPAN
+        torn = (("dead pid, 4200 spaces, x (T-3211 O-1)", digits + " " * 4200 + "x"),
+                ("dead pid padded with spaces to 4097 bytes", digits + " " * (span + 1 - len(digits))),
+                ("dead pid after 4097 spaces", " " * (span + 1) + digits))
+        for contender in PROGRAMS:
+            for name, text in torn:
+                with self.subTest(contender=contender, content=name):
+                    self.assertGreater(len(text.encode("ascii")), span)
+                    self.write_lock(text, False)
+                    line = self.attempt(contender)
+                    self.assertTrue(line.startswith("REFUSED"),
+                                    f"{contender} took a {len(text)}-byte lock ({name}): {line}")
+                    self.assertIn("torn", line)
+                    self.assertEqual(self.lock.read_bytes(), text.encode("ascii"), f"{contender} changed a torn lock")
+                    self.lock.unlink()
+            with self.subTest(contender=contender, content="dead pid padded with spaces to exactly 4096 bytes"):
+                text = digits + " " * (span - len(digits))
+                self.assertEqual(len(text.encode("ascii")), span)
+                self.write_lock(text, False)
+                self.assertEqual(self.attempt(contender), "HELD", f"{contender} did not recover a 4096-byte dead pid")
+                self.assertFalse(self.lock.exists())
+            with self.subTest(contender=contender, content="4097 bytes, modified before the last boot"):
+                self.write_lock(digits + " " * (span + 1 - len(digits)), True)
+                line = self.attempt(contender)
+                self.assertEqual(line, "HELD", f"{contender} did not take a pre-boot 4097-byte lock: {line}")
+                self.assertFalse(self.lock.exists())
+
+    # length, on release: '<own pid>' padded with spaces past 4096 bytes is torn, not the holder's, and stays;
+    # padded to exactly 4096 bytes it is the holder's and is removed
+    def test_release_leaves_a_lock_longer_than_4096_bytes(self):
+        span = self.LOCK_SPAN
+        for holder in PROGRAMS:
+            for size, removed in ((span, True), (span + 1, False)):
+                with self.subTest(holder=holder, size=size):
+                    h = self.hold(holder)
+                    text = str(h.pid).ljust(size)
+                    self.assertEqual(len(text), size)
+                    self.lock.write_bytes(text.encode("ascii"))
+                    self.release(h)
+                    if removed:
+                        self.assertFalse(self.lock.exists(), f"{holder} kept its own pid padded to {size} bytes")
+                    else:
+                        self.assertTrue(self.lock.exists(),
+                                        f"{holder}'s release removed a {size}-byte lock holding its pid")
+                        self.assertEqual(self.lock.read_bytes(), text.encode("ascii"),
+                                         f"{holder}'s release changed a {size}-byte lock")
+                        self.lock.unlink()
 
 
 if __name__ == "__main__":
