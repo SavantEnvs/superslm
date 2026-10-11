@@ -84,6 +84,19 @@ def live_load_state(record: Path) -> dict:
 _LOCK_BYTE = 1 << 20
 LOCK_PID_MAX = 2**31 - 1  # a pid is 1 to this (T-3206 N-4); other content is torn
 LOCK_TRIM = " \t\r\n"  # the only characters stripped around the pid, as run_paged_kv_rows.py's (T-3210 N-1)
+LOCK_MAX_BYTES = 4096  # a longer lock file is torn, as run_paged_kv_rows.py's (T-3211 O-1)
+
+
+def _read_capped(fd: int) -> bytes:
+    """At most LOCK_MAX_BYTES + 1 bytes of `fd` from its start; more than LOCK_MAX_BYTES means the file is too long."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = b""
+    while len(data) <= LOCK_MAX_BYTES:
+        chunk = os.read(fd, LOCK_MAX_BYTES + 1 - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
 
 
 def _os_lock(fd: int) -> bool:
@@ -142,7 +155,9 @@ class PidLock:
     lock on it; then a file modified before the system's last boot is stale whatever pid it holds (D-SLM8466 (3): that
     pid may now name an unrelated process); otherwise a pid liveness check (a live pid refuses); then an overwrite with
     this pid. An empty file is stale; content other than ASCII digits naming a pid from 1 to LOCK_PID_MAX, with only
-    space, tab, CR and LF stripped around it (LOCK_TRIM), is torn (T-3206 N-4, T-3210 N-1). A release unlinks the file when it still holds this pid and never truncates it."""
+    space, tab, CR and LF stripped around it (LOCK_TRIM), is torn (T-3206 N-4, T-3210 N-1), and so is a file longer
+    than LOCK_MAX_BYTES, whatever its first LOCK_MAX_BYTES hold (T-3211 O-1). A release unlinks the file when it still
+    holds this pid and never truncates it; a file longer than LOCK_MAX_BYTES holds no pid."""
 
     ATTEMPTS = 3
 
@@ -177,9 +192,12 @@ class PidLock:
                         return False  # released and replaced after this open
                 except FileNotFoundError:
                     return False
-                os.lseek(fd, 0, os.SEEK_SET)
-                text = os.read(fd, 4096).decode("ascii", "replace").strip(LOCK_TRIM)
-                if text and not _before_boot(fd):
+                stale = _before_boot(fd)
+                data = _read_capped(fd)
+                if len(data) > LOCK_MAX_BYTES and not stale:
+                    raise Refusal(f"torn pid lock: {self.path} is longer than {LOCK_MAX_BYTES} bytes")
+                text = data.decode("ascii", "replace").strip(LOCK_TRIM)
+                if text and not stale:
                     # T-3206 N-4: ASCII digits naming a pid from 1 to 2**31 - 1, as run_paged_kv_rows.py's _read_owner
                     owner = int(text) if text.isascii() and text.isdigit() else 0
                     if not 1 <= owner <= LOCK_PID_MAX:
@@ -205,7 +223,13 @@ class PidLock:
 
     def __exit__(self, *_):
         try:
-            if self.path.read_bytes().strip(LOCK_TRIM.encode("ascii")) == str(os.getpid()).encode("ascii"):
+            fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            try:
+                data = _read_capped(fd)
+            finally:
+                os.close(fd)
+            own = str(os.getpid()).encode("ascii")
+            if len(data) <= LOCK_MAX_BYTES and data.strip(LOCK_TRIM.encode("ascii")) == own:
                 self.path.unlink()
         except OSError:
             pass  # a reader holds it open: it keeps this pid, stale once this process exits

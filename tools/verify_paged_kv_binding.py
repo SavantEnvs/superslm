@@ -42,6 +42,13 @@ def registrar_for(registry_path: Path) -> Path:
 
 
 def bound(binary: Path, repo: Path, registry_path: Path, receipt_id: str) -> tuple[bool, str | None]:
+    """(bound, the SHA-256 of `binary`'s source-set manifest or None when there is no manifest) for registry entry
+    `receipt_id`. Bound requires every check below; any failure, missing file or parse error is unbound.
+
+    The registrar the entry's `verifier_sha256` binds is `instrument-commission.ps1` in the directory of `registry_path`
+    (`registrar_for`), never a fixed path. A caller that builds a registry anywhere else, a test fixture's temporary
+    directory included, must place the registrar it claims beside that registry; with none there the call is unbound,
+    and there is no fallback to another tree's registrar (T-3198 §23, T-3211 N-1)."""
     path = Path(str(binary) + ".source-set.json")
     if not path.is_file() or not registry_path.is_file():
         return False, sha(path) if path.is_file() else None

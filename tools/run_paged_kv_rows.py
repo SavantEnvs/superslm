@@ -281,10 +281,13 @@ def pid_live(pid):
 #     (D-SLM8466 (3)); otherwise a pid liveness check (any live pid refuses, the caller's own included); then an
 #     overwrite with the new owner's pid. An empty file is stale, so a lock left empty by a crash recovers;
 #   - content other than ASCII digits naming a pid from 1 to LOCK_PID_MAX, with only space, tab, CR and LF stripped
-#     around it (LOCK_TRIM), is torn and refused, in every holder;
-#   - a release unlinks the file when it still holds the releaser's pid, and never truncates it. A reader holding the
-#     file open at the release instant leaves the releaser's pid in place, which is stale once the releaser exits.
-# The OS lock is one byte far past any content, so a plain reader of the pid is never blocked by it.
+#     around it (LOCK_TRIM), is torn and refused, in all three holders, and so is a file longer than LOCK_MAX_BYTES,
+#     whatever its first LOCK_MAX_BYTES hold;
+#   - a release unlinks the file when it still holds the releaser's pid, and never truncates it; a file longer than
+#     LOCK_MAX_BYTES holds no pid. A reader holding the file open at the release instant leaves the releaser's pid in
+#     place, which is stale once the releaser exits.
+# The OS lock is one byte far past any content, so a plain reader of the pid is never blocked by it. Lock74 in
+# tests/paged-kv/c6_dim7_reset_adopt_timing.cpp also takes this file and is outside this protocol (D-SLM8497).
 _LOCK_BYTE = 1 << 20
 LOCK_ATTEMPTS = 3
 # T-3206 N-4: the format's pid is a process id, 1 to 2**31 - 1 (POSIX pid_t, and the Int32 PowerShell's Get-Process
@@ -295,6 +298,21 @@ LOCK_PID_MAX = 2**31 - 1
 # T-3210 N-1 (D-SLM8494): the only characters stripped around the pid, in all three holders. Python's bare strip()
 # also strips \x0b, \x0c, \x1c to \x1f and Unicode spaces such as \u3000, which would read "123\x1f" as pid 123.
 LOCK_TRIM = " \t\r\n"
+# T-3211 O-1 (D-SLM8496): a lock file longer than this is torn, in all three holders, on the recovery read and on the
+# release check. Each reads at most LOCK_MAX_BYTES + 1 bytes, so the check costs nothing.
+LOCK_MAX_BYTES = 4096
+
+
+def _read_capped(fd):
+    """At most LOCK_MAX_BYTES + 1 bytes of `fd` from its start; more than LOCK_MAX_BYTES means the file is too long."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = b""
+    while len(data) <= LOCK_MAX_BYTES:
+        chunk = os.read(fd, LOCK_MAX_BYTES + 1 - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
 
 
 def _os_lock(fd):
@@ -330,14 +348,10 @@ def _read_owner(fd):
     """The pid the lock's content names, None when the content is empty (stale). The content is the bare decimal pid
     every leg writes (D-SLM8464): ASCII digits only, naming a pid from 1 to LOCK_PID_MAX. Anything else raises
     ValueError (torn), as in the other two legs (T-3204 N-2; T-3206 N-4, O-3)."""
-    os.lseek(fd, 0, os.SEEK_SET)
-    chunks = []
-    while True:
-        chunk = os.read(fd, 65536)
-        if not chunk:
-            break
-        chunks.append(chunk)
-    text = b"".join(chunks).decode("utf-8").strip(LOCK_TRIM)
+    data = _read_capped(fd)
+    if len(data) > LOCK_MAX_BYTES:
+        raise ValueError(f"lock content longer than {LOCK_MAX_BYTES} bytes")
+    text = data.decode("utf-8").strip(LOCK_TRIM)
     if not text:
         return None
     value = int(text) if text.isascii() and text.isdigit() else 0
@@ -429,7 +443,12 @@ def _recover_lock(lock_path, pid, result_path):
 def _release_lock(lock_path, pid):
     """Unlink the lock when it still holds `pid`; never truncate it. A file another process holds open keeps `pid`."""
     try:
-        if lock_path.read_bytes().strip(LOCK_TRIM.encode("ascii")) == str(pid).encode("ascii"):
+        fd = os.open(lock_path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        try:
+            data = _read_capped(fd)
+        finally:
+            os.close(fd)
+        if len(data) <= LOCK_MAX_BYTES and data.strip(LOCK_TRIM.encode("ascii")) == str(pid).encode("ascii"):
             lock_path.unlink()
     except OSError:
         pass
