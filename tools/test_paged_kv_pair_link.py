@@ -19,9 +19,13 @@ D-SLM8477, D-SLM8484), written by the test author blind to tools/paged_kv_pair_m
              source_binding is taken from that manifest, on a clean checkout at the manifest's head; the same entry
              against a manifest without the driver is false
 
-Environment (both required; unset or missing fails the cells, never skips them):
-  PKV_BFR       the build directory: B-FR, the Ninja Release build of the fix-round tip (plan §30.3)
-  PKV_BFR_REPO  a clean checkout of SuperSLM at the manifests' git_head (79-18)
+Environment (all required; unset or missing fails the cells, never skips them):
+  PKV_BFR              the build directory: B-FR, the Ninja Release build of the fix-round tip (plan §30.3)
+  PKV_BFR_REPO         a clean checkout of SuperSLM at the manifests' git_head (79-18)
+  PKV_COMMISSION_TOOL  the registrar of the Wizard tree under test, instrument-commission.ps1 (79-18; T-3210 O-5).
+                       bound() reads a fixed path (verify_paged_kv_binding.py, D:/Wizard/Claude/Tooling/...); 79-18
+                       redirects that one path, in its own process, to this file, so it grades the tree under test
+                       and never the main checkout's copy by default
 The real link-line mutant and the check-8 mutant (§30.2, §31) are executed once and cited in the test author's record
 (T-3189 §17); never committed.
 """
@@ -40,6 +44,8 @@ TOOLS = Path(__file__).resolve().parent
 CHECKER = TOOLS / "check_paged_kv_pair_link.py"
 BFR = os.environ.get("PKV_BFR", "")
 REPO = os.environ.get("PKV_BFR_REPO", "")
+REGISTRAR = os.environ.get("PKV_COMMISSION_TOOL", "")
+BOUND_VERIFIER = "D:/Wizard/Claude/Tooling/instrument-commission.ps1"  # the path bound() reads (T-3210 O-5)
 MA, PAIR, MR = "superslm_pkv_pair_ma.exe", "superslm_pkv_pair.exe", "superslm_pkv_pair_mr_opt.exe"
 LIB = "superslm.lib"
 IDENTITY = {"ma1": "PKV_PAIR_MA1_V1 defs=none", "ma2": "PKV_PAIR_MA2_V1 defs=none"}
@@ -213,6 +219,26 @@ class Cell7918(Build):
         if not REPO or not (Path(REPO) / ".git").exists():
             self.fail("79-18 needs PKV_BFR_REPO: a clean checkout of SuperSLM at the manifest's git_head")
         self.repo = Path(REPO)
+        if not REGISTRAR or not Path(REGISTRAR).is_file():
+            self.fail("79-18 needs PKV_COMMISSION_TOOL: the instrument-commission.ps1 of the Wizard tree under test "
+                      "(T-3210 O-5); there is no default")
+        self.registrar = Path(REGISTRAR)
+
+    def bound(self, binary, registry, registrar=None):
+        """verify_paged_kv_binding.bound(), with its one fixed path (the registrar it hashes) redirected to `registrar`
+        (default PKV_COMMISSION_TOOL) for this call only."""
+        real = binding.Path
+        target = Path(registrar or self.registrar)
+
+        def path(*parts):
+            if len(parts) == 1 and str(parts[0]) == BOUND_VERIFIER:
+                return target
+            return real(*parts)
+        binding.Path = path
+        try:
+            return binding.bound(binary, self.repo, registry, "SUCCESSOR")[0]
+        finally:
+            binding.Path = real
 
     def entry(self, manifest_path):
         m = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
@@ -224,7 +250,7 @@ class Cell7918(Build):
             "source_binding": {"manifest_sha256": sha(manifest_path), "git_head": m["git_head"],
                                "git_tree": m["git_tree"], "build_recipe_sha256": binding.canonical(m["build_recipe"]),
                                "measurement_env": binding.measurement_env(),
-                               "verifier_sha256": sha("D:/Wizard/Claude/Tooling/instrument-commission.ps1")}}}))
+                               "verifier_sha256": sha(self.registrar)}}}))
         return registry
 
     def test_79_18_driver_in_the_production_manifest(self):
@@ -235,9 +261,14 @@ class Cell7918(Build):
     def test_79_18_bound_with_the_driver_and_not_without(self):
         head = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"], capture_output=True, text=True)
         self.assertEqual(head.stdout.strip(), self.manifest(PAIR)["git_head"], "PKV_BFR_REPO is not at the head")
-        okay, _ = binding.bound(self.build / PAIR, self.repo, self.entry(self.build / f"{PAIR}.source-set.json"),
-                                "SUCCESSOR")
-        self.assertTrue(okay, "bound() is false for the driver entry against the build's manifest")
+        registry = self.entry(self.build / f"{PAIR}.source-set.json")
+        self.assertTrue(self.bound(self.build / PAIR, registry),
+                        "bound() is false for the driver entry against the build's manifest")
+        # the redirect is real: a registrar other than the one the entry names makes the same entry unbound (O-5)
+        other = self.root / "instrument-commission.ps1"
+        other.write_bytes(self.registrar.read_bytes() + b"\n# another registrar\n")
+        self.assertFalse(self.bound(self.build / PAIR, registry, other),
+                         "bound() did not read the registrar the cell names")
         d = Path(tempfile.mkdtemp(dir=self.root))
         for name in (PAIR, LIB):
             shutil.copyfile(self.build / name, d / name)
@@ -245,8 +276,8 @@ class Cell7918(Build):
         m["sources"].pop("tools/run_paged_kv_rows.py", None)
         m["invoked"].pop("run_paged_kv_rows.py", None)
         (d / f"{PAIR}.source-set.json").write_text(json.dumps(m, indent=2), encoding="utf-8")
-        okay, _ = binding.bound(d / PAIR, self.repo, self.entry(d / f"{PAIR}.source-set.json"), "SUCCESSOR")
-        self.assertFalse(okay, "bound() is true against a manifest without the driver")
+        self.assertFalse(self.bound(d / PAIR, self.entry(d / f"{PAIR}.source-set.json")),
+                         "bound() is true against a manifest without the driver")
 
 
 if __name__ == "__main__":

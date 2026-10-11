@@ -23,6 +23,9 @@ meets the others' real pids:
   torn     (T-3204 N-2) a JSON body, or a dead pid with a sign or a digit separator, is torn in every holder; (T-3206
            N-4, O-3) so is a number outside 1 to 2**31 - 1 (99999999999, 2147483648, 0, 00) and non-ASCII digits
            (fullwidth); a dead 2147483647, the largest pid, is recovered by every holder
+  strip    (T-3210 N-1, D-SLM8494) exactly space, tab, CR and LF are stripped around the pid: a dead pid's digits beside
+           \x1f, U+3000, \x1c, \x0b, \x0c or U+00A0 are torn in every holder; '<pid>\r\n' and ' <pid>\t' still read
+           as the pid (recovered when dead). A release removes '<own pid>\r\n' and leaves '<own pid>\x0b'
   sharing  (T-3204 O-3) a holder of the file without write sharing: every holder refuses, PowerShell by name
 
 PKV_ROWS_DRIVER, PKV_PAIRS_RUNNER and PKV_PROVENANCE_PS1 name the programs under test (default: this checkout's); the
@@ -354,6 +357,46 @@ class TimingLock(unittest.TestCase):
                 self.write_lock("2147483647", False)
                 self.assertEqual(self.attempt(contender), "HELD")
                 self.assertFalse(self.lock.exists())
+
+    # strip: only space, tab, CR and LF are stripped (T-3210 N-1). The digits are a dead pid's, so a holder that strips
+    # more reads a dead pid and recovers the file (HELD), where it must refuse it as torn. PowerShell's bare Trim() read
+    # \x0b and \x0c as the pid (the builder's §22.1); Python's strip() read all six
+    def test_only_space_tab_cr_lf_are_stripped(self):
+        digits = str(self.dead_pid())
+        for contender in PROGRAMS:
+            for name, text in (("unit separator", digits + "\x1f"), ("ideographic space", digits + "\u3000"),
+                               ("file separator before", "\x1c" + digits), ("vertical tab", digits + "\x0b"),
+                               ("form feed", digits + "\x0c"), ("no-break space", digits + "\u00a0")):
+                with self.subTest(contender=contender, around=name):
+                    self.write_lock(text, False)
+                    line = self.attempt(contender)
+                    self.assertTrue(line.startswith("REFUSED"), f"{contender} took a lock holding {text!r}: {line}")
+                    self.assertIn("torn", line)
+                    self.assertEqual(self.lock.read_bytes(), text.encode("utf-8"), f"{contender} changed a torn lock")
+                    self.lock.unlink()
+            for name, text in (("CR LF after", digits + "\r\n"), ("space before, tab after", " " + digits + "\t")):
+                with self.subTest(contender=contender, around=name):
+                    self.write_lock(text, False)
+                    self.assertEqual(self.attempt(contender), "HELD", f"{contender} did not read {text!r} as a dead pid")
+                    self.assertFalse(self.lock.exists())
+
+    # strip, on release: the own-pid check strips the same set. '<own pid>\r\n' is the holder's and is removed;
+    # '<own pid>\x0b' is not, and stays
+    def test_release_strips_only_space_tab_cr_lf(self):
+        for holder in PROGRAMS:
+            for suffix, removed in (("\r\n", True), ("\x0b", False), ("\x0c", False)):
+                with self.subTest(holder=holder, suffix=repr(suffix)):
+                    h = self.hold(holder)
+                    text = str(h.pid) + suffix
+                    self.lock.write_bytes(text.encode("ascii"))
+                    self.release(h)
+                    if removed:
+                        self.assertFalse(self.lock.exists(), f"{holder} kept its own pid with {suffix!r}")
+                    else:
+                        self.assertTrue(self.lock.exists(), f"{holder}'s release removed a lock holding {text!r}")
+                        self.assertEqual(self.lock.read_bytes(), text.encode("ascii"),
+                                         f"{holder}'s release removed a lock holding {text!r}")
+                        self.lock.unlink()
 
     # sharing: another process holds the lock file open without write sharing. Every holder refuses; the PowerShell
     # holder names the sharing conflict (never a raw .NET error)

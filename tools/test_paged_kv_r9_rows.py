@@ -31,6 +31,9 @@ Cells (cell 7.9's text; the 79-series rows of the instrument table):
           7.9-MR-OPT) with no ids, or an empty IDS line, refuses 62; every construction refuses every other's identity
           (62); MA rows record guard "not applicable (no paged arm)" and grade by the row rule, R79A's aggregate over
           the four standing; argv and identity in every row and process record
+  T10     (T-3210 O-4, D-SLM8494, SuperSLM 89d70ec; class T8Remedies, test_t10_*) a production or 7.9-MR-OPT run with
+          no RESERVE line refuses 62 with no record; an MA run with none stands. The stand-in's paged constructions
+          print RESERVE by default; T6Remedies.test_f11's no-RESERVE member is superseded and now asserts the refusal
   T9      (T-3206 N-2, SuperSLM c4e3bf1; class T8Remedies, test_t9_*) an MA-1 or MA-2 run printing a RESERVE line
           refuses 62 with no record; production and 7.9-MR-OPT runs printing one record it
   loop    (T-3196 F-6) 79-6 to 79-9 through the driver's process loop, as a process: five processes against a
@@ -319,7 +322,8 @@ class Refusals(unittest.TestCase):
 # The stand-in pair executable: prints its construction's identity line (D-SLM8466 (2); PKV_STANDIN_CONSTRUCTION,
 # default production; PKV_STANDIN_IDENTITY overrides it), 104 timed pairs (slowdown 1%, tokens equal) and, for the
 # constructions with a paged arm only (D-SLM8466 (1)), the measured holder's ids (PKV_STANDIN_IDS_MODE: print, none or
-# empty overrides that); PKV_STANDIN_INJECT="<kind>@<k>" injects one refusal into process k. A "blob" injection
+# empty overrides that). A paged construction prints the RESERVE line by default (D-SLM8494, T-3210 O-4: a paged run
+# without one refuses), written here literally; PKV_STANDIN_RESERVE replaces it, or withholds it with "none"; PKV_STANDIN_INJECT="<kind>@<k>" injects one refusal into process k. A "blob" injection
 # changes the blob's bytes at the end of process k - 1, so process k's pre-restore check is what must see it.
 STANDIN = r"""
 import argparse, json, os, sys
@@ -341,8 +345,13 @@ with open(os.environ["PKV_STANDIN_LOG"], "a") as log:
     log.write(f"{a.process}\n")
 mine = a.process == at
 print("PKV_PAIR_PRODUCTION_V2 defs=PKV_C6_IDENTITY_PROBE" if kind in ("seam", "crash-seam") and mine else identity)
-if os.environ.get("PKV_STANDIN_RESERVE"):
-    print(os.environ["PKV_STANDIN_RESERVE"])
+reserve = os.environ.get("PKV_STANDIN_RESERVE", "")
+if reserve == "none":
+    pass
+elif reserve:
+    print(reserve)
+elif construction in ("production", "7.9-MR-OPT"):
+    print("RESERVE seed=1 singles=63 source=tests/paged-kv/pkv_scatter_reserve.h")
 for i in range(a.pairs - 1 if kind == "pairs" and mine else a.pairs):
     if kind == "badpair" and mine and i == 40:
         print("PAIR 1010000 1.0e6x 7 7")
@@ -518,11 +527,14 @@ class T6Remedies(unittest.TestCase):
         for k in range(1, 6):
             self.assertEqual(self.record(self.out / f"R2a-run1.p{k}.json").get("reserve"), want, f"process {k}")
         self.assertEqual(self.record().get("reserve"), want)
+        # Superseded (D-SLM8494, T-3210 O-4): this member read "absent, it records null". A production run with no
+        # RESERVE line now refuses as 79-7, exit 62, with no record (T8Remedies.test_t10_* pins it at both paged
+        # constructions)
         self.setUp()
-        self.assertEqual(self.run_row()[0].returncode, 0)
-        rec = self.record()
-        self.assertIn("reserve", rec)
-        self.assertIsNone(rec["reserve"])
+        done, _ = self.run_row(reserve="none")
+        self.assertEqual(done.returncode, 62, done.stderr[-2000:])
+        self.assertIn("no RESERVE line", done.stderr)
+        self.assertFalse(self.result.exists())
 
     # F-9: the lock is taken by an OS byte lock before the owner is read. A runner that holds the byte lock while the
     # content still names a dead owner (mid-recovery) refuses a second runner, which must not also recover.
@@ -917,6 +929,20 @@ class T8Remedies(unittest.TestCase):
                 self.assertEqual(done.returncode, 0, done.stderr[-2000:])
                 rec = self.record(result)
                 self.assertEqual((rec.get("status"), rec.get("reserve")), ("STANDING", want))
+
+    # T-3210 O-4 (D-SLM8494): a construction with a paged arm that prints no RESERVE line refuses (62), the mirror of the
+    # MA rule; an MA run with no RESERVE line stands
+    def test_t10_paged_run_without_reserve_refuses(self):
+        for construction in WITH_PAGED_ARM:
+            with self.subTest(construction=construction):
+                done = self.refused_62(construction, f"{construction} without RESERVE", reserve="none")
+                self.assertIn("no RESERVE line", done.stderr)
+        with self.subTest(construction="MA-1"):
+            result = self.root / "ma1.json"
+            done = self.drive(self.root, ROW_FOR["MA-1"], result, "MA-1", log=self.log)
+            self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+            rec = self.record(result)
+            self.assertEqual((rec.get("status"), rec.get("reserve")), ("STANDING", None))
 
     # D-SLM8466 (2): argv and identity in every row and process record. The row's argv is the driver's own command line;
     # each process's is the exact pair command it ran
