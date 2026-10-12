@@ -615,33 +615,25 @@ if errorlevel 1 (
 )
 echo T-2141 t2138-suite-side must-reject construction correctly failed to compile, for its own reason ^(marker text confirmed, see out\t2139\t2141_negative.log^)
 
-rem count_abi_verbs.sh's own cited figure (T-2139 design Sec4): 29, for the C1-C7 scope alone.
-rem RAISED to 34 (T-2132, G5-2): five new production verbs landed in
-rem sslm_abi_functions_g5_comparable.inc (sslm_schema_lookup, sslm_schema_count,
-rem sslm_schema_name, sslm_seq_set_schema, sslm_prefix_set_schema -- design Claude/Vitruvius/
-rem t2119-g5-constrained-decoding-design-2026-08-16.md Sec5, Wizard repo) -- a deliberate,
-rem documented extension of the ABI surface this counter is meant to CATCH undocumented drift
-rem against, not itself an instance of that drift. T-2199 then raised it to 35 for
-rem sslm_decode_step_v2 and the 1.2 candidate raises it to 36 for sslm_decode_params_init.
-rem 1.6.0 added sslm_seq_schema_bound, which makes 37; this gate was not raised with it.
-rem 1.7.0 adds sslm_workspace_set_parallel_for (T-2851), which makes 38.
-rem Count with native PowerShell so the gate does not depend on WSL, Git Bash's installation
-rem layout, or a separately configured Unix-tool PATH on Windows.
+rem Count declarations with the same comment-aware reader as the API-slot inventory. The
+rem previous text match also counted two status names mentioned in comments.
+rem 1.12.0 declares 51 C verbs: 38 before paged KV and 13 added by this release.
+rem Use native PowerShell so this gate does not depend on WSL or Git Bash.
 rem T2139_VERB_COUNT is read and compared OUTSIDE any parenthesized if-block on purpose: %VAR%
 rem inside a `( ... )` block expands at PARSE time (before the block's own `set /p` line has
-rem run) without `setlocal enabledelayedexpansion`, which this script does not otherwise need
-rem and this step does not want to turn on globally -- goto/labels sidestep it instead.
-powershell -NoLogo -NoProfile -NonInteractive -Command "$n = Get-Content 'include/superslm/sslm_abi_functions.inc','include/superslm/sslm_abi_functions_g5_comparable.inc' | Select-String -AllMatches 'sslm_[a-z0-9_]+\s*\(' | ForEach-Object { $_.Matches.Value -replace '\s*\($','' } | Sort-Object -Unique; $n.Count | Set-Content -Encoding ascii 'out/t2139/verb_count.txt'"
+rem run). Delayed expansion is enabled above, but this count uses %VAR%; the goto/label path
+rem reads it only after the `set /p` command has executed.
+powershell -NoLogo -NoProfile -NonInteractive -Command ". 'tests/t2807-api-slot/c_abi_verbs.ps1'; $n = @(Get-CAbiVerbs 'include/superslm'); $n.Count | Set-Content -Encoding ascii 'out/t2139/verb_count.txt'"
 if errorlevel 1 (
 	echo ABI verb inventory command failed ^(exit %errorlevel%^) -- this is not a measured verb-count drift
 	goto :hard_fail
 )
 set /p T2139_VERB_COUNT=<out\t2139\verb_count.txt
-if "%T2139_VERB_COUNT%"=="38" goto :t2139_verb_count_ok
-echo count_abi_verbs.sh reports %T2139_VERB_COUNT%, expected 38 -- verb count drifted, see design Sec4 / T-2132 / T-2199 / T-2851
+if "%T2139_VERB_COUNT%"=="51" goto :t2139_verb_count_ok
+echo C ABI inventory reports %T2139_VERB_COUNT%, expected 51 -- verb count drifted; see tests\t2807-api-slot\c_abi_verbs.txt
 goto :hard_fail
 :t2139_verb_count_ok
-echo count_abi_verbs.sh: 38 verbs, matches T-2139 Sec4's 29 plus T-2132/G5's five verbs, T-2199's versioned decode and params-initializer verbs, 1.6.0's sslm_seq_schema_bound, and 1.7.0's sslm_workspace_set_parallel_for
+echo C ABI inventory: 51 declared verbs, matching the 1.12.0 API-slot population
 goto :t2139_verb_count_done
 :t2139_verb_count_done
 
@@ -1663,7 +1655,7 @@ echo T-2899 suite: every cell compiled and linked against the current engine ^(c
 rem Runtime: the suite's own three scripts, which build every variant (mutants included) and run
 rem them. T2899_MODEL is the C39 synthetic model their headers name; T2899_G5_MODEL the 1.5B G5
 rem fixture build_red_suite_gpu.bat's real-schema cell needs. build_red_suite_gpu.bat and
-rem build_t2916_s3_bounds_tamper.bat write scratch copies under D:\_t2905 and D:\_t2916.
+rem build_t2916_s3_bounds_tamper.bat write under their own obj_gpu and obj_t2916_s3 directories.
 set T2899_RUN=1
 if not defined T2899_MODEL set T2899_RUN=0
 if not defined T2899_G5_MODEL set T2899_RUN=0
@@ -1747,7 +1739,7 @@ if not defined T2956_R15 set T2956_RUN=0
 if not defined T2956_ADAPTER set T2956_RUN=0
 if "%T2956_RUN%"=="0" goto :t2956_runtime_skipped
 if exist tests\t2956-token-finish-red-suite\out\ru\ru.sslm goto :t2956_ru_ready
-python tests\t2956-token-finish-red-suite\make_ru.py
+python tests\t2956-token-finish-red-suite\make_ru.py --verifier "%CD%\out\sslm_verify.exe"
 if errorlevel 1 (
 	echo T-2956 RU fixture generation FAILED
 	goto :hard_fail
@@ -2249,6 +2241,24 @@ rem      describes, not as a claim about the class's current state.
 rem      Re-executed this session: 77 collected, 74 passed, 3 xfailed, 0 failed (corpus available);
 rem      77 collected, 71 passed, 3 skipped, 3 xfailed, 0 failed (corpus forced unavailable). ANY
 rem      nonzero exit from this pytest invocation is now a real regression against this baseline.
+rem Decode-threading D1 fixtures: superslm_tests.exe reads them from the directory named by
+rem SUPERSLM_DECODE_THREADING_FIXTURE_DIR and fails a D1 cell when a fixture is missing. Generate
+rem them fresh here (they are never committed) and name the directory when the caller has not.
+if not exist out mkdir out
+if not defined SUPERSLM_DECODE_THREADING_FIXTURE_DIR (
+	where python >nul 2>nul
+	if not errorlevel 1 (
+		python tools\gen_decode_threading_fixture.py out\decode-threading-fixtures
+		if errorlevel 1 (
+			echo decode-threading fixture generation FAILED -- the D1 cells below will fail for the missing fixtures
+		) else (
+			set SUPERSLM_DECODE_THREADING_FIXTURE_DIR=%CD%\out\decode-threading-fixtures
+			echo decode-threading fixtures: SUPERSLM_DECODE_THREADING_FIXTURE_DIR provisioned by default, override to use another directory.
+		)
+	) else (
+		echo python is absent -- decode-threading fixtures not generated, the D1 cells below will fail for the missing fixtures
+	)
+)
 out\superslm_tests.exe
 set ec=%errorlevel%
 if not %b1_ec%==0 set ec=%b1_ec%

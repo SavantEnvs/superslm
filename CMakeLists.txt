@@ -408,6 +408,11 @@ foreach(_sslm_tier SSE2 AVX2 AVX512)
 	# Decode-threading plan §3.9 / §8 4.5: the forced full suites run the D1 cells too, so each
 	# forced library carries the same seams superslm_test_injection has (above).
 	target_compile_definitions(superslm_${_sslm_tier_lower}_forced PUBLIC SUPERSLM_ENABLE_MATVEC_TEST_SEAMS)
+	# Paged-KV plan §3.1 (R9 step T1, D-SLM8439): the forced paged-KV legs (superslm_pkv_c5_<tier>_forced,
+	# superslm_pkv_r9_<tier>_forced) pin their fixtures through the test-only pin and read the geometry seam,
+	# which, with the page module's seams, are compiled only under this macro; superslm_test_injection's own
+	# PUBLIC definition (above) is the precedent.
+	target_compile_definitions(superslm_${_sslm_tier_lower}_forced PUBLIC SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS)
 	# Both the bad-alloc-injection seam above (src/bad_alloc_wrap.h) and the dispatch-
 	# instrument seam below (src/matmul.cpp) #include "support/*.h" headers that resolve
 	# against a "tests" search directory -- the same PRIVATE include superslm_test_injection
@@ -1152,3 +1157,29 @@ install(FILES
 	"${CMAKE_CURRENT_BINARY_DIR}/superslmConfigVersion.cmake"
 	DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/superslm
 )
+
+# Paged-KV cell 7.9's must-reject mutant (SUPERSLM_MUTANT_PKV_MR_OPT: B = 16, unrotated) builds only as the
+# superslm_mr_opt target (tests/paged-kv/paged_kv.cmake). At configure time this checks four places for the text
+# SUPERSLM_MUTANT: the superslm target's COMPILE_DEFINITIONS and COMPILE_OPTIONS, the top directory's
+# COMPILE_DEFINITIONS, and CMAKE_C_FLAGS and CMAKE_CXX_FLAGS with every configuration's variants (T-3202 F-4). It does
+# not check the directory's COMPILE_OPTIONS (add_compile_options), definitions inherited through linked targets'
+# INTERFACE_COMPILE_DEFINITIONS, or anything CMake cannot see (the CL environment variable). The #error in
+# src/sslm_abi.cpp and include/superslm/forward_sites.h refuses every one of those at compile time unless
+# SUPERSLM_MUTANT_PKV_MR_OPT_TARGET, the superslm_mr_opt target's acknowledgement, is defined with it.
+get_target_property(_sslm_prod_defs superslm COMPILE_DEFINITIONS)
+get_target_property(_sslm_prod_opts superslm COMPILE_OPTIONS)
+get_directory_property(_sslm_dir_defs COMPILE_DEFINITIONS)
+set(_sslm_flags "${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS}")
+foreach(_sslm_cfg IN ITEMS DEBUG RELEASE RELWITHDEBINFO MINSIZEREL ${CMAKE_CONFIGURATION_TYPES} ${CMAKE_BUILD_TYPE})
+	string(TOUPPER "${_sslm_cfg}" _sslm_cfg)
+	string(APPEND _sslm_flags " ${CMAKE_C_FLAGS_${_sslm_cfg}} ${CMAKE_CXX_FLAGS_${_sslm_cfg}}")
+endforeach()
+if("${_sslm_prod_defs};${_sslm_prod_opts};${_sslm_dir_defs};${_sslm_flags}" MATCHES "SUPERSLM_MUTANT")
+	message(FATAL_ERROR "a SUPERSLM_MUTANT_* definition reaches the production superslm library; only the "
+		"superslm_mr_opt target may build 7.9-MR-OPT")
+endif()
+unset(_sslm_prod_defs)
+unset(_sslm_prod_opts)
+unset(_sslm_dir_defs)
+unset(_sslm_flags)
+unset(_sslm_cfg)

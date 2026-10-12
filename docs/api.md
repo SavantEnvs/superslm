@@ -322,7 +322,7 @@ instead, with the same reset requirement (see each function's own header comment
 `include/superslm/sslm_abi.h` is the contract: a from-scratch, engine-
 agnostic C ABI for embedding SuperSLM's CPU inference path directly in
 another process — a game engine's own tooling, for instance — without the
-GPU handle types above. It declares and implements 49 functions (38 before 1.12.0) across the
+GPU handle types above. It declares and implements 51 functions (38 before 1.12.0) across the
 same lifecycle shape as the GPU API (workspace and KV-pool sizing and
 creation, model map/unmap, sequence and prefix lifecycle, decode,
 tokenize/detokenize, stats) plus concepts the GPU API does not need:
@@ -478,37 +478,70 @@ silently accepted.
 Since 1.12.0 a KV pool stores K/V in fixed-size **pages** rather than one
 whole-context block per sequence. Each sequence and prefix addresses its K/V
 through a page table, and a sequence that adopts a prefix can **share** the
-prefix's full pages instead of copying them. Output is unchanged: tokens, K/V
-values and the axis digest are bit-identical to 1.11.0 on every path, whichever
-verbs a host uses. The 1.11.0 verbs keep their signatures and their behaviour
-(the changes are listed under [Changed in 1.12.0](#changed-in-1120) below);
-the memory savings come only from the new budget-mode verbs.
+prefix's full pages instead of copying them. Output is unchanged: tokens and K/V
+values are bit-identical to 1.11.0 on every path, whichever verbs a host uses, as
+read on Windows x64 with MSVC. The 1.11.0 verbs keep their signatures and their
+results (the changes are listed under [Changed in 1.12.0](#changed-in-1120)
+below), but a no-budget `sslm_seq_save` is slower than in 1.11.0 (see
+[Speed claims in 1.12.0](#speed-claims-in-1120)); the memory savings come only
+from the new budget-mode verbs.
 
 The paged surface is declared in `include/superslm/sslm_abi_functions.inc`, and
 `SSLM_HAS_PAGED_KV_ABI` is defined whenever it is present.
 
 **Page geometry.** `B`, the positions per page, is a pure function of the
-model: the artifact's `kv_block_size` when it divides the context cap, else the
-cap itself (one page per sequence). Every converted artifact on record has
-`kv_block_size` 16, so `B = 16`.
+model's head dimension `D`, context cap and K/V element width. It is the
+smallest power of two of at least 16 whose page run, `B · D · element_bytes`,
+reaches 4 KiB (when `D ≤ 64` and the cap is at most 4,096) or 8 KiB
+(otherwise), and the cap itself when that is larger than the cap. The
+artifact's stored `kv_block_size` does not select it. Where `B` does not
+divide the cap, a holder's last page is partial: its slack positions are never
+addressed, since writes stop at the cap.
 
-- `sslm_kv_page_positions(model)` returns `B` (0 on a null model).
+- `sslm_kv_page_positions(model)` returns `B` (0 on a null model). It is 64 at
+  Qwen2.5-0.5B with cap 4,096 and at Qwen2.5-1.5B with cap 32,768, and 128 at
+  Qwen2.5-0.5B with cap 32,768.
 - `sslm_kv_page_size(model)` returns the bytes per page,
   `layers · 2 · kv_heads · B · head_dim · element_bytes` (0 on a null model
-  or overflow). At Qwen2.5-0.5B that is 96 KiB, and at Qwen2.5-1.5B 224 KiB.
+  or overflow). At Qwen2.5-0.5B with cap 4,096 that is 384 KiB (768 KiB at cap
+  32,768), and at Qwen2.5-1.5B with cap 32,768 it is 896 KiB.
 - `sslm_kv_pages_for_budget(model, budget)` returns `R(budget)`, the pages a
   budget holder reserves: `min(ceil(budget / B) + 1, ceil(cap / B))`. It
   returns 0 for a budget outside `[1, cap]`. The extra page covers a prefix
   whose length is not a multiple of `B`.
 
-**Pools.** Two verbs build the same kind of pool over caller memory, and every
-holder verb, old or new, takes either.
+**Pools.** Three verbs build a pool over caller memory, and every holder verb,
+old or new, takes any of them. The first two build page pools of the same kind.
 
 - `sslm_kv_pool_create(model, buf, size, block_count, &pool)` builds
-  `block_count · ceil(cap / B)` pages in the same buffer size as before (one
-  block is exactly `ceil(cap / B)` pages). A count whose page total exceeds
-  `UINT32_MAX` is refused with `SSLM_INVALID_ARGUMENT`, before the buffer-size
-  check (at cap 32,768 and `B = 16`, any `block_count` of 2,097,152 or more).
+  `block_count · ceil(cap / B)` pages in the same buffer size as before at a
+  cap `B` divides (one block is exactly `ceil(cap / B)` pages). At any other
+  cap the buffer is larger by the slack of each block's partial last page,
+  which `sslm_kv_pool_overhead_size` carries, so a pool sized as
+  `N · sslm_kv_block_size + sslm_kv_pool_overhead_size(N)` admits N no-budget
+  holders. A count whose page total exceeds `UINT32_MAX` is refused with
+  `SSLM_INVALID_ARGUMENT`, before the buffer-size check (at cap 32,768, any
+  `block_count` of 8,388,608 or more at `B = 64`, and of 16,777,216 or more at
+  `B = 128`; computed from the page rule).
+- `sslm_kv_pool_create_contiguous(model, buf, size, block_count, &pool)` builds
+  the **contiguous pool option** (CPU only): `block_count` pages, each the
+  whole context cap, which is 1.11.0's contiguous layout (one page per
+  sequence). Size the buffer with
+  `sslm_kv_pool_contiguous_size(model, block_count)`, which returns
+  `block_count · (sslm_kv_block_size + 8) + 32` bytes, and 0 on a null model, a
+  zero count or an overflow. The create refuses in `sslm_kv_pool_create`'s
+  order and alignment rule. Every verb works on it as on a page pool with
+  `B = cap`: a no-budget or budget holder takes one page, adopt and
+  `sslm_prefix_begin_from` copy and share no page, and saves are the same in
+  every pool kind, so blobs restore across pool kinds. It gives up what a page
+  pool gives a budget holder, sharing a prefix's pages and reserving by
+  budget, and it is outside the claims for reset and adopt cost, shared
+  prefixes and residency below. `sslm_kv_page_positions`, `sslm_kv_page_size`
+  and `sslm_kv_pages_for_budget` answer for the model's derived `B`, not for a
+  contiguous pool's; `sslm_kv_pool_stats` reports the pool's own. A copy adopt
+  between a contiguous pool and a page pool of one model is
+  `SSLM_INVALID_ARGUMENT` wherever their page sizes differ, so move state
+  between pool kinds by save and restore.
 - `sslm_kv_page_pool_create(model, buf, size, page_count, &pool)` builds a
   pool of `page_count` pages. `buf_size` must be at least
   `page_count · sslm_kv_page_size + sslm_kv_page_pool_overhead_size`, and the
@@ -530,7 +563,8 @@ it is made:
 
 - **No-budget** (`whole_reserve`): made by `sslm_seq_create`,
   `sslm_prefix_begin`, or a restore of a no-budget blob (`SSB5` and older). It
-  reserves `ceil(cap / B)` pages, one old block, and behaves as in 1.11.0. Its
+  reserves `ceil(cap / B)` pages, one old block plus the slack of its partial
+  last page where `B` does not divide the cap, and behaves as in 1.11.0. Its
   limit is the cap.
 - **Budget**: made by `sslm_seq_create_budgeted(model, &pool, budget, &seq)`,
   `sslm_prefix_begin_budgeted(model, &pool, budget, &prefix)`,
@@ -577,7 +611,8 @@ length for `sslm_prefix_begin_from`. A budget holder's **limit** is
   read-only and copies at most one partial page into its own reservation. It
   never draws from the pool. A prefix of another pool is
   `SSLM_INVALID_ARGUMENT`, checked with the model check before anything
-  changes.
+  changes. This holds at a cap of more than one page: at a cap that fits in one
+  page a holder is a single page, so the adopt copies it and shares none.
 - A no-budget sequence **copies** the prefix's written rows into its own
   pages (proportional to the prefix's length, not to the cap), and may adopt
   from another pool of the same model, as before.
@@ -606,8 +641,9 @@ can stay full after its prefixes are released. Read `free_pages` from
 - A no-budget sequence's `sslm_seq_save` writes `SSB5`, byte-equal to the blob
   1.11.0 writes for the same state, so 1.9.0 to 1.11.0 read it. Its size is
   1.11.0's: the whole block.
-- A budget sequence writes **`SSB6`**, which carries only the rows the
-  sequence has written. Releases before 1.12.0 refuse it on its magic.
+- A budget sequence writes **`SSB6`**, which carries the rows `[0, L')` of its
+  live length, the span of an adopted prefix included. Releases before 1.12.0
+  refuse it on its magic.
 - Restore reads `SSB6`, `SSB5`, `SSB4`, `SSB3` and `SSB2`.
 
 The `SSB6` layout (little-endian):
@@ -701,6 +737,13 @@ These apply to every host, including one that calls no new verb:
 - `sslm_seq_state_size` is 20 bytes larger (above).
 - `sslm_kv_pool_create` refuses a `block_count` whose page total exceeds
   `UINT32_MAX`, with `SSLM_INVALID_ARGUMENT`.
+- `sslm_kv_pool_overhead_size` is larger at a cap the page size does not
+  divide, by `block_count · (ceil(cap / B) · B − cap)` positions of K/V;
+  `sslm_kv_block_size` and the no-budget save blob are unchanged at every cap.
+- `sslm_seq_save` of a no-budget sequence is slower than in 1.11.0 at every
+  length measured, with the same bytes: 1.14 to 2.00 times as long on the
+  release code (24 of 24 readings across four captures; readings, not resolved
+  changes; see [Speed claims in 1.12.0](#speed-claims-in-1120)).
 - The first `sslm_prefix_freeze` returns the prefix's unused pages to the
   pool, so a pool can admit more handles than before, never fewer.
 - `sslm_seq_reset` no longer zero-fills the sequence's K/V memory. No read
@@ -710,6 +753,31 @@ These apply to every host, including one that calls no new verb:
   (no save produces one), with `SSLM_INVALID_ARGUMENT`.
 - `sslm_seq_restore` reads `SSB6`.
 
+#### Speed claims in 1.12.0
+
+The claims are for Windows x64, CPU only, at ordinary background load, on the
+AVX2 tier. The [1.12.0 release note](releases/1.12.0.md) carries the measured
+figures.
+
+- **Single-conversation decode.** Attention reads K/V one page run at a time.
+  Decode of one sequence over paged K/V is no more than 5% slower than the
+  contiguous cache of the same build (the contiguous pool option), at
+  Qwen2.5-0.5B up to its cap of 4,096 and at Qwen2.5-1.5B up to width 18,682.
+  It is measured with whole-token calls and no host parallel-for hook, and it
+  is not a comparison with 1.11.0.
+- **Reset and adopt.** Their cost does not grow with the context cap, except
+  that at `head_dim ≤ 64` a cap above 4,096 doubles the page and its one-page
+  tail copy (0.5B: 384 KiB at caps up to 4,096, 768 KiB above), at a cap of
+  more than one page: the same live length at cap 32,768 costs no more than a
+  fixed bound of 2.0 times its cost at cap 4,096, measured at Qwen2.5-0.5B with
+  the page size pinned equal (64 positions) at both caps, so the doubled page
+  was not timed.
+- **Batched decode.** `sslm_decode_step` over several sequences works and stays
+  bit-identical to each sequence's solo run. No batched speed is claimed.
+- **Lifecycle verbs against 1.11.0.** The release note's lifecycle table states
+  the changes its comparison resolves (a factor of at least 4); all 22 are
+  speed-ups. No-budget save is read separately, under *Not promised* below.
+
 #### Not promised in 1.12.0
 
 - **Memory savings for no-budget verbs.** A host that calls only the 1.11.0
@@ -717,12 +785,17 @@ These apply to every host, including one that calls no new verb:
   live length apply to budget-mode holders only.
 - **No-budget save size.** A no-budget sequence's `SSB5` is still the whole
   block, so that 1.11.0 can read it.
+- **No-budget save speed.** A no-budget `sslm_seq_save` takes 1.14 to 2.00 times
+  as long as in 1.11.0 on the release code, at every length measured (24 of 24
+  readings across four captures on the release machine; readings, not resolved
+  changes: the release note's lifecycle comparison resolves a change only at 4
+  times or more), with the same bytes. A later release is planned to remove the
+  slowdown.
 - **A higher context cap.** The cap is not removed: RoPE tables and the
   attention score scratch are still sized by it, and a write at the cap still
   fails. Paging only makes a high cap cheaper to reserve.
-- **Speed.** No speed figure is promised. Attention reads K/V one page run at
-  a time, and decode throughput against 1.11.0 is measured, not guaranteed
-  (see the [1.12.0 release note](releases/1.12.0.md)).
+- **Speed beyond the claims above.** Nothing is claimed under load, on the
+  GPU, or for batched decode.
 - **GPU paging.** The GPU API (`SslmGpu*`, `sslm_gpu_*`) is unchanged: GPU
   sequences keep one whole-cap buffer each and have no prefix or adopt verbs.
   GPU paging is planned for a later release.
