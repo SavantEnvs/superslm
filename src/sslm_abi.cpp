@@ -85,6 +85,9 @@
 #include <unordered_set>
 #include "detail/int_hash.h"
 #include <vector>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <emmintrin.h>  // GatherFlatBlock's streaming stores (SSE2, baseline on x64)
+#endif
 
 #include "superslm/adapter_marshal.h"
 #include "superslm/forward_sites.h"
@@ -1886,6 +1889,52 @@ size_t KvRuns(const superslm::SslmModelConfig& c) {
 	return static_cast<size_t>(c.num_hidden_layers) * 2u * c.num_key_value_heads;
 }
 
+// The block writes of GatherFlatBlock. A save writes a whole SSB5 block (24 MiB at 0.5B and cap
+// 4,096, 448 MiB at 1.5B and cap 32,768) that the save itself never reads back. 1.11.0 wrote it with
+// one memcpy of the block, which C runtimes perform with non-temporal stores above a cache-sized
+// threshold. The paged gather writes the same bytes as one copy per (page, run) slab (4 or 8 KiB)
+// and one fill per run tail, each small enough that the runtime takes the cached path, so every
+// destination line is read for ownership first and the block is pushed through the cache: a
+// full-length save took 1.88 to 1.93 times 1.11.0's (docs/releases/1.12.0.md, *Speed*). For a block
+// of kGatherStreamBytes or more, these two write with SSE2 streaming stores on x64 (the ends of a
+// misaligned span by plain stores) and GatherFlatBlock fences once before returning; for a smaller
+// block, which a cache holds, and on other targets they are memcpy and memset, which measured faster
+// there. The threshold is a fixed size, not a query of the cache. The bytes are the same either way.
+constexpr size_t kGatherStreamBytes = size_t{16} << 20;
+
+void BlockCopy(uint8_t* dst, const uint8_t* src, size_t n, bool stream) {
+#if defined(_M_X64) || defined(__x86_64__)
+	if (stream) {
+		const size_t head = std::min(n, (16u - (reinterpret_cast<uintptr_t>(dst) & 15u)) & 15u);
+		std::memcpy(dst, src, head);
+		size_t i = head;
+		for (; i + 16 <= n; i += 16)
+			_mm_stream_si128(reinterpret_cast<__m128i*>(dst + i),
+			                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i)));
+		std::memcpy(dst + i, src + i, n - i);
+		return;
+	}
+#endif
+	(void)stream;
+	std::memcpy(dst, src, n);
+}
+
+void BlockZero(uint8_t* dst, size_t n, bool stream) {
+#if defined(_M_X64) || defined(__x86_64__)
+	if (stream) {
+		const size_t head = std::min(n, (16u - (reinterpret_cast<uintptr_t>(dst) & 15u)) & 15u);
+		std::memset(dst, 0, head);
+		size_t i = head;
+		const __m128i zero = _mm_setzero_si128();
+		for (; i + 16 <= n; i += 16) _mm_stream_si128(reinterpret_cast<__m128i*>(dst + i), zero);
+		std::memset(dst + i, 0, n - i);
+		return;
+	}
+#endif
+	(void)stream;
+	std::memset(dst, 0, n);
+}
+
 void GatherFlatBlock(const sslm_kv_pool_s* pool, const sslm_seq_s* seq, const superslm::SslmModelConfig& c,
                      uint8_t* dst, size_t block_size) {
 	const size_t D = c.head_dim;
@@ -1897,6 +1946,7 @@ void GatherFlatBlock(const sslm_kv_pool_s* pool, const sslm_seq_s* seq, const su
 	const size_t runs = KvRuns(c);
 	const size_t run_bytes = cap * D;
 	const size_t slab = static_cast<size_t>(B) * D;  // one run's rows within one page
+	const bool stream = block_size >= kGatherStreamBytes;
 	// Rows [0, L), page by page: each page is read once, one memcpy per run (a page holds every run's
 	// B rows in its own slot, (r + j) mod runs by §3.1's rotation, and the runs are cap * D apart in
 	// the block). The table is read once per page, through the address path; run r's slab is the
@@ -1908,7 +1958,7 @@ void GatherFlatBlock(const sslm_kv_pool_s* pool, const sslm_seq_s* seq, const su
 		    pool->pages, superslm::kv_pages::HolderTableEntryForAddress(seq->kv, static_cast<uint32_t>(j)));
 		uint8_t* out = dst + static_cast<size_t>(p0) * D;
 		for (size_t r = 0; r < runs; ++r)
-			std::memcpy(out + r * run_bytes, page + superslm::KvPageRunSlot(r, j, pool->runs) * slab, n);
+			BlockCopy(out + r * run_bytes, page + superslm::KvPageRunSlot(r, j, pool->runs) * slab, n, stream);
 	}
 	// Every byte past row L of every run is zero, except the mid-token row's layers below
 	// layer_index, which were written this token. No byte is written twice, so the block is filled
@@ -1921,10 +1971,13 @@ void GatherFlatBlock(const sslm_kv_pool_s* pool, const sslm_seq_s* seq, const su
 			std::memcpy(run_dst + live, HolderRow(pool, seq->kv, r, L, D), D);
 			from += D;
 		}
-		if (from < run_bytes) std::memset(run_dst + from, 0, run_bytes - from);
+		if (from < run_bytes) BlockZero(run_dst + from, run_bytes - from, stream);
 	}
 	// block_size is runs * cap * D for a one-byte element; any bytes past the runs are zero too.
-	if (runs * run_bytes < block_size) std::memset(dst + runs * run_bytes, 0, block_size - runs * run_bytes);
+	if (runs * run_bytes < block_size) BlockZero(dst + runs * run_bytes, block_size - runs * run_bytes, stream);
+#if defined(_M_X64) || defined(__x86_64__)
+	if (stream) _mm_sfence();  // the streaming stores are ordered before the save returns
+#endif
 }
 
 // The K/V section of 'SSB6' (§3.7, C5): rows [0, L') of every run in canonical layout
