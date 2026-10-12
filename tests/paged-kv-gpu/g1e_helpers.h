@@ -679,6 +679,40 @@ inline bool AdmitsPages(const Env& e, ProbeState& s, int64_t k) {
 	return all;
 }
 
+// The GPU fill probe's one-state form (§8, "Precondition, and the one-state form"; the CPU's
+// ProbeExactlyFreeOneState), for k >= 3, on the one state `s` holds: creates totalling k - 1 are admitted (at least
+// k - 1 free); a 2-page create is refused for capacity (at most k free); one admitted create of r pages is released
+// and creates totalling r + 1 are admitted (at least k were free). Every create is released again.
+inline bool ProbeExactlyFreeOneState(const Env& e, ProbeState& s, int64_t k, const char* what) {
+	CHECK_MSG(k >= 3, "%s: the one-state probe needs k >= 3 (k = %lld)", what, static_cast<long long>(k));
+	if (k < 3) return false;
+	s.DrainAll();
+	std::vector<SslmGpuSequenceHandle*> made;
+	Refusal first;
+	const bool step1 = AdmitPages(e.geo, s, k - 1, &made, &first);
+	CHECK_MSG(step1, "%s: one-state fill probe at k=%lld: creates totalling %lld pages were not all admitted (a %lld-page create: %s)",
+	          what, static_cast<long long>(k), static_cast<long long>(k - 1), static_cast<long long>(first.pages),
+	          StatusName(first.status));
+	SslmGpuSequenceHandle* two = nullptr;
+	const GS st2 = sslm_gpu_seq_create_budgeted(s.Ctx(), s.Model(), s.Pool(), static_cast<int32_t>(e.geo.B), &two);
+	if (two) sslm_gpu_seq_release(s.Ctx(), two);
+	const bool step2 = st2 == GS::SSLM_GPU_KV_POOL_EXHAUSTED;
+	CHECK_MSG(step2, "%s: one-state fill probe at k=%lld: after %lld pages, a 2-page create returned %s, not exhausted", what,
+	          static_cast<long long>(k), static_cast<long long>(k - 1), StatusName(st2));
+	bool step3 = false;
+	if (step1 && !made.empty()) {
+		const int64_t r = ProbeSplit(e.geo, k - 1).back();
+		sslm_gpu_seq_release(s.Ctx(), made.back());
+		made.pop_back();
+		step3 = AdmitPages(e.geo, s, r + 1, &made, &first);
+		CHECK_MSG(step3, "%s: one-state fill probe at k=%lld: after releasing a %lld-page create, creates totalling %lld were not all "
+		                 "admitted (%s)",
+		          what, static_cast<long long>(k), static_cast<long long>(r), static_cast<long long>(r + 1), StatusName(first.status));
+	}
+	for (auto it = made.rbegin(); it != made.rend(); ++it) sslm_gpu_seq_release(s.Ctx(), *it);
+	return step1 && step2 && step3;
+}
+
 // ---- the mirror peek, addressed by §3.1's formula ---------------------------------------------------
 
 inline std::vector<uint8_t> PeekPage(const Env& e, SslmGpuKvPoolHandle* pool, uint32_t page) {

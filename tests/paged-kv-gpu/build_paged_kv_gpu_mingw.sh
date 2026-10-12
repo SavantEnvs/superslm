@@ -4,7 +4,7 @@
 # executables as tests/paged-kv-gpu/build_paged_kv_gpu.bat (the box build), from the same table.
 #
 # Usage: tests/paged-kv-gpu/build_paged_kv_gpu_mingw.sh [--out=DIR] [--jobs=N] [--list] [TARGET ...]
-#   TARGET   g2 | g3 | g4 | g5   every executable whose bracket is that step (default: all four)
+#   TARGET   g2 | g3 | g4 | g5 | g6   every executable whose bracket is that step (default: all five)
 #            <exe name>          one executable from the table below (e.g. pkvg_g2, g1d_cell_3_6f)
 #   --out    default <repo>/out/pkvg (the exes must sit under the repo: the shader staleness check walks up
 #            from the exe to src/gpu/shaders)
@@ -19,7 +19,7 @@
 # Engine objects: the source list is wine_gpu.sh's SRCS (build.bat's list) restricted to src/, so it follows
 # the engine as G3-G5 add files. The CPU sources compile once; the GPU sources (src/gpu/*.cpp in that list)
 # compile once per configuration:
-#   plain  no definitions                                         (the step runners, g1d 3.12, g1e)
+#   plain  no definitions                                         (the step runners, g1d 3.12, g1e, G6 timing)
 #   alloc  SUPERSLM_GPU_ALLOC_FAULT_INJECTION SUPERSLM_GPU_TEST_SEAMS  (11.4, 3.6d first touch, g1d 3.6e/f/g stranded)
 #   t2169  SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION          (g1d 3.6g recovered)
 #   bench  SUPERSLM_ENABLE_GPU_BENCH_PRE_BATCHING                  (3.6d bench prefill)
@@ -44,7 +44,7 @@ for a in "$@"; do
 		*) TARGETS+=("$a") ;;
 	esac
 done
-[ ${#TARGETS[@]} -eq 0 ] && TARGETS=(g2 g3 g4 g5)
+[ ${#TARGETS[@]} -eq 0 ] && TARGETS=(g2 g3 g4 g5 g6)
 
 # ---- the suite's executables (keep in step with build_paged_kv_gpu.bat) ------------------------------------
 # name | config | step | sources (tests/paged-kv-gpu/*.cpp; NAME@DEF,DEF compiles NAME with -DDEF ...) | extra
@@ -70,6 +70,10 @@ g1e_cell_9_12|plain|G5|g1e_cell_9_12|
 g1e_cell_9_13|plain|G5|g1e_cell_9_13|
 g1e_cell_8_17|plain|G5|g1e_cell_8_17|
 g1e_cell_slm6_cap|plain|G5|g1e_cell_slm6_cap|
+g1e_cell_10_3|plain|G6|g1e_cell_10_3|
+g1e_cell_10_5|plain|G6|g1e_cell_10_5|
+g1e_cell_10_7|plain|G6|g1e_cell_10_7|
+pkvg_g6_decode_timing|plain|G6|pkvg_g6_decode_timing|
 '
 # Host-only programs (no engine): the suite's process runner.
 HOST_TABLE="pkvg_suite"
