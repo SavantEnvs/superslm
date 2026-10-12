@@ -1736,7 +1736,7 @@ if not defined T2956_R15 set T2956_RUN=0
 if not defined T2956_ADAPTER set T2956_RUN=0
 if "%T2956_RUN%"=="0" goto :t2956_runtime_skipped
 if exist tests\t2956-token-finish-red-suite\out\ru\ru.sslm goto :t2956_ru_ready
-python tests\t2956-token-finish-red-suite\make_ru.py
+python tests\t2956-token-finish-red-suite\make_ru.py --verifier "%CD%\out\sslm_verify.exe"
 if errorlevel 1 (
 	echo T-2956 RU fixture generation FAILED
 	goto :hard_fail
