@@ -10,14 +10,14 @@
 // by job-id prefix or '=' exact id, a selector that selects nothing fails the run, a job whose artifact
 // was not given is RED (a skip fails the run), and every job runs with SSLM_GPU_ENABLE_DEBUG_LAYER=1.
 //
-// Usage: pkvg_suite --bin=DIR [--step=G2|G3|G4|G5] [--list] [--no-debug-layer] [artifact flags] [JOB ...]
+// Usage: pkvg_suite --bin=DIR [--step=G2|G3|G4|G5|G6] [--list] [--no-debug-layer] [artifact flags] [JOB ...]
 //   --bin=DIR           where build_paged_kv_gpu.bat (or _mingw.sh) put the executables
 //   --step=GN           run the jobs whose bracket is at or before GN, and the in-process runner pkvg_gN
-//                       (default G5: everything)
+//                       (G6 adds no in-process cell: at G6 the runner is pkvg_g5) (default G6: everything)
 //   --pkv-fixtures=DIR  tools/gen_paged_kv_fixture.py's output (pkv_def.sslm, pkv_qk.sslm, ...)
 //   --pkv-reference=DIR tests/paged-kv/reference (default: relative to the working directory, the repo root)
 //   --gpu-ref=DIR       6.5a's pre-G2 GPU records (gpu_pre_g2_<fx>_adapter<N>.ref)
-//   --model05=PATH --model15=PATH   the real Qwen2.5-0.5B / 1.5B artifacts (g1a 4.8, g1b 11.4)
+//   --model05=PATH --model15=PATH   the real Qwen2.5-0.5B / 1.5B artifacts (g1a 4.8, g1b 11.4, the G6 box legs)
 //   --qwen3=PATH --r15=PATH --g5=PATH  g1d's artifacts (te425's --qwen3, --r15, --g5)
 //   --adapter=PATH --adapter-other-base=PATH  g1c's LoRA adapters (3.6d adapter_map, adapter_other_base)
 //   --out98=DIR         9.8's exchange directory (SUPERSLM_PKV_GPU_98_OUT)
@@ -36,7 +36,7 @@ namespace {
 
 struct Job {
 	const char* id;    // "pkvg/g3", "3.6f/first", "9.8/leg2"
-	int bracket;       // the step at which it can first link (2..5)
+	int bracket;       // the step at which it can first link (2..6)
 	int only_at;       // nonzero: the in-process runner of exactly that step (pkvg_gN)
 	const char* exe;   // under --bin ("old:" prefix: under --old-bin)
 	const char* args;  // {key} expands to the flag's value; a "--x={key}" word whose value is empty is dropped
@@ -101,6 +101,16 @@ const Job kJobs[] = {
     // reader (built from the other tree, --old-bin) refusing SLM6 with 7. Leg 2 runs after leg 1.
     {"9.8/leg1", 5, 0, "g1e_cell_9_8.exe", "--fixture-dir={fx}", "fx out98"},
     {"9.8/leg2", 5, 0, "old:g1e_old_reader_9_8.exe", "--model={fx}/pkv_def.sslm --in={out98}", "fx out98 oldbin"},
+    // G6 (§7 10.3, 10.5, 10.7): the GPU cohort and admission cells (g1e_cohort.h). Each has a fixture leg on pkv_def
+    // (B = 16 at cap 4,096, the geometry the plan's figures were executed at; it runs on the software GPU) and a box
+    // leg on the real 0.5B. Both read the R0 records under --pkv-reference. The G6 decode timing (§10 R1) is not a
+    // suite job: tools\run_paged_kv_g6_box.ps1 runs pkvg_g6_decode_timing.exe on a quiet box.
+    {"10.3/fixture", 6, 0, "g1e_cell_10_3.exe", "--leg=fixture --fixture-dir={fx} --pkv-reference={ref}", "fx"},
+    {"10.3/box", 6, 0, "g1e_cell_10_3.exe", "--leg=box --model05={m05} --pkv-reference={ref}", "m05"},
+    {"10.5/fixture", 6, 0, "g1e_cell_10_5.exe", "--leg=fixture --fixture-dir={fx}", "fx"},
+    {"10.5/box", 6, 0, "g1e_cell_10_5.exe", "--leg=box --model05={m05}", "m05"},
+    {"10.7/fixture", 6, 0, "g1e_cell_10_7.exe", "--leg=fixture --fixture-dir={fx} --pkv-reference={ref}", "fx"},
+    {"10.7/box", 6, 0, "g1e_cell_10_7.exe", "--leg=box --model05={m05} --pkv-reference={ref}", "m05"},
 };
 
 bool Matches(const char* id, const std::string& arg) {
@@ -166,7 +176,7 @@ void SetEnv(const char* k, const std::string& v) {
 int main(int argc, char** argv) {
 	std::map<std::string, std::string> v;
 	v["ref"] = "tests/paged-kv/reference";
-	std::string bin = ".", step_s = "G5";
+	std::string bin = ".", step_s = "G6";
 	bool list = false, debug_layer = true;
 	std::vector<std::string> sel;
 	const std::pair<const char*, const char*> kFlags[] = {
@@ -198,10 +208,13 @@ int main(int argc, char** argv) {
 		} else sel.push_back(a);
 	}
 	const int step = (step_s.size() == 2 && (step_s[0] == 'G' || step_s[0] == 'g')) ? step_s[1] - '0' : 0;
-	if (step < 2 || step > 5) {
-		std::fprintf(stderr, "--step must be G2, G3, G4 or G5\n");
+	if (step < 2 || step > 6) {
+		std::fprintf(stderr, "--step must be G2, G3, G4, G5 or G6\n");
 		return 2;
 	}
+	// The in-process runner of the step: pkvg_g2 .. pkvg_g5. G6 brings process cells only, so at G6 the runner is
+	// pkvg_g5's (every in-process cell at or before G6).
+	const int inproc = step < 5 ? step : 5;
 	if (v.count("fx") == 0) {
 		if (const char* d = std::getenv("SUPERSLM_PAGED_KV_FIXTURE_DIR")) v["fx"] = d;
 	}
@@ -224,7 +237,7 @@ int main(int argc, char** argv) {
 	}
 	int ran = 0, failed = 0;
 	for (const Job& j : kJobs) {
-		if (j.bracket > step || (j.only_at && j.only_at != step)) continue;
+		if (j.bracket > step || (j.only_at && j.only_at != inproc)) continue;
 		bool selected = sel.empty();
 		for (size_t i = 0; i < sel.size() && !selected; ++i) selected = Matches(j.id, sel[i]);
 		if (!selected) continue;

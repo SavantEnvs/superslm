@@ -5,7 +5,7 @@ rem build_paged_kv_gpu_mingw.sh (the cloud build); the two tables below must sta
 rem
 rem Usage: tests\paged-kv-gpu\build_paged_kv_gpu.bat ["--out=DIR"] ["--shaders=DIR"] ["--gpu-dir=DIR"]
 rem                                                  ["--old-tree=DIR"] ["--old-cpu-lib=FILE"] [TARGET ...]
-rem   TARGET     g2 | g3 | g4 | g5: every executable whose bracket is that step (default: all four);
+rem   TARGET     g2 | g3 | g4 | g5 | g6: every executable whose bracket is that step (default: all five);
 rem              or one executable's name (pkvg_g3, g1d_cell_3_6f, ...); oldreader: 9.8's v1.12.0 reader only
 rem   --out      default <repo>\build\pkvg (executables in <out>\bin, shaders copied to <out>\bin\shaders)
 rem   --shaders  default <repo>\out\shaders (build.bat's), else <repo>\build\Release\shaders (CMake's)
@@ -20,7 +20,7 @@ rem engine library failed to build.
 rem
 rem Engine: build.bat's superslm_tests source list restricted to src\ (CPU library once; GPU library per
 rem configuration). Configurations, and the cells compiled with the same definitions:
-rem   plain  (none)                                                pkvg_g2..g5, g1d 3.12, g1e
+rem   plain  (none)                                                pkvg_g2..g5, g1d 3.12, g1e, G6 timing
 rem   alloc  /DSUPERSLM_GPU_ALLOC_FAULT_INJECTION /DSUPERSLM_GPU_TEST_SEAMS  11.4, 3.6d first touch, g1d 3.6e/f/g
 rem   t2169  /DSUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION       g1d 3.6g recovered
 rem   bench  /DSUPERSLM_ENABLE_GPU_BENCH_PRE_BATCHING               3.6d bench prefill
@@ -50,7 +50,7 @@ if not defined TAKEN set "TARGETS=!TARGETS! %~1"
 shift
 goto :parse_args
 :args_done
-if "%TARGETS%"=="" set TARGETS= g2 g3 g4 g5
+if "%TARGETS%"=="" set TARGETS= g2 g3 g4 g5 g6
 if "%SHADERS%"=="" set SHADERS=%ENG%\out\shaders
 if not exist "%SHADERS%\*.cso" set SHADERS=%ENG%\build\Release\shaders
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -no_logo
@@ -129,6 +129,12 @@ call :exe g1e_cell_9_12 plain G5 "g1e_cell_9_12" ""
 call :exe g1e_cell_9_13 plain G5 "g1e_cell_9_13" ""
 call :exe g1e_cell_8_17 plain G5 "g1e_cell_8_17" ""
 call :exe g1e_cell_slm6_cap plain G5 "g1e_cell_slm6_cap" ""
+rem G6 (plan §7 10.3, 10.5, 10.7; §10 R1): the GPU cohort and admission cells, and the decode timing harness
+rem (plain configuration: the harness refuses any seam definition at compile time).
+call :exe g1e_cell_10_3 plain G6 "g1e_cell_10_3" ""
+call :exe g1e_cell_10_5 plain G6 "g1e_cell_10_5" ""
+call :exe g1e_cell_10_7 plain G6 "g1e_cell_10_7" ""
+call :exe pkvg_g6_decode_timing plain G6 "pkvg_g6_decode_timing" ""
 :only_old
 if defined OLDTREE call :oldreader
 echo PKVG BUILD: %NLINKED% linked, %NRED% red by link, %NCOMPILE% red by compile or unexpected link failure
