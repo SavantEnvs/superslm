@@ -239,8 +239,11 @@ As an example, at Qwen2.5-0.5B with a 4,096-token context, a cast of 50 characte
 
 Existing code needs no changes: `sslm_seq_create`, `sslm_prefix_begin` and the other 1.11.0 calls
 behave as before and save in the same format, which older releases can read. The savings apply only
-to budgeted sequences, the context cap is still the cap, and GPU sequences are not paged yet. This
-release makes no speed claim; see the release note for measured figures. The full contract is in
+to budgeted sequences, the context cap is still the cap, and GPU sequences are not paged yet. Speed
+is claimed for single-conversation decode on Windows x64 CPU only: paged decode is held to within 5%
+of the contiguous cache of the same build, and reset and adopt cost does not grow with the context
+cap. Batched decode works and stays bit-identical, with no speed claim. The release note has the
+figures. The full contract is in
 [docs/api.md](docs/api.md#paged-kv-memory-1120).
 
 ## Status

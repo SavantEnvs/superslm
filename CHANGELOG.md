@@ -41,8 +41,18 @@ memory*) is the contract and `docs/releases/1.12.0.md` the release note.
   exactly one create, against 60 blocks (1,440 MiB) in 1.11.0. Reproduced in the cloud on a
   synthetic fixture with the 0.5B page arithmetic; the 1,842 and 1,841 page admissions are
   confirmed on the real artifact on the release machine (cell 10.4).
-- **Speed:** no figure is promised. Decode against 1.11.0: TODO-BOX (cell 7.9). Lifecycle verbs:
-  TODO-BOX (the lifecycle timing cell on both binaries).
+- **Speed** (Windows x64 CPU only, at the release machine's ordinary background load, TODO-BOX(R0:
+  CPU model, ISA flags and background-load record from the capture); decode speed for
+  single-conversation generation only; nothing is claimed under load or on the GPU). Paged decode is
+  held to no more than 5% slower than the contiguous cache of the same build, at Qwen2.5-0.5B and
+  1.5B (cell 7.9; 0.5B: TODO-BOX(R2: 0.5B paged vs one-page tok/s and ratio); 1.5B: TODO-BOX(R4: 1.5B
+  paged vs one-page tok/s and ratio); shared-prefix decode, reported, cell 7.9b: TODO-BOX(R3: 7.9b
+  ratio)). Reset and adopt cost does not grow with the context cap (cell 7.4: TODO-BOX(R1: four
+  reset and adopt ratios, cap 32,768 against cap 4,096)). Lifecycle changes against 1.11.0:
+  TODO-BOX(R5: per-verb changes from the commissioned cross-binary comparison; stated only from a run
+  carrying STANDING R5 (X-6), otherwise dropped).
+- **Batched decode** works and stays bit-identical to each sequence's solo run (cell 8.1; release
+  machine: TODO-BOX(R11: cell 8.1 in `superslm_pkv_c5`)). No batched speed is measured or claimed.
 - **Behaviour changes for every host:** `sslm_seq_state_size` is 20 bytes larger (fixed part 180,
   was 160). `sslm_kv_pool_create` refuses a `block_count` whose page total exceeds `UINT32_MAX`.
   The first `sslm_prefix_freeze` returns the prefix's unused pages to the pool, so a pool can

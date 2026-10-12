@@ -710,6 +710,20 @@ These apply to every host, including one that calls no new verb:
   (no save produces one), with `SSLM_INVALID_ARGUMENT`.
 - `sslm_seq_restore` reads `SSB6`.
 
+#### Speed claims in 1.12.0
+
+The claims are for Windows x64, CPU only, at ordinary background load. The
+[1.12.0 release note](releases/1.12.0.md) carries the measured figures.
+
+- **Single-conversation decode.** Attention reads K/V one page run at a time.
+  Decode of one sequence over paged K/V is no more than 5% slower than the
+  contiguous cache of the same build, at Qwen2.5-0.5B and Qwen2.5-1.5B.
+- **Reset and adopt.** Their cost does not grow with the context cap: the same
+  live length at cap 32,768 costs no more than a fixed bound of 2.0 times its
+  cost at cap 4,096.
+- **Batched decode.** `sslm_decode_step` over several sequences works and stays
+  bit-identical to each sequence's solo run. No batched speed is claimed.
+
 #### Not promised in 1.12.0
 
 - **Memory savings for no-budget verbs.** A host that calls only the 1.11.0
@@ -720,9 +734,8 @@ These apply to every host, including one that calls no new verb:
 - **A higher context cap.** The cap is not removed: RoPE tables and the
   attention score scratch are still sized by it, and a write at the cap still
   fails. Paging only makes a high cap cheaper to reserve.
-- **Speed.** No speed figure is promised. Attention reads K/V one page run at
-  a time, and decode throughput against 1.11.0 is measured, not guaranteed
-  (see the [1.12.0 release note](releases/1.12.0.md)).
+- **Speed beyond the claims above.** Nothing is claimed under load, on the
+  GPU, or for batched decode.
 - **GPU paging.** The GPU API (`SslmGpu*`, `sslm_gpu_*`) is unchanged: GPU
   sequences keep one whole-cap buffer each and have no prefix or adopt verbs.
   GPU paging is planned for a later release.
