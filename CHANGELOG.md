@@ -12,8 +12,9 @@ and K/V element width, and is 64 for Qwen2.5-0.5B at cap 4,096 and for Qwen2.5-1
 reached through a per-holder page table. Tokens and K/V values are bit-identical to 1.11.0 on every
 path, as read on Windows x64 with MSVC. A host that calls only the 1.11.0 verbs keeps their results,
 admission counts and save blobs, apart from the changes listed below, but not their save speed:
-`sslm_seq_save` of a no-budget sequence takes 1.21 to 1.93 times as long as in 1.11.0, and a later
-release is planned to fix that. The memory savings come only from the new budget-mode verbs. Thirteen C verbs and one status are added (51 C verbs in all); no signature,
+`sslm_seq_save` of a no-budget sequence takes 1.14 to 2.00 times as long as in 1.11.0 on the release
+code, at every length measured (24 of 24 readings across four captures; readings, not resolved
+changes), and a later release is planned to fix that. The memory savings come only from the new budget-mode verbs. Thirteen C verbs and one status are added (51 C verbs in all); no signature,
 struct layout or existing ordinal changes. The GPU API is unchanged. `docs/api.md` (*Paged KV
 memory*) is the contract and `docs/releases/1.12.0.md` the release note.
 - **Budget mode.** `sslm_seq_create_budgeted` and `sslm_prefix_begin_budgeted` take a budget,
@@ -83,18 +84,20 @@ memory*) is the contract and `docs/releases/1.12.0.md` the release note.
   claims no size or direction of change for them except save (next bullet). The release note has the
   tables.
 - **Save is slower than 1.11.0.** `sslm_seq_save` of a no-budget sequence writes the same bytes as in
-  1.11.0 and takes longer at every length measured: 1.21 to 1.93 times as long (Qwen2.5-0.5B, cap
-  4,096: 1.30, 1.35 and 1.93 times at 16, 1,000 and 4,096 live tokens; Qwen2.5-1.5B, cap 32,768:
-  1.21, 1.24 and 1.88 times at 16, 1,000 and 32,768). A full-length save takes 60.3 ms against 32.1
-  ms at 1.5B, and 3.32 ms against 1.72 ms at 0.5B. A later release is planned to remove the
-  slowdown. The release note has the readings.
+  1.11.0 and is slower at every length measured: 24 of 24 readings across four captures on the
+  release machine. Three captures of the release code read 1.14 to 2.00 times as long (the graded
+  run, 1.21 to 1.93: Qwen2.5-0.5B, cap 4,096, 1.30, 1.35 and 1.93 times at 16, 1,000 and 4,096 live
+  tokens; Qwen2.5-1.5B, cap 32,768, 1.21, 1.24 and 1.88 times at 16, 1,000 and 32,768); an earlier
+  build read up to 2.23. These are readings, not resolved changes: the lifecycle comparison
+  resolves a change only at 4 times or more and graded all six not resolved. A later release is
+  planned to remove the slowdown. The release note has the readings.
 - **Batched decode** works and stays bit-identical to each sequence's solo run (cell 8.1; on the
   release machine it is one of the 70 cells of `superslm_pkv_c5`, which ran green: 70 cells, 0 red,
   74,052 checks). No batched speed is measured or claimed.
 - **Behaviour changes for every host:** `sslm_seq_state_size` is 20 bytes larger (fixed part 180,
   was 160). `sslm_kv_pool_create` refuses a `block_count` whose page total exceeds `UINT32_MAX`.
   `sslm_kv_pool_overhead_size` is larger at a cap the page size does not divide, by `block_count *
-  (ceil(cap/B) * B - cap)` positions of K/V; `sslm_kv_block_size` and the no-budget save are
+  (ceil(cap/B) * B - cap)` positions of K/V; `sslm_kv_block_size` and the no-budget save blob are
   unchanged at every cap.
   The first `sslm_prefix_freeze` returns the prefix's unused pages to the pool, so a pool can
   admit more handles than before, never fewer. `sslm_seq_reset` no longer zero-fills K/V memory

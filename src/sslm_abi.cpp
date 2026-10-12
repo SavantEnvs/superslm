@@ -184,9 +184,9 @@ struct sslm_model_s {
 	int64_t damped_greedy_q_b = 0;
 	int64_t damped_greedy_q_c = 0;
 	// Paged-KV plan §3.1: the test-only pin's B (KvPagesTestPinPagePositions, below; 0: none, the rule's B),
-	// and the pools that exist on this model, which the pin refuses to change B under. Both are read on
-	// every geometry query, so they are atomics; the pin is a test seam, and a pin racing a pool create on
-	// another thread is the caller's error. The pool count is a counter the model and each pool co-own
+	// and the pools that exist on this model, which the pin refuses to change B under. Geometry queries read
+	// the pin's B, so it is an atomic; the pool count is read only by the pin. The pin is a test seam, and
+	// a pin racing a pool create on another thread is the caller's error. The pool count is a counter the model and each pool co-own
 	// (a pool copies the pointer at create and decrements through its own copy at destroy), so a pool
 	// destroyed after sslm_model_unmap, which does not refuse while a pool lives, writes only to the
 	// counter and never to the freed model. Set once in sslm_model_map before the handle is published and

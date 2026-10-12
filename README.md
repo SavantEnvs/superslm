@@ -18,9 +18,10 @@ Current release: **1.12.0**. On the CPU, K/V memory is stored in pages. A sequen
 token budget and reserve only what that budget needs, and sequences that start from the same prompt
 prefix can share the prefix's memory instead of each holding a copy. Every output stays
 bit-identical to 1.11.0 (read on Windows x64 with MSVC), and code written for 1.11.0 needs no
-changes, but its saves are slower: `sslm_seq_save` of a no-budget sequence takes 1.21 to 1.93 times
-as long as in 1.11.0, and a later release is planned to fix that (the release note lists the
-behaviour changes). See
+changes, but its saves are slower: `sslm_seq_save` of a no-budget sequence takes 1.14 to 2.00 times
+as long as in 1.11.0 on the release code, at every length measured (24 of 24 readings across four
+captures; readings, not resolved changes), and a later release is planned to fix that (the release
+note lists the behaviour changes). See
 [Shared prompt prefixes and budgeted sequences](#shared-prompt-prefixes-and-budgeted-sequences)
 and the [1.12.0 release note](docs/releases/1.12.0.md).
 
@@ -216,7 +217,8 @@ documented in [docs/api.md](docs/api.md) and
 description, then a persona, then their own conversation. SuperSLM already lets you run a shared
 prefix once and have every sequence adopt it instead of re-reading it. From 1.12.0 the CPU backend
 can also keep that prefix in memory once, however many sequences use it, and size each sequence by
-what it will actually generate rather than by the model's whole context length.
+what it will actually generate rather than by the model's whole context length. Sharing and sizing
+by budget hold at a context cap of more than one page.
 
 - **Budgeted sequences.** Create a sequence with `sslm_seq_create_budgeted` and a budget: the number
   of tokens it may add itself. It reserves memory for that budget up front, so it never runs out of
@@ -243,14 +245,15 @@ As an example, at Qwen2.5-0.5B with a 4,096-token context, a cast of 50 characte
 
 Existing code needs no changes: `sslm_seq_create`, `sslm_prefix_begin` and the other 1.11.0 calls
 behave as before in what they return and save in the same format, which older releases can read.
-They are not as fast at one call: `sslm_seq_save` of a no-budget sequence takes 1.21 to 1.93 times
-as long as in 1.11.0, and a later release is planned to fix that. The savings apply only
+One call differs in speed: `sslm_seq_save` of a no-budget sequence takes 1.14 to 2.00 times as long
+as in 1.11.0 on the release code, at every length measured (24 of 24 readings across four captures;
+readings, not resolved changes), and a later release is planned to fix that. The savings apply only
 to budgeted sequences, the context cap is still the cap, and GPU sequences are not paged yet. Speed
-is claimed for single-conversation decode on Windows x64 CPU only: paged decode is held to within 5%
+is claimed for single-conversation decode on Windows x64 CPU only, at ordinary background load: paged decode is held to within 5%
 of the contiguous cache of the same build, to the 0.5B model's 4,096-token cap and to width 18,682 at
 1.5B (measured with whole-token calls and no host parallel-for hook, on the AVX2 tier), and reset
-and adopt cost does not grow with the context cap, measured with the page size held equal at the
-two caps (except that at head_dim 64 or below, a cap above 4,096 doubles the page and its one-page
+and adopt cost does not grow with the context cap (no more than 2.0 times higher at an eightfold
+larger cap), measured with the page size held equal at the two caps (except that at head_dim 64 or below, a cap above 4,096 doubles the page and its one-page
 tail copy). Batched decode works and stays bit-identical, with no speed claim. The release note has the
 figures. The full contract is in
 [docs/api.md](docs/api.md#paged-kv-memory-1120).

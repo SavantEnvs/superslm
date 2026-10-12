@@ -739,7 +739,11 @@ These apply to every host, including one that calls no new verb:
   `UINT32_MAX`, with `SSLM_INVALID_ARGUMENT`.
 - `sslm_kv_pool_overhead_size` is larger at a cap the page size does not
   divide, by `block_count · (ceil(cap / B) · B − cap)` positions of K/V;
-  `sslm_kv_block_size` and the no-budget save are unchanged at every cap.
+  `sslm_kv_block_size` and the no-budget save blob are unchanged at every cap.
+- `sslm_seq_save` of a no-budget sequence is slower than in 1.11.0 at every
+  length measured, with the same bytes: 1.14 to 2.00 times as long on the
+  release code (24 of 24 readings across four captures; readings, not resolved
+  changes; see [Speed claims in 1.12.0](#speed-claims-in-1120)).
 - The first `sslm_prefix_freeze` returns the prefix's unused pages to the
   pool, so a pool can admit more handles than before, never fewer.
 - `sslm_seq_reset` no longer zero-fills the sequence's K/V memory. No read
@@ -781,9 +785,12 @@ figures.
   live length apply to budget-mode holders only.
 - **No-budget save size.** A no-budget sequence's `SSB5` is still the whole
   block, so that 1.11.0 can read it.
-- **No-budget save speed.** A no-budget `sslm_seq_save` takes 1.21 to 1.93 times
-  as long as in 1.11.0 on the release machine, with the same bytes. A later
-  release is planned to remove the slowdown.
+- **No-budget save speed.** A no-budget `sslm_seq_save` takes 1.14 to 2.00 times
+  as long as in 1.11.0 on the release code, at every length measured (24 of 24
+  readings across four captures on the release machine; readings, not resolved
+  changes: the release note's lifecycle comparison resolves a change only at 4
+  times or more), with the same bytes. A later release is planned to remove the
+  slowdown.
 - **A higher context cap.** The cap is not removed: RoPE tables and the
   attention score scratch are still sized by it, and a write at the cap still
   fails. Paging only makes a high cap cheaper to reserve.
