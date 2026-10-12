@@ -234,15 +234,17 @@ what it will actually generate rather than by the model's whole context length.
 
 As an example, at Qwen2.5-0.5B with a 4,096-token context, a cast of 50 characters sharing one
 1,000-token world and 10 200-token personas, each with up to 512 tokens of its own, fits in a pool of
-173 MiB, where whole-context sequences need 1,440 MiB (the pool figure is confirmed on the real
+189.4 MiB, where whole-context sequences need 1,440 MiB (the pool figure is confirmed on the real
 0.5B artifact). The cast and its numbers are an illustration, not a measured game workload.
 
 Existing code needs no changes: `sslm_seq_create`, `sslm_prefix_begin` and the other 1.11.0 calls
 behave as before and save in the same format, which older releases can read. The savings apply only
 to budgeted sequences, the context cap is still the cap, and GPU sequences are not paged yet. Speed
 is claimed for single-conversation decode on Windows x64 CPU only: paged decode is held to within 5%
-of the contiguous cache of the same build, and reset and adopt cost does not grow with the context
-cap. Batched decode works and stays bit-identical, with no speed claim. The release note has the
+of the contiguous cache of the same build, to the 0.5B model's 4,096-token cap and to width 18,682 at
+1.5B, and reset and adopt cost does not grow with the context cap (except that at head_dim 64 or
+below, a cap above 4,096 doubles the page and its one-page tail copy). Batched decode works and
+stays bit-identical, with no speed claim. The release note has the
 figures. The full contract is in
 [docs/api.md](docs/api.md#paged-kv-memory-1120).
 

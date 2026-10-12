@@ -183,7 +183,7 @@ speed (`docs/attention-rowsites/s3/bench.md`).
 
 Attention's softmax row (`SoftmaxRowQ15`) turns a row of scores into Q15
 probabilities. On the AVX2 and AVX-512 tiers it first checks a row guard:
-width at most 2^14, q_ln2 >= 1, q_c >= 0, M = q_b^2 + q_c in [1, 2^47]
+width at most 32,767, q_ln2 >= 1, q_c >= 0, M = q_b^2 + q_c in [1, 2^47]
 (formed in 128 bits, as the 1.9.0 body forms it), q_ln2 <= 2 q_b + 1, and
 every score within 2^61. Inside the guard it computes the row 4 or 8
 elements at a time. Each element's quotient by q_ln2 and each

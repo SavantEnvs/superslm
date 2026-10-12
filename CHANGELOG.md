@@ -7,11 +7,12 @@ All notable changes to SuperSLM (Layer 1) are recorded here.
 ## [1.12.0] - Unreleased
 
 Not yet tagged; the date is filled at the tag (TODO-BOX). The CPU backend stores K/V in pages of
-`B` positions (`sslm_kv_page_positions`; 16 for every converted artifact on record), reached
-through a per-holder page table. Tokens, K/V values and the axis digest are bit-identical to
+`B` positions (`sslm_kv_page_positions`; `B` follows from the model's head dimension, context cap
+and K/V element width, and is 64 for Qwen2.5-0.5B at cap 4,096 and for Qwen2.5-1.5B at cap 32,768),
+reached through a per-holder page table. Tokens, K/V values and the axis digest are bit-identical to
 1.11.0 on every path. A host that calls only the 1.11.0 verbs keeps their behaviour, admission
 counts and save blobs, apart from the changes listed below; the memory savings come only from the
-new budget-mode verbs. Eleven C verbs and one status are added (49 C verbs in all); no signature,
+new budget-mode verbs. Thirteen C verbs and one status are added (51 C verbs in all); no signature,
 struct layout or existing ordinal changes. The GPU API is unchanged. `docs/api.md` (*Paged KV
 memory*) is the contract and `docs/releases/1.12.0.md` the release note.
 - **Budget mode.** `sslm_seq_create_budgeted` and `sslm_prefix_begin_budgeted` take a budget,
@@ -28,8 +29,15 @@ memory*) is the contract and `docs/releases/1.12.0.md` the release note.
   or re-adopted.
 - **Pools and diagnostics.** `sslm_kv_page_pool_create`, `sslm_kv_page_size` and
   `sslm_kv_page_pool_overhead_size` size a pool in pages; `sslm_kv_pool_create` builds
-  `block_count * ceil(cap/B)` pages in the same buffer. `sslm_kv_pool_stats` and
-  `sslm_seq_kv_stats` report pages, mode, origin, budget and limit. `kv_blocks_resident` stays 1.
+  `block_count * ceil(cap/B)` pages in the same buffer at a cap `B` divides. `sslm_kv_pool_stats`
+  and `sslm_seq_kv_stats` report pages, mode, origin, budget and limit. `kv_blocks_resident` stays 1.
+- **Contiguous pool option (CPU).** `sslm_kv_pool_contiguous_size` and
+  `sslm_kv_pool_create_contiguous` build a pool whose page is the whole context cap, 1.11.0's
+  contiguous layout. Adopt and `sslm_prefix_begin_from` in it copy and share no page; saves are the
+  same in every pool kind. It is the reference decode speed is measured against.
+- **Softmax fast path.** On the AVX2 and AVX-512 tiers, `SoftmaxRowQ15`'s fast path admits rows up
+  to width 32,767 (was 2^14); every probability and the returned bool stay bit-identical to the
+  1.9.0 body. No speed figure is claimed for it.
 - **Save format `SSB6`** for budget holders only: the `SSB5` header plus `kv_mode`, `budget` and
   `origin` (172 bytes), the residual and history, then `kv_positions` and only the written rows, so
   its size follows the live length. No-budget holders keep writing `SSB5`, byte-equal to 1.11.0's.
@@ -37,24 +45,45 @@ memory*) is the contract and `docs/releases/1.12.0.md` the release note.
   an `SSB6` blob's exact size. `sslm_seq_restore_shared` re-shares a live prefix handle's pages when
   its bytes match the blob's exactly, and otherwise restores privately with `SSLM_OK`.
 - **Memory (by admission, 0.5B, cap 4096, example cohort of a 1,000-token world, 10 personas and 50
-  budget-512 sequences):** a pool of 1,842 pages (173 MiB) admits the cohort and 1,841 refuses
-  exactly one create, against 60 blocks (1,440 MiB) in 1.11.0. Reproduced in the cloud on a
-  synthetic fixture with the 0.5B page arithmetic; the 1,842 and 1,841 page admissions are
-  confirmed on the real artifact on the release machine (cell 10.4).
-- **Speed** (Windows x64 CPU only, at the release machine's ordinary background load, TODO-BOX(R0:
-  CPU model, ISA flags and background-load record from the capture); decode speed for
-  single-conversation generation only; nothing is claimed under load or on the GPU). Paged decode is
-  held to no more than 5% slower than the contiguous cache of the same build, at Qwen2.5-0.5B and
-  1.5B (cell 7.9; 0.5B: TODO-BOX(R2: 0.5B paged vs one-page tok/s and ratio); 1.5B: TODO-BOX(R4: 1.5B
-  paged vs one-page tok/s and ratio); shared-prefix decode, reported, cell 7.9b: TODO-BOX(R3: 7.9b
-  ratio)). Reset and adopt cost does not grow with the context cap (cell 7.4: TODO-BOX(R1: four
-  reset and adopt ratios, cap 32,768 against cap 4,096)). Lifecycle changes against 1.11.0:
-  TODO-BOX(R5: per-verb changes from the commissioned cross-binary comparison; stated only from a run
-  carrying STANDING R5 (X-6), otherwise dropped).
-- **Batched decode** works and stays bit-identical to each sequence's solo run (cell 8.1; release
-  machine: TODO-BOX(R11: cell 8.1 in `superslm_pkv_c5`)). No batched speed is measured or claimed.
+  budget-512 sequences):** a pool of 505 pages (189.4 MiB) admits the cohort and 504 refuses
+  exactly one create, against 60 blocks (1,440 MiB) in 1.11.0. The 505 and 504 page admissions are
+  confirmed on the real artifact on the release machine (cell 10.4), and 1.11.0-style blocks in the
+  same bytes admit 7 sequences. Restored with their prefix handles, the cohort fits in the same 505
+  pages (cell 10.6); restored without them it needs 1,405 pages until each sequence re-adopts, after
+  which 100 more budget-512 sequences are admitted (cell 10.8).
+- **Speed** (Windows x64 CPU only, at the ordinary background load of the release machine, an AMD
+  Ryzen 9 3950X with AVX2 and without AVX-512, Windows 10.0.19045; decode speed for
+  single-conversation generation only; nothing is claimed under load, on the GPU or for batched
+  decode). Single-conversation decode is no more than 5% slower than the contiguous cache at both
+  targets, to the 0.5B cap of 4,096 and to width 18,682 at 1.5B, with 7.9b reported; the contiguous
+  cache is the contiguous pool option of the same build, not 1.11.0 (cell 7.9). Largest of five
+  process medians, in percent slower, with the SD of the five: Qwen2.5-0.5B at cap 4,096, restored
+  at 1,200, 2,044 and 3,988 tokens: +1.001 (0.067), +1.706 (0.098), +2.682 (0.089); Qwen2.5-1.5B at
+  cap 32,768, restored at 8,188, 15,872 and 18,678 tokens: +1.310 (0.178), +3.349 (0.520), +3.861
+  (0.439). At 0.5B the mean of the five medians is 0.941 ± 0.083, 1.629 ± 0.122 and 2.582 ± 0.110
+  (95% half-width of the mean). The 1.5B figures carry a session-dependent zero-point offset of about
+  one point (an A/A run of two identical contiguous arms read +1.16 and +1.13 at the rows restored
+  at 15,872 and 18,678, +0.05 at the 0.5B row restored at 3,988; the 1.5B row restored at 8,188 has
+  none of its own, and the offset covers it by extension) and are not resolved finer. Shared-prefix
+  decode, reported (cell 7.9b, Qwen2.5-0.5B): +1.063% median, sign interval +0.990% to +1.130%.
+  Reset and adopt cost does not grow with the context cap, except that at head_dim <= 64 a cap
+  above 4,096 doubles the page and its one-page tail copy (0.5B: 384 KiB at caps up to 4,096, 768
+  KiB above), at a cap of more than one page (cell 7.4, cap 32,768 against cap 4,096, bound 2.0: the
+  86th and 120th smallest of 205 ratios were 0.996 and 1.004 for budget adopt, 1.000 and 1.000 for
+  budget reset, 0.950 and 1.018 for no-budget adopt, 1.188 and 1.750 for no-budget reset). Lifecycle
+  changes against 1.11.0 (no-budget holders, Qwen2.5-0.5B at cap 4,096 and Qwen2.5-1.5B at cap
+  32,768, published only where the two builds' medians differ by a factor of at least 4): 22 of 34
+  readings, all speed-ups, from 6.811 times faster (restore of a 1,000-token state at 0.5B) to 9864.84
+  times (release of a fresh holder at 1.5B). The other 12, which include every save, claim nothing in
+  either direction. The release note has the tables.
+- **Batched decode** works and stays bit-identical to each sequence's solo run (cell 8.1; on the
+  release machine it is one of the 70 cells of `superslm_pkv_c5`, which ran green: 70 cells, 0 red,
+  74,052 checks). No batched speed is measured or claimed.
 - **Behaviour changes for every host:** `sslm_seq_state_size` is 20 bytes larger (fixed part 180,
   was 160). `sslm_kv_pool_create` refuses a `block_count` whose page total exceeds `UINT32_MAX`.
+  `sslm_kv_pool_overhead_size` is larger at a cap the page size does not divide, by `block_count *
+  (ceil(cap/B) * B - cap)` positions of K/V; `sslm_kv_block_size` and the no-budget save are
+  unchanged at every cap.
   The first `sslm_prefix_freeze` returns the prefix's unused pages to the pool, so a pool can
   admit more handles than before, never fewer. `sslm_seq_reset` no longer zero-fills K/V memory
   (nothing reads it, and saves are unchanged). Restore refuses a blob of any format that is
