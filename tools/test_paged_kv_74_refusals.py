@@ -9,10 +9,24 @@ import csv
 import json
 import statistics
 
-BUILD = Path(os.environ.get("PKV_C6_BUILD", "D:/_scratch/T-3112/build-c6"))
-FIXTURES = Path(os.environ.get("PKV_C6_FIXTURES", "D:/_scratch/T-3112/fixtures"))
+# Required, with no default (the 1.12.0 review M-2): a default naming an old scratch build ran these cells against
+# that stale build whenever it was present. Unset or missing fails every cell, never skips it, as
+# .github/workflows/tests.yml says of the paged-KV tool tests it leaves to the build box.
+BUILD_DIR = os.environ.get("PKV_C6_BUILD", "")
+FIXTURES_DIR = os.environ.get("PKV_C6_FIXTURES", "")
+BUILD = Path(BUILD_DIR)
+FIXTURES = Path(FIXTURES_DIR)
 
 class RefusalCells(unittest.TestCase):
+    def setUp(self):
+        if not BUILD_DIR:
+            self.fail("PKV_C6_BUILD is unset: name the paged-KV C6 build's directory; there is no default")
+        if not (BUILD / "superslm_pkv_c6.exe").is_file():
+            self.fail(f"PKV_C6_BUILD names {BUILD_DIR}, which holds no superslm_pkv_c6.exe")
+        if not FIXTURES_DIR or not FIXTURES.is_dir():
+            self.fail("PKV_C6_FIXTURES is unset or not a directory: name the generated fixture directory "
+                      "(tools/gen_paged_kv_fixture.py); there is no default")
+
     def call(self, binary="superslm_pkv_c6.exe", cell="7.4/C6:fixtures", **settings):
         env = os.environ.copy()
         env["SUPERSLM_PAGED_KV_FIXTURE_DIR"] = str(FIXTURES)

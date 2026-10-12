@@ -118,11 +118,15 @@ if "%PRISTINE_OK%"=="1" (
     "%SSLM_PYTHON%" make_gpu_fixed_noslm5.py "%PRISTINE%\gpu_1p0_pristine.cpp" "%PRISTINE%\gpu_1p0_fixed.cpp" ^
         > obj_gpu\make_gpu_fixed_noslm5.log 2>&1 || (echo GENERATE FAILED: gpu_fixed_noslm5 & type obj_gpu\make_gpu_fixed_noslm5.log & set OVERALL_OK=0& set PRISTINE_OK=0)
 )
+rem The configuration's objects are removed before the step that writes them, and a failed compile
+rem clears PRISTINE_OK as a failed staging or generation does (the 1.12.0 review): the slm4_dump
+rem link below then never runs, and never on objects an earlier run wrote.
+if exist obj_gpu\gpu_fixed_noslm5 rmdir /s /q obj_gpu\gpu_fixed_noslm5
 if "%PRISTINE_OK%"=="1" (
-    if not exist obj_gpu\gpu_fixed_noslm5 mkdir obj_gpu\gpu_fixed_noslm5
+    mkdir obj_gpu\gpu_fixed_noslm5
     cl /nologo /std:c++20 /O2 /W3 /fp:precise /EHsc /I"%PRISTINE%" /I%ENG%\include /I%ENG%\src\gpu ^
         /c "%PRISTINE%\gpu_1p0_fixed.cpp" "%PRISTINE%\superslm_gpu_pristine.cpp" /Fo"obj_gpu\gpu_fixed_noslm5\\" ^
-        > obj_gpu\gpu_fixed_noslm5.buildlog 2>&1 || (echo BUILD FAILED: gpu_fixed_noslm5 & type obj_gpu\gpu_fixed_noslm5.buildlog & set OVERALL_OK=0)
+        > obj_gpu\gpu_fixed_noslm5.buildlog 2>&1 || (echo BUILD FAILED: gpu_fixed_noslm5 & type obj_gpu\gpu_fixed_noslm5.buildlog & set OVERALL_OK=0& set PRISTINE_OK=0)
 )
 
 rem MUT_CHECKEDRETURN / MUT_NOREARM (T-2916, TE-370 M1): single-line reverts, generated fresh
@@ -482,6 +486,9 @@ rem dead-end at all, so linking against it made the pre-save assertion below unw
 rem cell_gpu_slm4_restore (FIXED only) ----
 cl /nologo /std:c++20 /O2 /W3 /fp:precise /EHsc %STOCKINC% /c cell_gpu_slm4_dump.cpp /Fo"obj_gpu\slm4_dump.obj" ^
     > obj_gpu\slm4_dump.buildlog 2>&1 || (echo BUILD FAILED: slm4_dump.obj & type obj_gpu\slm4_dump.buildlog & set OVERALL_OK=0)
+rem The blob is removed before the dump that writes it, so slm4_restore below reads only a blob this
+rem run's dump wrote, or none (the 1.12.0 review).
+if exist obj_gpu\slm4_blob.bin del /f /q obj_gpu\slm4_blob.bin
 if "!PRISTINE_OK!"=="1" (
     link /nologo /OUT:"bin_gpu\slm4_dump.exe" obj_gpu\slm4_dump.obj obj_gpu\gpu_fixed_noslm5\gpu_1p0_fixed.obj obj_gpu\gpu_fixed_noslm5\superslm_gpu_pristine.obj !CPU_COMMON_OBJS! %SYSLIBS% ^
         > obj_gpu\slm4_dump.linklog 2>&1 || (echo LINK FAILED: slm4_dump & type obj_gpu\slm4_dump.linklog & set OVERALL_OK=0)

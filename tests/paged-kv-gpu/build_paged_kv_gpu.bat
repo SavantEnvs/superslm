@@ -221,7 +221,8 @@ echo ===== g1e_old_reader_9_8 against %OLDTREE% =====
 if not exist "%OUT%\old" mkdir "%OUT%\old"
 if not defined OLDCPULIB set OLDCPULIB=%OLDTREE%\build\Release\superslm.lib
 if not exist "%OLDCPULIB%" ( echo NO v1.12.0 CPU LIBRARY AT %OLDCPULIB% & set /a NCOMPILE+=1 & exit /b 0 )
-set OCLF=/nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /I"%OLDTREE%\include"
+rem /MD: the default --old-cpu-lib is the old tree's CMake (Visual Studio generator) library, built /MD.
+set OCLF=/nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /MD /I"%OLDTREE%\include"
 for %%S in ("%OLDTREE%\src\gpu\superslm_gpu.cpp" "%OLDTREE%\src\gpu\gpu_1p0.cpp") do (
     cl /c %OCLF% /I"%OLDTREE%\src\gpu" /Fo"%OUT%\old\\" "%%~S" > "%OUT%\old\%%~nS.log" 2>&1
     if errorlevel 1 ( type "%OUT%\old\%%~nS.log" & echo v1.12.0 GPU BUILD FAILED & set /a NCOMPILE+=1 & exit /b 0 )

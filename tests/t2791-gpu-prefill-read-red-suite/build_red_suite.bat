@@ -153,7 +153,12 @@ if "%CELL%"=="cell_env_pins_shipping_leg" set VARIANT=gpu_plain
 if "%CELL%"=="cell_prompt_guard_removal" set VARIANT=gpu_plain
 set CELLINC=
 findstr /R /C:"^ *# *include *\"d3d12_harness.h\"" "%HEREDIR%%CELL%.cpp" >nul && set CELLINC=/I"%GPUDIR%"
-cl /c %CLF% !CELLINC! /DSUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION /Fo"%OUT%\cells\%CELL%.obj" "%HEREDIR%%CELL%.cpp" > "%OUT%\cells\%CELL%.log" 2>&1
+rem The cell is compiled with its library's definitions: since GPU paged KV G3, d3d12_harness.h's inline
+rem Device::SignalFence and ThrowSignalFailure call the T2169 signal seam under the define, and only the
+rem fault-injection library defines it, so a shipping-build cell compiled with it does not link.
+set CELLDEF=/DSUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION
+if "!VARIANT!"=="gpu_plain" set CELLDEF=
+cl /c %CLF% !CELLINC! !CELLDEF! /Fo"%OUT%\cells\%CELL%.obj" "%HEREDIR%%CELL%.cpp" > "%OUT%\cells\%CELL%.log" 2>&1
 if errorlevel 1 (
     echo    RED BY COMPILE:
     findstr /R /C:"error C[0-9]*" "%OUT%\cells\%CELL%.log"

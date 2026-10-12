@@ -1,6 +1,7 @@
-"""Cells for the box timing lock's one format and protocol across its three programs (T-3203 N-2, D-SLM8464; SuperSLM
-371dc34; the test author's record T-3189 §14). Every holder and every contender is its own process, so each program
-meets the others' real pids:
+"""Cells for the box timing lock's one format and protocol across its three script programs (T-3203 N-2, D-SLM8464;
+SuperSLM 371dc34; the test author's record T-3189 §14). The fourth holder, Lock74 in
+tests/paged-kv/c6_dim7_reset_adopt_timing.cpp, has its own cells in tools/test_paged_kv_74_lock.py. Every holder and
+every contender is its own process, so each program meets the others' real pids:
 
   driver   tools/run_paged_kv_rows.py's timing_lock (the 7.9 driver)
   pidlock  tools/run_paged_kv_pairs.py's PidLock (the 7.9b and legacy pair legs)
