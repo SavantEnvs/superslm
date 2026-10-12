@@ -54,8 +54,8 @@ SUPERSLM_API sslm_status sslm_model_unmap(sslm_model model);
  * at the full context cap, across every layer -- num_hidden_layers * context_cap *
  * num_key_value_heads * head_dim * 2 (K+V) * kv_precision_width. Its value is unchanged in 1.12.0.
  * Since 1.12.0 the pool stores K/V in pages of sslm_kv_page_positions positions, and one block is
- * exactly ceil(cap/B) pages (B divides the cap, sslm_abi_functions.inc); a holder made by a
- * no-budget verb reserves that many pages, one block's worth. */
+ * exactly ceil(cap/B) pages where B divides the cap (sslm_abi_functions.inc gives B); at another cap
+ * the last page is partial and sslm_kv_pool_overhead_size carries its slack. A no-budget holder reserves ceil(cap/B) pages. */
 SUPERSLM_API size_t sslm_kv_block_size(sslm_model model);
 SUPERSLM_API size_t sslm_kv_pool_overhead_size(sslm_model model, uint32_t block_count);
 SUPERSLM_API size_t sslm_seq_state_size(sslm_model model);
