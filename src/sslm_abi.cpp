@@ -186,9 +186,13 @@ struct sslm_model_s {
 	// Paged-KV plan §3.1: the test-only pin's B (KvPagesTestPinPagePositions, below; 0: none, the rule's B),
 	// and the pools that exist on this model, which the pin refuses to change B under. Both are read on
 	// every geometry query, so they are atomics; the pin is a test seam, and a pin racing a pool create on
-	// another thread is the caller's error.
+	// another thread is the caller's error. The pool count is a counter the model and each pool co-own
+	// (a pool copies the pointer at create and decrements through its own copy at destroy), so a pool
+	// destroyed after sslm_model_unmap, which does not refuse while a pool lives, writes only to the
+	// counter and never to the freed model. Set once in sslm_model_map before the handle is published and
+	// never reassigned, so concurrent copies of it are reads of an immutable member.
 	std::atomic<int64_t> pinned_page_positions{0};
-	std::atomic<uint32_t> live_pools{0};
+	std::shared_ptr<std::atomic<uint32_t>> live_pools;
 };
 
 // T-2700 converter-only observation binding.  This intentionally remains
@@ -280,6 +284,9 @@ struct sslm_kv_pool_s {
 	uint32_t cap_pages = 0;      // ceil(cap / B): a whole_reserve holder's reservation and table size
 	uint32_t runs = 0;           // L * 2 * H_kv: the slots a page's runs rotate through (§3.1)
 	std::atomic<uint32_t> live_refs{0};
+	// The model's pool counter, co-owned: bound once the pool is counted (the three create verbs), and
+	// decremented by sslm_kv_pool_destroy through this pointer so destroy never reads `model`.
+	std::shared_ptr<std::atomic<uint32_t>> model_live_pools;
 	~sslm_kv_pool_s() { superslm::kv_pages::PoolDestroy(pages); }
 };
 
@@ -1329,7 +1336,8 @@ extern "C" sslm_status sslm_kv_pool_create(sslm_model model, void* buf, size_t b
 		delete h;
 		return fill_st;
 	}
-	model->live_pools.fetch_add(1, std::memory_order_acq_rel);
+	h->model_live_pools = model->live_pools;
+	h->model_live_pools->fetch_add(1, std::memory_order_acq_rel);
 	*out = h;
 	return SSLM_OK;
 }
@@ -1337,7 +1345,7 @@ extern "C" sslm_status sslm_kv_pool_create(sslm_model model, void* buf, size_t b
 extern "C" sslm_status sslm_kv_pool_destroy(sslm_kv_pool pool) {
 	if (!pool) return SSLM_INVALID_ARGUMENT;
 	if (pool->live_refs.load(std::memory_order_acquire) != 0) return SSLM_POOL_HAS_LIVE_HANDLES;
-	if (pool->model) pool->model->live_pools.fetch_sub(1, std::memory_order_acq_rel);
+	if (pool->model_live_pools) pool->model_live_pools->fetch_sub(1, std::memory_order_acq_rel);
 	delete pool;
 	return SSLM_OK;
 }
@@ -1428,7 +1436,8 @@ extern "C" sslm_status sslm_kv_page_pool_create(sslm_model model, void* buf, siz
 		delete h;  // ~sslm_kv_pool_s destroys the page pool, if it was made
 		return fill_st;
 	}
-	model->live_pools.fetch_add(1, std::memory_order_acq_rel);
+	h->model_live_pools = model->live_pools;
+	h->model_live_pools->fetch_add(1, std::memory_order_acq_rel);
 	*out = h;
 	return SSLM_OK;
 }
@@ -1500,7 +1509,8 @@ extern "C" sslm_status sslm_kv_pool_create_contiguous(sslm_model model, void* bu
 		delete h;  // ~sslm_kv_pool_s destroys the page pool, if it was made
 		return fill_st;
 	}
-	model->live_pools.fetch_add(1, std::memory_order_acq_rel);
+	h->model_live_pools = model->live_pools;
+	h->model_live_pools->fetch_add(1, std::memory_order_acq_rel);
 	*out = h;
 	return SSLM_OK;
 }
@@ -1649,6 +1659,7 @@ extern "C" sslm_status sslm_model_map(const void* data, size_t size, sslm_model*
 	// fact about the PLAIN shared slot it arms: that one still always trips Load's own
 	// consultation first, by design -- the two pins now exercise the two independent slots.
 	const sslm_status cache_st = CatchAllocationFailure([&]() -> sslm_status {
+		h->live_pools = std::make_shared<std::atomic<uint32_t>>(0);
 		if (!BuildEngineCache(h)) return SSLM_ARTIFACT_REJECTED;
 		h->damped_greedy_free_text_mask.assign(
 		    (static_cast<size_t>(h->view.config.vocab_size) + 7) / 8, 0xFF);
@@ -4858,7 +4869,7 @@ extern "C" sslm_status KvPagesTestPinPagePositions(sslm_model model, int64_t pag
 	if (!model) return SSLM_INVALID_ARGUMENT;
 	const int64_t cap = static_cast<int64_t>(model->view.config.context_cap);
 	if (page_positions < 1 || page_positions > cap || cap % page_positions != 0) return SSLM_INVALID_ARGUMENT;
-	if (model->live_pools.load(std::memory_order_acquire) != 0) return SSLM_INVALID_ARGUMENT;
+	if (model->live_pools->load(std::memory_order_acquire) != 0) return SSLM_INVALID_ARGUMENT;
 	if (!ComputePageGeometry(model->view.config, page_positions).ok) return SSLM_INVALID_ARGUMENT;
 	model->pinned_page_positions.store(page_positions, std::memory_order_release);
 	return SSLM_OK;
