@@ -409,16 +409,18 @@ static void TestSlm19x_LegacySsb4RestoreAndTruncatedSsb5() {
 //
 // The order under test uses 1.11.0 calls only: map a model, create a pool on it, unmap the model
 // while the pool lives (sslm_model_unmap checks sequences, not pools, and returns SSLM_OK), then
-// destroy the pool. In 1.12.0 sslm_kv_pool_destroy decrements model->live_pools, a write into the
-// model after sslm_model_unmap freed it. The fix (D-SLM8593) makes production pool destroy leave the
-// model alone and keeps unmap accepting, so the cell asserts unmap == SSLM_OK as the 1.11.0
-// behaviour and asserts that the destroy writes nothing into the freed model.
+// destroy the pool. The defect this guards against is a pool destroy that writes into the model it
+// was made on: after sslm_model_unmap freed the model, that write lands in freed memory. The fix
+// (D-SLM8593) leaves the model alone in production pool destroy and keeps unmap accepting, so the
+// cell asserts unmap == SSLM_OK as the 1.11.0 behaviour and asserts that the destroy writes nothing
+// into the freed model.
 //
 // Two observers, each failing on the defect:
 //  - A sanitizer build (the linux-x64-asan job): AddressSanitizer reports the write as a
 //    heap-use-after-free inside sslm_kv_pool_destroy and the process aborts
 //    (-fno-sanitize-recover=all). The deterministic observer below stands down there, because the
-//    sanitizer's quarantine keeps the freed block from being reissued.
+//    sanitizer's allocator keeps the freed block from being reissued; it stands down under
+//    ThreadSanitizer too, whose allocator need not reissue the block (the ASan job catches the defect).
 //  - Every other build: the freed model block is reissued to the test. The cell reads the model's
 //    block size (the allocator's own usable size, taken while the model is live), allocates blocks
 //    of that size after the unmap until one is placed at the freed model's address, zero-fills all
@@ -435,20 +437,22 @@ static void TestSlm19x_LegacySsb4RestoreAndTruncatedSsb5() {
 
 extern "C" sslm_status KvPagesTestPinPagePositions(sslm_model model, int64_t page_positions);
 
-#if defined(__SANITIZE_ADDRESS__)
-#define SSLM_T3262_ASAN 1
+// A sanitizer allocator (AddressSanitizer or ThreadSanitizer, GCC or Clang) quarantines or relocates
+// freed blocks, so the deterministic observer below cannot rely on a reissued block there.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define SSLM_T3262_SANITIZER 1
 #elif defined(__has_feature)
-#if __has_feature(address_sanitizer)
-#define SSLM_T3262_ASAN 1
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define SSLM_T3262_SANITIZER 1
 #endif
 #endif
 
 namespace {
 
-#if defined(SSLM_T3262_ASAN)
-constexpr bool kT3262Asan = true;
+#if defined(SSLM_T3262_SANITIZER)
+constexpr bool kT3262Sanitizer = true;
 #else
-constexpr bool kT3262Asan = false;
+constexpr bool kT3262Sanitizer = false;
 #endif
 
 // Platforms where the deterministic observer has been run and must find its block.
@@ -590,7 +594,7 @@ static bool T3262TeardownAttempt(T3262Verb verb) {
 	constexpr int kGroomBlocks = 8192;
 	std::vector<unsigned char*> groom;
 	bool landed = false;
-	const bool observe = !kT3262Asan && model_block != 0 && model_block <= kMaxModelBlock;
+	const bool observe = !kT3262Sanitizer && model_block != 0 && model_block <= kMaxModelBlock;
 	if (observe) {
 		groom.reserve(kGroomBlocks);
 		for (int i = 0; i < kGroomBlocks; ++i) {
@@ -618,7 +622,7 @@ static bool T3262TeardownAttempt(T3262Verb verb) {
 		          "%s: sslm_kv_pool_destroy after sslm_model_unmap wrote %zu byte(s) in %zu block(s) of "
 		          "the freed model's memory (model block %zu bytes)",
 		          T3262VerbName(verb), dirty_bytes, dirty_blocks, model_block);
-	} else if (!kT3262Asan) {
+	} else if (!kT3262Sanitizer) {
 		CHECK_MSG(false, "%s: model block size %zu is unreadable or above %zu; the write observer is off",
 		          T3262VerbName(verb), model_block, kMaxModelBlock);
 	}
@@ -634,7 +638,7 @@ static bool T3262TeardownAttempt(T3262Verb verb) {
 // one attempt is made and the sanitizer observes.
 static void TestT3262_PoolDestroyAfterModelUnmapWritesNothingIntoTheFreedModel(T3262Verb verb) {
 	constexpr int kMaxAttempts = 64;
-	if (kT3262Asan) {
+	if (kT3262Sanitizer) {
 		T3262TeardownAttempt(verb);
 		return;
 	}
