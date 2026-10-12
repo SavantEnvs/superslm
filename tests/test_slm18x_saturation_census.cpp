@@ -435,7 +435,12 @@ static void TestSlm19x_LegacySsb4RestoreAndTruncatedSsb5() {
 //    that never lands is reported as a NOTE and does not fail the cell.
 // ---------------------------------------------------------------------------------------------
 
+#if defined(SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS)
+// The pin seam exists only where the library is built with the seam macro (superslm_test_injection
+// and the forced-tier libraries); build.bat's source list does not define it, so the seam cell is
+// compiled out there rather than left unresolved at link.
 extern "C" sslm_status KvPagesTestPinPagePositions(sslm_model model, int64_t page_positions);
+#endif
 
 // A sanitizer allocator (AddressSanitizer or ThreadSanitizer, GCC or Clang) quarantines or relocates
 // freed blocks, so the deterministic observer below cannot rely on a reissued block there.
@@ -665,6 +670,7 @@ static void TestT3262_PoolDestroyAfterModelUnmapAllVerbs() {
 	TestT3262_PoolDestroyAfterModelUnmapWritesNothingIntoTheFreedModel(T3262Verb::kContiguous);
 }
 
+#if defined(SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS)
 // The seam guarantee that survives the fix: a test build's KvPagesTestPinPagePositions refuses a pin
 // while any pool made on the model lives, leaves B unchanged on the refusal, keeps refusing until the
 // LAST pool is destroyed, and then admits the pin. Run once per pool-create verb.
@@ -709,12 +715,16 @@ static void TestT3262_PinRefusedWhileAPoolLivesAllVerbs() {
 	TestT3262_PinRefusedWhileAPoolLivesOnEveryCreateVerb(T3262Verb::kContiguous);
 }
 
+#endif  // SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS
+
 // Entry point for the T-3262 cells (called from tests/test_main.cpp beside the census cells).
 void RunPoolTeardownOrderCells(int& checks, int& failures) {
 	GChecks = 0;
 	GFailures = 0;
 	TestT3262_PoolDestroyAfterModelUnmapAllVerbs();
+#if defined(SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS)
 	TestT3262_PinRefusedWhileAPoolLivesAllVerbs();
+#endif
 	checks += GChecks;
 	failures += GFailures;
 }
