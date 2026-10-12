@@ -20,10 +20,12 @@
 //       exhausted. Kills: a begin_from drawing more or less than R(200), freeze not returning a persona's spare
 //       reserve page, the world's release keeping its unshared tail page or freeing a page the personas share.
 //   (d) the contrast. The GPU has no block pool: a v1.12.0-style GPU sequence (sslm_gpu_seq_create) owns a
-//       dedicated buffer of the whole cap. Its block is read from the GPU itself -- the workspace_size field of
-//       the dedicated sequence's own SLM5 save -- and asserted equal to §3.1's formula (ceil(cap/B) pages of
-//       page_bytes); then floor(1,842 pages' bytes / block) = 7. (Reading taken: §7's "v1.9.0 block pool" has
-//       no GPU twin, so the contrast's operand is the GPU's own dedicated block size.)
+//       dedicated buffer of the whole cap, and nothing bounds how many a caller creates, so no GPU status can admit
+//       "7 and refuse the 8th" as the CPU twin's block pool does. Reading taken: the GPU twin of the contrast is its
+//       one checkable operand, the dedicated block size, read from the GPU itself (the workspace_size field of the
+//       dedicated sequence's own SLM5 save) and asserted equal to §3.1's formula (ceil(cap/B) pages of
+//       page_bytes); floor(1,842 pages' bytes / block) = 7 then follows by arithmetic and is printed with it. The
+//       only failing check here is the block-size one; the 7 is a restatement, not an independent grade.
 // Nothing reads sslm_gpu_kv_pool_stats.
 //
 // Legs (g1e_cohort.h): --leg=fixture (pkv_def; runs on the software GPU) and --leg=box (the real 0.5B; box-only).
@@ -36,40 +38,6 @@ using namespace g1e;
 using namespace g1e::cohort;
 
 namespace {
-
-// The GPU fill probe's one-state form (§8, "Precondition, and the one-state form"; the CPU's
-// ProbeExactlyFreeOneState), for k >= 3, on the one state `s` holds: creates totalling k - 1 are admitted (at least
-// k - 1 free); a 2-page create is refused for capacity (at most k free); one admitted create of r pages is released
-// and creates totalling r + 1 are admitted (at least k were free). Every create is released again.
-bool ProbeExactlyFreeOneState(const Env& e, ProbeState& s, int64_t k, const char* what) {
-	CHECK_MSG(k >= 3, "%s: the one-state probe needs k >= 3 (k = %lld)", what, static_cast<long long>(k));
-	if (k < 3) return false;
-	s.DrainAll();
-	std::vector<SslmGpuSequenceHandle*> made;
-	Refusal first;
-	const bool step1 = AdmitPages(e.geo, s, k - 1, &made, &first);
-	CHECK_MSG(step1, "%s: one-state fill probe at k=%lld: creates totalling %lld pages were not all admitted (a %lld-page create: %s)",
-	          what, static_cast<long long>(k), static_cast<long long>(k - 1), static_cast<long long>(first.pages),
-	          StatusName(first.status));
-	SslmGpuSequenceHandle* two = nullptr;
-	const GS st2 = sslm_gpu_seq_create_budgeted(s.Ctx(), s.Model(), s.Pool(), static_cast<int32_t>(e.geo.B), &two);
-	if (two) sslm_gpu_seq_release(s.Ctx(), two);
-	const bool step2 = st2 == GS::SSLM_GPU_KV_POOL_EXHAUSTED;
-	CHECK_MSG(step2, "%s: one-state fill probe at k=%lld: after %lld pages, a 2-page create returned %s, not exhausted", what,
-	          static_cast<long long>(k), static_cast<long long>(k - 1), StatusName(st2));
-	bool step3 = false;
-	if (step1 && !made.empty()) {
-		const int64_t r = ProbeSplit(e.geo, k - 1).back();
-		sslm_gpu_seq_release(s.Ctx(), made.back());
-		made.pop_back();
-		step3 = AdmitPages(e.geo, s, r + 1, &made, &first);
-		CHECK_MSG(step3, "%s: one-state fill probe at k=%lld: after releasing a %lld-page create, creates totalling %lld were not all "
-		                 "admitted (%s)",
-		          what, static_cast<long long>(k), static_cast<long long>(r), static_cast<long long>(r + 1), StatusName(first.status));
-	}
-	for (auto it = made.rbegin(); it != made.rend(); ++it) sslm_gpu_seq_release(s.Ctx(), *it);
-	return step1 && step2 && step3;
-}
 
 void PeakLeg(const Env& e, const Figures& f, const std::string& stem) {
 	const int64_t k = f.peak - ChainPages(e.geo, kPersonas);  // 203 - 192 = 11 at B = 16

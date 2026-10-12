@@ -438,7 +438,10 @@ inline RestoreRun RestoreCohort(const Env& e, uint32_t pages, const std::vector<
 	if (!rig.pool) return r;
 	const GWorld w = BuildWorld(rig);
 	if (!w.ok) {
-		r.first_refused = -2;
+		// Nothing restored: reported as every restore refused, so no admission check can read it as "all admitted".
+		CHECK_MSG(false, "the restore pool's world and personas did not rebuild in %u pages", pages);
+		r.first_refused = 0;
+		r.refused = static_cast<int>(blobs.size());
 		return r;
 	}
 	std::vector<GSeq> seqs;

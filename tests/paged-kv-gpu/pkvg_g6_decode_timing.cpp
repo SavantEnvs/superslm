@@ -30,7 +30,9 @@
 // graded and printed, status MECHANISM_ONLY, never a verdict.
 //
 // Resumable logs. --out=DIR holds run.txt (the run's identity: this executable's and the model's SHA-256, the
-// adapter selection, pairs, warmup, repeats, the timed sequence, the hook state and the seed, chosen once and kept),
+// adapter selection and that adapter's DXGI description, the commissioning state -- so readings taken quarantined are
+// never regraded as standing -- pairs, warmup, repeats, the timed sequence, the hook state and the seed, chosen once
+// and kept),
 // repeat_<k>.log for each completed repeat (written to repeat_<k>.partial, renamed only after its END line), and
 // result.txt once every repeat is complete. A rerun with the same identity keeps every completed repeat and reruns
 // the rest from a fresh construction (a repeat cannot resume mid-stream: its sequences' state dies with the
@@ -48,8 +50,9 @@
 // pairs; NOT_QUIET under --allow-busy; STANDING only with --commissioned (passed by tools\run_paged_kv_g6_box.ps1
 // only after instrument-commission.ps1 -Verify lists the receipt PKV-TIMING-G6-R1); otherwise QUARANTINED.
 //
-// Exit: 0 every repeat complete and the pooled bar PASS (or a complete mechanism / mutant / not-quiet run); 1
-// complete with FAIL or NO RESULT, or a token mismatch; 40 infrastructure (arguments, artifact, refusal by the quiet
+// Exit: 0 every repeat complete, and, for a STANDING result, the pooled bar PASS (a result of any other status exits 0
+// once complete: its bar is a reading, not a verdict); 1 a STANDING result with FAIL or NO RESULT, or a token mismatch
+// (printed "RED:"); 40 infrastructure (arguments, artifact, refusal by the quiet
 // guard, an identity mismatch, a construction that would not build).
 //
 // Usage: pkvg_g6_decode_timing.exe --model=PATH --out=DIR [--repeats=5] [--pairs=508] [--warmup=4] [--seed=N]
@@ -79,6 +82,7 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <dxgi1_6.h>
 #endif
 
 using namespace g1e;
@@ -115,6 +119,37 @@ std::string SelfName() {
 	const std::string p = SelfPath();
 	const size_t cut = p.find_last_of("/\\");
 	return cut == std::string::npos ? p : p.substr(cut + 1);
+}
+
+// The adapter SSLM_GPU_ADAPTER_INDEX names: d3d12_harness.h selects by the raw EnumAdapters1 index when the variable
+// is set, so the same enumeration names it here. Recorded in the run's identity, so a resume on another device (indices
+// swapped by a driver update or a new card) is refused, and the result says which GPU R1 was read on.
+std::string AdapterDescription(const char* index_env) {
+	if (!index_env || !*index_env) return "default selection (SSLM_GPU_ADAPTER_INDEX unset)";
+#if defined(_WIN32)
+	char* end = nullptr;
+	const long idx = std::strtol(index_env, &end, 10);
+	if (!end || *end || idx < 0) return std::string("unparsed index ") + index_env;
+	IDXGIFactory1* factory = nullptr;
+	if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) || !factory) return "no DXGI factory";
+	IDXGIAdapter1* a = nullptr;
+	std::string out = "no adapter at index " + std::to_string(idx);
+	if (SUCCEEDED(factory->EnumAdapters1(static_cast<UINT>(idx), &a)) && a) {
+		DXGI_ADAPTER_DESC1 d{};
+		if (SUCCEEDED(a->GetDesc1(&d))) {
+			out.clear();
+			for (const wchar_t* w = d.Description; *w; ++w) out += (*w >= 32 && *w < 127) ? static_cast<char>(*w) : '?';
+			char ids[64];
+			std::snprintf(ids, sizeof ids, " (vendor %04x device %04x)", d.VendorId, d.DeviceId);
+			out += ids;
+		}
+		a->Release();
+	}
+	factory->Release();
+	return out;
+#else
+	return std::string("index ") + index_env;
+#endif
 }
 
 // ---- the quiet guard -----------------------------------------------------------------------------
@@ -440,6 +475,8 @@ int main(int argc, char** argv) {
 	    {"model", Stem(o.model)},
 	    {"model_sha256", FileSha(o.model)},
 	    {"adapter_index", adapter_env ? adapter_env : "default"},
+	    {"adapter", AdapterDescription(adapter_env)},
+	    {"commissioned", o.commissioned ? "1" : "0"},
 	    {"debug_layer", debug_env ? debug_env : "unset"},
 	    {"repeats", std::to_string(o.repeats)},
 	    {"pairs", std::to_string(o.pairs)},
@@ -561,13 +598,16 @@ int main(int argc, char** argv) {
 	report += "G6 R1 pooled: " + GradeLine(pooled) + " paged_tok_s=" + Fmt(1e9 / Median(all_paged)) +
 	          " legacy_tok_s=" + Fmt(1e9 / Median(all_legacy)) + " median_of_repeat_medians=" + Fmt(Median(medians)) +
 	          " status=" + status + "\n";
-	report += "G6 R1 verdict: " + (mechanism || !hook.empty() || o.allow_busy ? std::string("none (") + status + ")" : pooled.bar) +
-	          " (bar: paged no more than 5% slower than the legacy view; " + status + ")\n";
+	// Only a STANDING result is a verdict. Every other status prints its reading as a reading (§8: quarantined
+	// readings are recorded, never acted on or headlined), and its exit status does not depend on the bar.
+	const bool standing = status == "STANDING";
+	report += standing ? "G6 R1 verdict: " + pooled.bar + " (bar: paged no more than 5% slower than the legacy view; STANDING)\n"
+	                   : "G6 R1 verdict: none (" + status + "; the pooled reading's bar is " + pooled.bar + ", not a verdict)\n";
 	std::printf("%s", report.c_str());
 	std::string result;
 	for (const auto& kv : id) result += kv.first + "=" + kv.second + "\n";
 	result += "seed=" + std::to_string(seed) + "\nrun_sha256=" + run_sha + "\n" + report;
 	WriteAtomic(out / "result.txt", result);
-	if (mechanism || !hook.empty() || o.allow_busy) return 0;
+	if (!standing) return 0;
 	return pooled.bar == "PASS" ? 0 : 1;
 }

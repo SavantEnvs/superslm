@@ -4,7 +4,7 @@
 #
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_paged_kv_g6_box.ps1
 #            [-Scratch D:\_scratch\pkv-gpu-113] [-Model05 PATH] [-FixtureDir DIR] [-BinDir DIR] [-Adapters 0,1]
-#            [-Repeats 5] [-CorrectnessOnly | -TimingOnly] [-Only 10.3/box@0,R1@1] [-Fresh] [-NoBuild]
+#            [-Repeats 5] [-CorrectnessOnly | -TimingOnly] [-Only 10.3/box@0,R1@1] [-Fresh] [-Rebuild | -NoBuild]
 #            [-QuietWaitSeconds 900] [-MaxLoadPercent 30] [-PauseFile D:\_scratch\TE-444\u3\PAUSE]
 #
 # Legs, per adapter index N in -Adapters (SSLM_GPU_ADAPTER_INDEX=N):
@@ -42,12 +42,13 @@ param(
     [string]$Model05 = 'D:\hf_cache\superslm_artifacts\example\qwen2.5-0.5b-instruct-cap4096-aex.sslm',
     [string]$FixtureDir = '',
     [string]$BinDir = '',
-    [int[]]$Adapters = @(0, 1),
+    [string]$Adapters = '0,1',
     [int]$Repeats = 5,
     [switch]$CorrectnessOnly,
     [switch]$TimingOnly,
     [string[]]$Only = @(),
     [switch]$Fresh,
+    [switch]$Rebuild,
     [switch]$NoBuild,
     [int]$QuietWaitSeconds = 900,
     [int]$MaxLoadPercent = 30,
@@ -65,10 +66,14 @@ $TimingRoot = Join-Path $Scratch 'timing'
 New-Item -ItemType Directory -Force -Path $Scratch, $Logs, $Done, $TimingRoot | Out-Null
 $Scratch = (Resolve-Path -LiteralPath $Scratch).Path
 $RegistryId = 'PKV-TIMING-G6-R1'
+# -Adapters is a comma list (a string, so `powershell -File ... -Adapters 0,1` binds under Windows PowerShell 5.1).
+$adapterList = @($Adapters -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object {
+    if ($_ -notmatch '^\d+$') { throw "-Adapters takes adapter indices: '$_'" }; [int]$_ })
+if ($adapterList.Count -eq 0) { throw 'no adapter index in -Adapters' }
 
 # ---- the legs ------------------------------------------------------------------------------------
 $legs = @()
-foreach ($a in $Adapters) {
+foreach ($a in $adapterList) {
     foreach ($cell in @('10.3', '10.5', '10.7')) {
         foreach ($kind in @('fixture', 'box')) {
             $legs += [pscustomobject]@{ Name = "$cell/$kind@$a"; Kind = 'correctness'; Adapter = $a; Job = "$cell/$kind"; Leg = $kind
@@ -76,7 +81,7 @@ foreach ($a in $Adapters) {
         }
     }
 }
-foreach ($a in $Adapters) {
+foreach ($a in $adapterList) {
     $legs += [pscustomobject]@{ Name = "R1@$a"; Kind = 'timing'; Adapter = $a; Job = ''; Leg = 'box'; Exe = 'pkvg_g6_decode_timing.exe' }
 }
 if ($TimingOnly) { $legs = @($legs | Where-Object { $_.Kind -eq 'timing' }) }
@@ -115,7 +120,13 @@ if ($needFixture) {
 }
 
 # ---- build (all before any leg) ------------------------------------------------------------------------
-if (-not $NoBuild) {
+# Built only when a G6 executable is missing, or with -Rebuild. Every leg's provenance, and the timing harness's run
+# identity, hold the executables' SHA-256, and build_paged_kv_gpu.bat relinks every executable it builds, so a rebuild
+# on every invocation would make every finished leg stale and refuse every timing resume. After a deliberate
+# -Rebuild, correctness legs rerun and a timing leg needs -Fresh (its records belong to the old binary).
+$missing = @(@('pkvg_suite.exe') + @($legs | ForEach-Object { $_.Exe }) | Select-Object -Unique |
+    Where-Object { -not (Test-Path -LiteralPath (Join-Path $BinDir $_) -PathType Leaf) })
+if (-not $NoBuild -and ($Rebuild -or $missing.Count -gt 0)) {
     $outDir = Split-Path -Parent $BinDir
     $buildLog = Join-Path $Logs 'build.log'
     Write-Output "BUILD tests\paged-kv-gpu\build_paged_kv_gpu.bat --out=$outDir g6 (log $buildLog)"
@@ -134,7 +145,13 @@ if (($legs | Where-Object { $_.Kind -eq 'correctness' }) -and -not (Test-Path -L
 $commissioned = $false
 $verifier = 'D:\Wizard\Claude\Tooling\instrument-commission.ps1'
 if (($legs | Where-Object { $_.Kind -eq 'timing' }) -and (Test-Path -LiteralPath $verifier)) {
-    $verification = @(powershell -NoProfile -File $verifier -Verify 2>&1 | ForEach-Object { "$_" })
+    # Under Windows PowerShell 5.1 a native command's stderr merged with 2>&1 becomes a terminating error when
+    # $ErrorActionPreference is Stop; the verifier's stderr must not stop the run, only fail to commission.
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $verification = @(powershell -NoProfile -File $verifier -Verify 2>&1 | ForEach-Object { "$_" }) }
+    catch { $verification = @() }
+    finally { $ErrorActionPreference = $saved }
     $commissioned = [bool]($verification | Where-Object { $_ -eq "COMMISSIONED  $RegistryId" })
 }
 
@@ -240,10 +257,19 @@ function Invoke-Leg($leg) {
     } else {
         $last = $tail | Where-Object { $_ -match '^G6 R1 (pooled|verdict):' } | Select-Object -Last 2
         $last = ($last -join ' | ')
-        # 0: complete, bar PASS (or a mechanism/mutant run); 1: complete with FAIL or NO RESULT, or RED on a token
-        # mismatch between the arms; 40: infrastructure (refused, unbuilt, identity mismatch): resumable, no marker.
-        $verdict = switch ($code) { 0 { 'COMPLETE' } 1 { 'COMPLETE' } 40 { 'INFRASTRUCTURE' } default { "CRASH($code)" } }
-        if ($code -eq 1 -and ($tail | Where-Object { $_ -match '^RED:' })) { $verdict = 'RED'; $last = ($tail | Where-Object { $_ -match '^RED:' } | Select-Object -First 1) }
+        # The harness: 0 complete (a non-standing result's bar is a reading only); 1 a STANDING FAIL or NO RESULT, or
+        # RED on a token mismatch between the arms; 40 infrastructure (refused, identity mismatch): resumable, no marker.
+        # Here: QUARANTINED-READING (complete, not a verdict), R1-PASS, R1-FAIL, R1-NO-RESULT (standing), RED.
+        $pooled = $tail | Where-Object { $_ -match '^G6 R1 pooled:' } | Select-Object -Last 1
+        $status = if ($pooled -match 'status=(\S+)') { $Matches[1] } else { '' }
+        $bar = if ($pooled -match ' bar=(PASS|FAIL|NO RESULT)') { $Matches[1] } else { '' }
+        if ($code -eq 0 -or $code -eq 1) {
+            if ($status -eq 'STANDING') { $verdict = 'R1-' + ($bar -replace ' ', '-') }
+            elseif ($status) { $verdict = "$status-READING" }
+            else { $verdict = "CRASH($code)" }
+        } elseif ($code -eq 40) { $verdict = 'INFRASTRUCTURE' } else { $verdict = "CRASH($code)" }
+        $red = $tail | Where-Object { $_ -match '^RED:' } | Select-Object -First 1
+        if ($red) { $verdict = 'RED'; $last = $red }
     }
     if ($verdict -like 'INFRASTRUCTURE*' -or $verdict -like 'CRASH*') {
         # Not a finished leg: no marker, so the next run resumes it (the harness keeps its completed repeats).
@@ -315,7 +341,8 @@ foreach ($leg in $legs) {
         $state = if ($stored) { "$($stored['Outcome'])" } else { 'NOT-RUN' }
     }
     $verdict = ($state -split ' ')[0]
-    if ($verdict -ne 'GREEN' -and $verdict -ne 'COMPLETE') { $allDone = $false }
+    # Done: a green cell, a standing R1 PASS, or a complete quarantined reading (recorded; it decides nothing).
+    if ($verdict -ne 'GREEN' -and $verdict -ne 'R1-PASS' -and $verdict -notlike '*-READING') { $allDone = $false }
     $rows += [pscustomobject]@{ Leg = $leg.Name; Kind = $leg.Kind; Verdict = $verdict; Detail = $state }
 }
 $summary = @('G6 box run summary ' + (Get-Date -Format s) + " (repo $Repo at $Head, bin $BinDir, scratch $Scratch)")
@@ -325,7 +352,7 @@ $summary += ''
 $summary += 'R1 readings (pooled and per repeat, from each adapter''s result.txt):'
 foreach ($leg in $timingAll) {
     $res = Join-Path (Get-TimingDir $leg) 'result.txt'
-    if (Test-Path -LiteralPath $res) { Get-Content -LiteralPath $res | Where-Object { $_ -match '^G6 R1 |^adapter_index=' } | ForEach-Object { $summary += "  [$($leg.Name)] $_" } }
+    if (Test-Path -LiteralPath $res) { Get-Content -LiteralPath $res | Where-Object { $_ -match '^G6 R1 |^adapter_index=|^adapter=|^commissioned=' } | ForEach-Object { $summary += "  [$($leg.Name)] $_" } }
     $err = (Get-LogPath $leg) + '.err'
     if (Test-Path -LiteralPath $err) { Get-Content -LiteralPath $err | Where-Object { $_ -match '# adapter' } | Select-Object -First 1 | ForEach-Object { $summary += "  [$($leg.Name)] $_" } }
 }
