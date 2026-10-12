@@ -4,15 +4,16 @@ All notable changes to SuperSLM (Layer 1) are recorded here.
 
 ## [Unreleased]
 
-## [1.12.0] - Unreleased
+## [1.12.0] - TODO-BOX(release date: fill at the tag, and delete "Not yet tagged" below)
 
-Not yet tagged; the date is filled at the tag (TODO-BOX). The CPU backend stores K/V in pages of
+Not yet tagged. The CPU backend stores K/V in pages of
 `B` positions (`sslm_kv_page_positions`; `B` follows from the model's head dimension, context cap
 and K/V element width, and is 64 for Qwen2.5-0.5B at cap 4,096 and for Qwen2.5-1.5B at cap 32,768),
-reached through a per-holder page table. Tokens, K/V values and the axis digest are bit-identical to
-1.11.0 on every path. A host that calls only the 1.11.0 verbs keeps their behaviour, admission
-counts and save blobs, apart from the changes listed below; the memory savings come only from the
-new budget-mode verbs. Thirteen C verbs and one status are added (51 C verbs in all); no signature,
+reached through a per-holder page table. Tokens and K/V values are bit-identical to 1.11.0 on every
+path, as read on Windows x64 with MSVC. A host that calls only the 1.11.0 verbs keeps their results,
+admission counts and save blobs, apart from the changes listed below, but not their save speed:
+`sslm_seq_save` of a no-budget sequence takes 1.21 to 1.93 times as long as in 1.11.0, and a later
+release is planned to fix that. The memory savings come only from the new budget-mode verbs. Thirteen C verbs and one status are added (51 C verbs in all); no signature,
 struct layout or existing ordinal changes. The GPU API is unchanged. `docs/api.md` (*Paged KV
 memory*) is the contract and `docs/releases/1.12.0.md` the release note.
 - **Budget mode.** `sslm_seq_create_budgeted` and `sslm_prefix_begin_budgeted` take a budget,
@@ -39,14 +40,15 @@ memory*) is the contract and `docs/releases/1.12.0.md` the release note.
   to width 32,767 (was 2^14); every probability and the returned bool stay bit-identical to the
   1.9.0 body. No speed figure is claimed for it.
 - **Save format `SSB6`** for budget holders only: the `SSB5` header plus `kv_mode`, `budget` and
-  `origin` (172 bytes), the residual and history, then `kv_positions` and only the written rows, so
-  its size follows the live length. No-budget holders keep writing `SSB5`, byte-equal to 1.11.0's.
+  `origin` (172 bytes), the residual and history, then `kv_positions` and the rows from position 0 to
+  the live length, a shared prefix's span included, so its size follows the live length. No-budget holders keep writing `SSB5`, byte-equal to 1.11.0's.
   Restore reads `SSB6` through `SSB2`, keeps a budget holder's budget, origin and limit, and requires
   an `SSB6` blob's exact size. `sslm_seq_restore_shared` re-shares a live prefix handle's pages when
   its bytes match the blob's exactly, and otherwise restores privately with `SSLM_OK`.
 - **Memory (by admission, 0.5B, cap 4096, example cohort of a 1,000-token world, 10 personas and 50
   budget-512 sequences):** a pool of 505 pages (189.4 MiB) admits the cohort and 504 refuses
-  exactly one create, against 60 blocks (1,440 MiB) in 1.11.0. The 505 and 504 page admissions are
+  exactly one create, against 60 blocks (1,440 MiB) in 1.11.0's layout (arithmetic from the block
+  size, not a 1.11.0 run). The 505 and 504 page admissions are
   confirmed on the real artifact on the release machine (cell 10.4), and 1.11.0-style blocks in the
   same bytes admit 7 sequences. Restored with their prefix handles, the cohort fits in the same 505
   pages (cell 10.6); restored without them it needs 1,405 pages until each sequence re-adopts, after
@@ -56,26 +58,36 @@ memory*) is the contract and `docs/releases/1.12.0.md` the release note.
   single-conversation generation only; nothing is claimed under load, on the GPU or for batched
   decode). Single-conversation decode is no more than 5% slower than the contiguous cache at both
   targets, to the 0.5B cap of 4,096 and to width 18,682 at 1.5B, with 7.9b reported; the contiguous
-  cache is the contiguous pool option of the same build, not 1.11.0 (cell 7.9). Largest of five
+  cache is the contiguous pool option of the same build, not 1.11.0 (cell 7.9; whole-token calls, no
+  host parallel-for hook, AVX2 tier). Largest of five
   process medians, in percent slower, with the SD of the five: Qwen2.5-0.5B at cap 4,096, restored
   at 1,200, 2,044 and 3,988 tokens: +1.001 (0.067), +1.706 (0.098), +2.682 (0.089); Qwen2.5-1.5B at
   cap 32,768, restored at 8,188, 15,872 and 18,678 tokens: +1.310 (0.178), +3.349 (0.520), +3.861
   (0.439). At 0.5B the mean of the five medians is 0.941 ± 0.083, 1.629 ± 0.122 and 2.582 ± 0.110
-  (95% half-width of the mean). The 1.5B figures carry a session-dependent zero-point offset of about
-  one point (an A/A run of two identical contiguous arms read +1.16 and +1.13 at the rows restored
+  (95% half-width of the mean). The 1.5B figures carry a zero-point offset of about one point in
+  this measuring session (an A/A run of two identical contiguous arms read +1.16 and +1.13 at the rows restored
   at 15,872 and 18,678, +0.05 at the 0.5B row restored at 3,988; the 1.5B row restored at 8,188 has
   none of its own, and the offset covers it by extension) and are not resolved finer. Shared-prefix
   decode, reported (cell 7.9b, Qwen2.5-0.5B): +1.063% median, sign interval +0.990% to +1.130%.
   Reset and adopt cost does not grow with the context cap, except that at head_dim <= 64 a cap
   above 4,096 doubles the page and its one-page tail copy (0.5B: 384 KiB at caps up to 4,096, 768
-  KiB above), at a cap of more than one page (cell 7.4, cap 32,768 against cap 4,096, bound 2.0: the
+  KiB above), at a cap of more than one page (cell 7.4, cap 32,768 against cap 4,096 with the page
+  size pinned to 64 positions at both caps, so the doubled page was not timed; bound 2.0: the
   86th and 120th smallest of 205 ratios were 0.996 and 1.004 for budget adopt, 1.000 and 1.000 for
   budget reset, 0.950 and 1.018 for no-budget adopt, 1.188 and 1.750 for no-budget reset). Lifecycle
   changes against 1.11.0 (no-budget holders, Qwen2.5-0.5B at cap 4,096 and Qwen2.5-1.5B at cap
-  32,768, published only where the two builds' medians differ by a factor of at least 4): 22 of 34
-  readings, all speed-ups, from 6.811 times faster (restore of a 1,000-token state at 0.5B) to 9864.84
-  times (release of a fresh holder at 1.5B). The other 12, which include every save, claim nothing in
-  either direction. The release note has the tables.
+  32,768, taken on 2026-10-03 for 1.11.0 and 2026-10-11 for 1.12.0, published as a change only where
+  the two builds' medians differ by a factor of at least 4): 22 of 34 readings are resolved, all
+  speed-ups, from 6.811 times faster (restore of a 1,000-token state at 0.5B) to 9864.84 times
+  (release of a fresh holder at 1.5B). The other 12 are not resolved at that factor, and this release
+  claims no size or direction of change for them except save (next bullet). The release note has the
+  tables.
+- **Save is slower than 1.11.0.** `sslm_seq_save` of a no-budget sequence writes the same bytes as in
+  1.11.0 and takes longer at every length measured: 1.21 to 1.93 times as long (Qwen2.5-0.5B, cap
+  4,096: 1.30, 1.35 and 1.93 times at 16, 1,000 and 4,096 live tokens; Qwen2.5-1.5B, cap 32,768:
+  1.21, 1.24 and 1.88 times at 16, 1,000 and 32,768). A full-length save takes 60.3 ms against 32.1
+  ms at 1.5B, and 3.32 ms against 1.72 ms at 0.5B. A later release is planned to remove the
+  slowdown. The release note has the readings.
 - **Batched decode** works and stays bit-identical to each sequence's solo run (cell 8.1; on the
   release machine it is one of the 70 cells of `superslm_pkv_c5`, which ran green: 70 cells, 0 red,
   74,052 checks). No batched speed is measured or claimed.
@@ -87,8 +99,9 @@ memory*) is the contract and `docs/releases/1.12.0.md` the release note.
   The first `sslm_prefix_freeze` returns the prefix's unused pages to the pool, so a pool can
   admit more handles than before, never fewer. `sslm_seq_reset` no longer zero-fills K/V memory
   (nothing reads it, and saves are unchanged). Restore refuses a blob of any format that is
-  mid-token at the context cap, which no save produces.
-- **Not in this release:** GPU paging (planned for 1.13.0), memory savings for the 1.11.0 verbs,
+  mid-token at the context cap, which no save produces. The axis digest tool's attention section
+  now covers softmax rows up to width 32,767, so its GLOBAL hash differs from 1.11.0's.
+- **Not in this release:** GPU paging (planned for a later release), memory savings for the 1.11.0 verbs,
   removal of the context cap, automatic prefix matching, adapter-shaped prefixes and batched
   shared-prefix attention.
 

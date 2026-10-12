@@ -92,8 +92,8 @@ SUPERSLM_API sslm_status sslm_seq_adopt_prefix(sslm_seq seq, sslm_prefix prefix)
 /* Save: a sequence made by a no-budget verb (sslm_seq_create, or a restore of a no-budget blob)
  * emits SSB5, byte-equal to the blob 1.11.0 writes for the same state, so 1.9.0 to 1.11.0 read
  * it. A budget-mode sequence (sslm_seq_create_budgeted, or a restore of a budget-mode SSB6)
- * emits SSB6 (1.12.0): SSB5's header plus kv_mode, budget and origin, and only the K/V rows the
- * sequence has written, so its size follows its live length; releases before 1.12.0 refuse it.
+ * emits SSB6 (1.12.0): SSB5's header plus kv_mode, budget and origin, and the K/V rows [0, live length),
+ * an adopted prefix's span included, so its size follows its live length; releases before 1.12.0 refuse it.
  * Restore accepts SSB6, SSB5 and the shipped SSB4, SSB3 and SSB2 predecessors; SSB2's absent
  * damped anti-LM state is restored as empty. SSB5 and SSB6 carry the sequence's saturation total
  * and the four per-site saturation counts that sum to it (kv_landing, k_channel_landing, rope_q,
