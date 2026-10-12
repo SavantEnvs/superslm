@@ -16,7 +16,11 @@ SOURCE = Path(os.environ.get(
     "PKV_C6_SOURCE", ROOT / "tests/paged-kv/c6_dim7_reset_adopt_timing.cpp"))
 ARTIFACTS = Path(os.environ.get(
     "PKV_C6_ARTIFACT_DIR", "D:/_artifacts/SuperSLM/t3114"))
-BUILD = Path(os.environ.get("PKV_C6_BUILD", "D:/_scratch/T-3112/build-c6"))
+# Required, with no default (the 1.12.0 review M-2): a default naming an old scratch build ran the cell against that
+# stale build whenever it was present. Unset or missing fails the cell, never skips it, as .github/workflows/tests.yml
+# says of the paged-KV tool tests it leaves to the build box.
+BUILD_DIR = os.environ.get("PKV_C6_BUILD", "")
+BUILD = Path(BUILD_DIR)
 VCVARS = Path("C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Auxiliary/Build/vcvars64.bat")
 
 
@@ -44,6 +48,10 @@ def config(path):
 
 class RealGeometryCells(unittest.TestCase):
     def test_p5_real_artifact_block_mismatch_refuses_before_timer(self):
+        if not BUILD_DIR:
+            self.fail("PKV_C6_BUILD is unset: name the paged-KV C6 build's directory; there is no default")
+        if not (BUILD / "superslm_pkv_c6.exe").is_file():
+            self.fail(f"PKV_C6_BUILD names {BUILD_DIR}, which holds no superslm_pkv_c6.exe")
         small_name = "qwen2.5-0.5b-instruct-cap4096-aex.sslm"
         large_name = "qwen2.5-0.5b-instruct-cap32768-aex.sslm"
         with tempfile.TemporaryDirectory(prefix="pkv-p5-real-", dir="D:/_scratch/T-3112") as temp:
