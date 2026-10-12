@@ -28270,6 +28270,9 @@ static void TestT2572_M2_MarshalLayerAcceptsArmCsNonQkNormOutput() {
 // because they call the C ABI, whose unscoped sslm_status enumerators collide with this
 // file's `using enum SslmGpuStatus;` on Windows. Adds its own counts to the two passed in.
 void RunSlm18xSaturationCensusCells(int& checks, int& failures);
+// Pool teardown order (map, create pool, unmap, destroy pool) and the pin seam's refusal while a pool
+// lives, defined in the same unit (T-3262).
+void RunPoolTeardownOrderCells(int& checks, int& failures);
 // 1.9.x schema-constrained and damped-greedy decoding cells
 // (tests/test_slm19x_schema_damped_greedy.cpp), a separate unit for the same reason.
 void RunSlm19xSchemaDampedGreedyCells(int& checks, int& failures);
@@ -30150,6 +30153,7 @@ int main(int argc, char** argv) {
 	TestT2572_S2_RunLayerLoopWiresRopeSaturationCounterThroughBothPaths();
 	TestT2572_M2_MarshalLayerAcceptsArmCsNonQkNormOutput();
 	RunSlm18xSaturationCensusCells(GChecks, GFailures);
+	RunPoolTeardownOrderCells(GChecks, GFailures);
 	RunSlm19xSchemaDampedGreedyCells(GChecks, GFailures);
 	RunTiledGemmCells(GChecks, GFailures);
 	RunAttnRowsiteCells(GChecks, GFailures);
