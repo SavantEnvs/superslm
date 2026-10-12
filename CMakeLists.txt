@@ -465,6 +465,12 @@ foreach(_sslm_tier SSE2 AVX2 AVX512)
 		target_include_directories(superslm_tests_${_sslm_tier_lower}_forced PRIVATE src/gpu)
 		target_link_libraries(superslm_tests_${_sslm_tier_lower}_forced PRIVATE d3d12 dxgi dxguid)
 	endif()
+	# test_main.cpp calls the G3 ledger cells, so each forced suite carries the same adapter,
+	# include path and whole-target SUPERSLM_LEDGER_YIELD_HOOK as superslm_tests (g3_core.cmake).
+	target_sources(superslm_tests_${_sslm_tier_lower}_forced PRIVATE
+		tests/gpu-g3-core/g3_superslm_tests_adapter.cpp tests/gpu-g3-core/g3_cells_ledger.cpp)
+	target_include_directories(superslm_tests_${_sslm_tier_lower}_forced PRIVATE tests/gpu-g3-core src/gpu)
+	target_compile_definitions(superslm_tests_${_sslm_tier_lower}_forced PRIVATE SUPERSLM_LEDGER_YIELD_HOOK)
 
 	# The forced digest executable (design §8.3), mirroring sslm_axis_digest_scalar_forced.
 	add_executable(sslm_axis_digest_${_sslm_tier_lower}_forced EXCLUDE_FROM_ALL tools/ci/sslm_axis_digest.cpp)
