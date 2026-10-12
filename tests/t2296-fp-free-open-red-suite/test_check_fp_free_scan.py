@@ -920,8 +920,9 @@ def test_population_08_source_manifest_resolves_its_real_files():
     block = text[start:end]
     sources = [line.strip() for line in block.splitlines()[1:] if line.strip()]
     # Decode threading D0 added src/forward/parallel_split.cpp: 18 from D0 on (design Sec4.1 said 17).
-    assert len(sources) == 19, (
-        "SUPERSLM_CORE_SOURCES names 19 translation units from the paged-KV page module on, 18 from decode threading D0 on (design "
+    # GPU paged KV G3 added src/gpu/gpu_inflight_registry.cpp: 20 from then on.
+    assert len(sources) == 20, (
+        "SUPERSLM_CORE_SOURCES names 20 translation units from GPU paged KV G3 on, 19 from the paged-KV page module on, 18 from decode threading D0 on (design "
         "Sec4.1's own text states 17); CMakeLists.txt currently names {}: {}".format(len(sources), sources)
     )
     missing = [s for s in sources if not os.path.exists(os.path.join(engine_root, s))]
@@ -2872,12 +2873,13 @@ def test_derive_core_sources_control_ordinary_manifest_unaffected():
         "got {}".format(result)
     )
     # The real, currently-committed CMakeLists.txt must also be unaffected --
-    # population eight's own 19-source claim depends on this.
+    # population eight's own 20-source claim depends on this.
     engine_root = os.path.dirname(_TESTS_ROOT)
     real_cmake = os.path.join(engine_root, "CMakeLists.txt")
     real_result = scan.derive_core_sources(real_cmake)
     # The paged-KV page module added src/kv_pages.cpp: 19 from then on; decode threading D0 added src/forward/parallel_split.cpp: 18 from D0 on.
-    assert len(real_result) == 19, (
+    # GPU paged KV G3 added src/gpu/gpu_inflight_registry.cpp: 20 from then on.
+    assert len(real_result) == 20, (
         "the completeness self-check must not regress the real, currently-"
         "committed CMakeLists.txt -- got {} sources: {}".format(
             len(real_result), real_result)
@@ -4457,8 +4459,9 @@ def test_scan_build_output_real_build_finds_exactly_its_objects(real_build_dir):
         _fail_absent("(thirty-sixth population, must-accept)", "")
     objects = scan_build_output.find_target_objects(real_build_dir, "superslm")
     # Decode threading D0 added src/forward/parallel_split.cpp: 18 from D0 on.
-    assert len(objects) == 19, (
-        "the real build emits exactly 19 objects for the superslm target from the paged-KV page module on, 18 from decode "
+    # GPU paged KV G3 added src/gpu/gpu_inflight_registry.cpp: 20 from then on.
+    assert len(objects) == 20, (
+        "the real build emits exactly 20 objects for the superslm target from GPU paged KV G3 on, 19 from the paged-KV page module on, 18 from decode "
         "threading D0 on (design Sec4.1 said 17); found {}: {}".format(
             len(objects), objects)
     )

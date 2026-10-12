@@ -27,6 +27,8 @@ set(SUPERSLM_INSTALL_GPU_SHADER_DIR "${CMAKE_INSTALL_DATADIR}/superslm/gpu-shade
 
 # The core library. Layer 1 is independently embeddable — no Unreal, no third-party
 # runtime dependency in its graph (DecisionLog D-SLM13). Standard library only.
+# src/gpu/gpu_inflight_registry.cpp is GPU paged-KV plan G3's run-site task trampoline, D3D12-free.
+# Keep comments out of the list below: tools and tests read it with plain text parsers.
 set(SUPERSLM_CORE_SOURCES
 	src/artifact.cpp
 	src/sha256.cpp
@@ -40,7 +42,7 @@ set(SUPERSLM_CORE_SOURCES
 	src/forward/checked_chain_funnel.cpp
 	src/forward/forward_sites.cpp
 	src/forward/parallel_split.cpp
-	src/gpu/gpu_inflight_registry.cpp  # GPU paged-KV plan G3: the run site's task trampoline (D3D12-free)
+	src/gpu/gpu_inflight_registry.cpp
 	src/decode_digest.cpp
 	src/kv_pages.cpp
 	src/sslm_abi.cpp
