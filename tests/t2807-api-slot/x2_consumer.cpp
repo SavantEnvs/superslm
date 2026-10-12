@@ -195,11 +195,15 @@ extern "C" __declspec(dllexport) int x2_run() {
 		X2_ZERO(sslm_kv_page_size(m));
 		X2_ZERO(sslm_kv_pages_for_budget(m, 1));
 		X2_ZERO(sslm_kv_page_pool_overhead_size(m, 1));
+		X2_ZERO(sslm_kv_pool_contiguous_size(m, 1));
 		X2_ZERO(sslm_seq_state_size(m));
 		X2_INVALID(sslm_kv_pool_create(m, nullptr, 0, 1, nullptr));
 		kp = reinterpret_cast<sslm_kv_pool>(static_cast<uintptr_t>(1));
 		X2_CHECK(sslm_kv_page_pool_create(m, nullptr, 0, 1, &kp) == SSLM_INVALID_ARGUMENT && kp == nullptr,
 		         "sslm_kv_page_pool_create rejects null model and clears output");
+		kp = reinterpret_cast<sslm_kv_pool>(static_cast<uintptr_t>(1));
+		X2_CHECK(sslm_kv_pool_create_contiguous(m, nullptr, 0, 1, &kp) == SSLM_INVALID_ARGUMENT && kp == nullptr,
+		         "sslm_kv_pool_create_contiguous rejects null model and clears output");
 		kp = nullptr;
 		X2_INVALID(sslm_kv_pool_destroy(kp));
 		pool_stats.struct_size = sizeof pool_stats;
