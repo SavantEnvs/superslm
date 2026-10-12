@@ -2238,6 +2238,24 @@ rem      describes, not as a claim about the class's current state.
 rem      Re-executed this session: 77 collected, 74 passed, 3 xfailed, 0 failed (corpus available);
 rem      77 collected, 71 passed, 3 skipped, 3 xfailed, 0 failed (corpus forced unavailable). ANY
 rem      nonzero exit from this pytest invocation is now a real regression against this baseline.
+rem Decode-threading D1 fixtures: superslm_tests.exe reads them from the directory named by
+rem SUPERSLM_DECODE_THREADING_FIXTURE_DIR and fails a D1 cell when a fixture is missing. Generate
+rem them fresh here (they are never committed) and name the directory when the caller has not.
+if not exist out mkdir out
+if not defined SUPERSLM_DECODE_THREADING_FIXTURE_DIR (
+	where python >nul 2>nul
+	if not errorlevel 1 (
+		python tools\gen_decode_threading_fixture.py out\decode-threading-fixtures
+		if errorlevel 1 (
+			echo decode-threading fixture generation FAILED -- the D1 cells below will fail for the missing fixtures
+		) else (
+			set SUPERSLM_DECODE_THREADING_FIXTURE_DIR=%CD%\out\decode-threading-fixtures
+			echo decode-threading fixtures: SUPERSLM_DECODE_THREADING_FIXTURE_DIR provisioned by default, override to use another directory.
+		)
+	) else (
+		echo python is absent -- decode-threading fixtures not generated, the D1 cells below will fail for the missing fixtures
+	)
+)
 out\superslm_tests.exe
 set ec=%errorlevel%
 if not %b1_ec%==0 set ec=%b1_ec%
