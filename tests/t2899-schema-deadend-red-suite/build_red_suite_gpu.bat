@@ -482,48 +482,52 @@ rem dead-end at all, so linking against it made the pre-save assertion below unw
 rem cell_gpu_slm4_restore (FIXED only) ----
 cl /nologo /std:c++20 /O2 /W3 /fp:precise /EHsc %STOCKINC% /c cell_gpu_slm4_dump.cpp /Fo"obj_gpu\slm4_dump.obj" ^
     > obj_gpu\slm4_dump.buildlog 2>&1 || (echo BUILD FAILED: slm4_dump.obj & type obj_gpu\slm4_dump.buildlog & set OVERALL_OK=0)
-link /nologo /OUT:"bin_gpu\slm4_dump.exe" obj_gpu\slm4_dump.obj obj_gpu\gpu_fixed_noslm5\gpu_1p0_fixed.obj obj_gpu\gpu_fixed_noslm5\superslm_gpu_pristine.obj !CPU_COMMON_OBJS! %SYSLIBS% ^
-    > obj_gpu\slm4_dump.linklog 2>&1 || (echo LINK FAILED: slm4_dump & type obj_gpu\slm4_dump.linklog & set OVERALL_OK=0)
-echo ===== cell_gpu_slm4_dump [FIXED, pre-SLM5 -- checked-return fix only, T-2903] =====
-"bin_gpu\slm4_dump.exe" %MODELARG% --out=obj_gpu\slm4_blob.bin > obj_gpu\slm4_dump.runlog 2>&1
-type obj_gpu\slm4_dump.runlog
-set SUMMARY_LINE=
-for /f "delims=" %%s in ('findstr /R "^checks=[0-9]* failures=[0-9]*" obj_gpu\slm4_dump.runlog') do set SUMMARY_LINE=%%s
-if "!SUMMARY_LINE!"=="" (
-    echo    CRASHED OR NO SUMMARY LINE
-    set OVERALL_OK=0
-) else (
-    set TOK_CHECKS=
-    set TOK_FAILURES=
-    set TOK_SKIPS=
-    for /f "tokens=1,2,3 delims= " %%a in ("!SUMMARY_LINE!") do (set TOK_CHECKS=%%a& set TOK_FAILURES=%%b& set TOK_SKIPS=%%c)
-    set "FAILN=!TOK_FAILURES:~9!"
-    set "SKIPN=!TOK_SKIPS:~6!"
-    if not "!FAILN!"=="0" (echo    FAILURES=!FAILN! -- a red cell ^(obj_gpu\slm4_dump.runlog^)& set OVERALL_OK=0)
-    if not "!SKIPN!"=="0" (echo    SKIPS=!SKIPN! -- a skipped cell fails the run ^(obj_gpu\slm4_dump.runlog^)& set OVERALL_OK=0)
+if "!PRISTINE_OK!"=="1" (
+    link /nologo /OUT:"bin_gpu\slm4_dump.exe" obj_gpu\slm4_dump.obj obj_gpu\gpu_fixed_noslm5\gpu_1p0_fixed.obj obj_gpu\gpu_fixed_noslm5\superslm_gpu_pristine.obj !CPU_COMMON_OBJS! %SYSLIBS% ^
+        > obj_gpu\slm4_dump.linklog 2>&1 || (echo LINK FAILED: slm4_dump & type obj_gpu\slm4_dump.linklog & set OVERALL_OK=0)
+    echo ===== cell_gpu_slm4_dump [FIXED, pre-SLM5 -- checked-return fix only, T-2903] =====
+    "bin_gpu\slm4_dump.exe" %MODELARG% --out=obj_gpu\slm4_blob.bin > obj_gpu\slm4_dump.runlog 2>&1
+    type obj_gpu\slm4_dump.runlog
+    set SUMMARY_LINE=
+    for /f "delims=" %%s in ('findstr /R "^checks=[0-9]* failures=[0-9]*" obj_gpu\slm4_dump.runlog') do set SUMMARY_LINE=%%s
+    if "!SUMMARY_LINE!"=="" (
+        echo    CRASHED OR NO SUMMARY LINE
+        set OVERALL_OK=0
+    ) else (
+        set TOK_CHECKS=
+        set TOK_FAILURES=
+        set TOK_SKIPS=
+        for /f "tokens=1,2,3 delims= " %%a in ("!SUMMARY_LINE!") do (set TOK_CHECKS=%%a& set TOK_FAILURES=%%b& set TOK_SKIPS=%%c)
+        set "FAILN=!TOK_FAILURES:~9!"
+        set "SKIPN=!TOK_SKIPS:~6!"
+        if not "!FAILN!"=="0" (echo    FAILURES=!FAILN! -- a red cell ^(obj_gpu\slm4_dump.runlog^)& set OVERALL_OK=0)
+        if not "!SKIPN!"=="0" (echo    SKIPS=!SKIPN! -- a skipped cell fails the run ^(obj_gpu\slm4_dump.runlog^)& set OVERALL_OK=0)
+    )
 )
 
 cl /nologo /std:c++20 /O2 /W3 /fp:precise /EHsc %STOCKINC% /c cell_gpu_slm4_restore.cpp /Fo"obj_gpu\slm4_restore.obj" ^
     > obj_gpu\slm4_restore.buildlog 2>&1 || (echo BUILD FAILED: slm4_restore.obj & type obj_gpu\slm4_restore.buildlog & set OVERALL_OK=0)
 link /nologo /OUT:"bin_gpu\slm4_restore.exe" obj_gpu\slm4_restore.obj obj_gpu\gpu_asbuilt\gpu_1p0.obj obj_gpu\gpu_asbuilt\superslm_gpu.obj !CPU_COMMON_OBJS! %SYSLIBS% ^
     > obj_gpu\slm4_restore.linklog 2>&1 || (echo LINK FAILED: slm4_restore & type obj_gpu\slm4_restore.linklog & set OVERALL_OK=0)
-echo ===== cell_gpu_slm4_restore [FIXED, reading the ASBUILT-written blob] =====
-"bin_gpu\slm4_restore.exe" %MODELARG% --in=obj_gpu\slm4_blob.bin > obj_gpu\slm4_restore.runlog 2>&1
-type obj_gpu\slm4_restore.runlog
-set SUMMARY_LINE=
-for /f "delims=" %%s in ('findstr /R "^checks=[0-9]* failures=[0-9]*" obj_gpu\slm4_restore.runlog') do set SUMMARY_LINE=%%s
-if "!SUMMARY_LINE!"=="" (
-    echo    CRASHED OR NO SUMMARY LINE
-    set OVERALL_OK=0
-) else (
-    set TOK_CHECKS=
-    set TOK_FAILURES=
-    set TOK_SKIPS=
-    for /f "tokens=1,2,3 delims= " %%a in ("!SUMMARY_LINE!") do (set TOK_CHECKS=%%a& set TOK_FAILURES=%%b& set TOK_SKIPS=%%c)
-    set "FAILN=!TOK_FAILURES:~9!"
-    set "SKIPN=!TOK_SKIPS:~6!"
-    if not "!FAILN!"=="0" (echo    FAILURES=!FAILN! -- a red cell ^(obj_gpu\slm4_restore.runlog^)& set OVERALL_OK=0)
-    if not "!SKIPN!"=="0" (echo    SKIPS=!SKIPN! -- a skipped cell fails the run ^(obj_gpu\slm4_restore.runlog^)& set OVERALL_OK=0)
+if "!PRISTINE_OK!"=="1" (
+    echo ===== cell_gpu_slm4_restore [FIXED, reading the ASBUILT-written blob] =====
+    "bin_gpu\slm4_restore.exe" %MODELARG% --in=obj_gpu\slm4_blob.bin > obj_gpu\slm4_restore.runlog 2>&1
+    type obj_gpu\slm4_restore.runlog
+    set SUMMARY_LINE=
+    for /f "delims=" %%s in ('findstr /R "^checks=[0-9]* failures=[0-9]*" obj_gpu\slm4_restore.runlog') do set SUMMARY_LINE=%%s
+    if "!SUMMARY_LINE!"=="" (
+        echo    CRASHED OR NO SUMMARY LINE
+        set OVERALL_OK=0
+    ) else (
+        set TOK_CHECKS=
+        set TOK_FAILURES=
+        set TOK_SKIPS=
+        for /f "tokens=1,2,3 delims= " %%a in ("!SUMMARY_LINE!") do (set TOK_CHECKS=%%a& set TOK_FAILURES=%%b& set TOK_SKIPS=%%c)
+        set "FAILN=!TOK_FAILURES:~9!"
+        set "SKIPN=!TOK_SKIPS:~6!"
+        if not "!FAILN!"=="0" (echo    FAILURES=!FAILN! -- a red cell ^(obj_gpu\slm4_restore.runlog^)& set OVERALL_OK=0)
+        if not "!SKIPN!"=="0" (echo    SKIPS=!SKIPN! -- a skipped cell fails the run ^(obj_gpu\slm4_restore.runlog^)& set OVERALL_OK=0)
+    )
 )
 
 echo DEBUG_OVERALL_OK=[%OVERALL_OK%]
