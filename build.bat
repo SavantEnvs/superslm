@@ -1652,7 +1652,7 @@ echo T-2899 suite: every cell compiled and linked against the current engine ^(c
 rem Runtime: the suite's own three scripts, which build every variant (mutants included) and run
 rem them. T2899_MODEL is the C39 synthetic model their headers name; T2899_G5_MODEL the 1.5B G5
 rem fixture build_red_suite_gpu.bat's real-schema cell needs. build_red_suite_gpu.bat and
-rem build_t2916_s3_bounds_tamper.bat write scratch copies under D:\_t2905 and D:\_t2916.
+rem build_t2916_s3_bounds_tamper.bat write under their own obj_gpu and obj_t2916_s3 directories.
 set T2899_RUN=1
 if not defined T2899_MODEL set T2899_RUN=0
 if not defined T2899_G5_MODEL set T2899_RUN=0
