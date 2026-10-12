@@ -17,6 +17,8 @@
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -48,54 +50,194 @@ using namespace pkv::bc;
 constexpr int kPairs = 205;
 enum class Verdict { Pass, Fail, NoResult };
 [[noreturn]] void Refuse(int code,const char* why);
+// The box timing lock (D-SLM8464), the fourth holder beside tools/run_paged_kv_rows.py's timing_lock,
+// tools/run_paged_kv_pairs.py's PidLock and tools/paged_kv_c6_provenance.ps1's Enter-PkvTimingLock, under the same one
+// format and protocol: the file holds the owner's bare decimal pid. A fresh acquire writes the pid to a temporary file
+// and moves it into place without replacing, so the lock is never visible empty; an existing file is recovered only
+// under an exclusive non-blocking OS lock on one byte at kLock74Byte (far past any content); then a file modified
+// before the system's last boot is stale whatever it holds, since its pid may now name an unrelated process
+// (D-SLM8466 (3)); otherwise content other than ASCII digits naming a pid from 1 to 2**31 - 1, with only space, tab,
+// CR and LF stripped around it, is torn and refused, and so is a file longer than kLock74MaxBytes; a live pid refuses;
+// an empty file or a dead pid is stale. A stale file is overwritten in place with this pid, never unlinked, so two
+// contenders cannot both reclaim it. A release unlinks the file only when it still holds this pid.
 std::string locked74_path;
+constexpr int kLock74Attempts=3;
+constexpr long long kLock74Byte=1LL<<20;
+constexpr size_t kLock74MaxBytes=4096;
+enum class Owner74 { Empty, Torn, Pid };
+// The pid `content` names (a content longer than kLock74MaxBytes is torn whatever it holds).
+Owner74 ReadOwner74(const std::string& content,unsigned long& owner){
+	if(content.size()>kLock74MaxBytes)return Owner74::Torn;
+	const char* trim=" \t\r\n";
+	const size_t first=content.find_first_not_of(trim);
+	if(first==std::string::npos)return Owner74::Empty;
+	const std::string text=content.substr(first,content.find_last_not_of(trim)-first+1);
+	unsigned long long value=0;  // saturates past the largest pid, so leading zeros and long numbers read as Python's int
+	for(const char c:text){if(c<'0'||c>'9')return Owner74::Torn;value=std::min(value*10+static_cast<unsigned>(c-'0'),1ULL<<32);}
+	if(value<1||value>2147483647ULL)return Owner74::Torn;
+	owner=static_cast<unsigned long>(value);return Owner74::Pid;
+}
+bool OwnsLock74(const std::string& content,unsigned long pid){
+	unsigned long owner=0;return ReadOwner74(content,owner)==Owner74::Pid&&owner==pid;
+}
+#if defined(_WIN32)
+std::string ReadCapped74(HANDLE handle){
+	std::string data;char buffer[1024];
+	if(SetFilePointer(handle,0,nullptr,FILE_BEGIN)==INVALID_SET_FILE_POINTER)return data;
+	while(data.size()<=kLock74MaxBytes){
+		const DWORD want=static_cast<DWORD>(std::min<size_t>(sizeof(buffer),kLock74MaxBytes+1-data.size()));
+		DWORD count=0;
+		if(!ReadFile(handle,buffer,want,&count,nullptr)||!count)break;
+		data.append(buffer,count);
+	}
+	return data;
+}
+void Release74(){
+	const HANDLE handle=CreateFileA(locked74_path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+	if(handle==INVALID_HANDLE_VALUE)return;  // a reader holds it open: it keeps this pid, stale once this process exits
+	const std::string data=ReadCapped74(handle);CloseHandle(handle);
+	if(OwnsLock74(data,GetCurrentProcessId()))DeleteFileA(locked74_path.c_str());
+}
+// The file was last written before the last boot: now less GetTickCount64 (which counts sleep and hibernation), the
+// reading the other three holders take.
+bool BeforeBoot74(HANDLE handle){
+	FILETIME written{},now{};
+	if(!GetFileTime(handle,nullptr,nullptr,&written))return false;
+	GetSystemTimeAsFileTime(&now);
+	const unsigned long long w=(static_cast<unsigned long long>(written.dwHighDateTime)<<32)|written.dwLowDateTime;
+	const unsigned long long n=(static_cast<unsigned long long>(now.dwHighDateTime)<<32)|now.dwLowDateTime;
+	return w<n-GetTickCount64()*10000ULL;
+}
+// True when this call published the lock; false when a lock file exists (or is being deleted).
+bool Publish74(const std::string& path,const std::string& pid){
+	const std::string temp=path+"."+pid+".new";
+	const HANDLE handle=CreateFileA(temp.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+	if(handle==INVALID_HANDLE_VALUE)Refuse(77,"C6 timing lock temporary file create failed");
+	DWORD written=0;
+	const bool okay=WriteFile(handle,pid.data(),static_cast<DWORD>(pid.size()),&written,nullptr)&&written==pid.size();
+	CloseHandle(handle);
+	if(!okay){DeleteFileA(temp.c_str());Refuse(77,"C6 timing lock owner write failed");}
+	const bool moved=MoveFileExA(temp.c_str(),path.c_str(),0)!=0;  // no MOVEFILE_REPLACE_EXISTING: fails when the lock exists
+	const DWORD error=moved?ERROR_SUCCESS:GetLastError();
+	DeleteFileA(temp.c_str());
+	if(moved)return true;
+	if(error!=ERROR_ALREADY_EXISTS&&error!=ERROR_FILE_EXISTS&&error!=ERROR_ACCESS_DENIED)Refuse(77,"C6 timing lock create failed");
+	return false;
+}
+// True when this call recovered a stale lock for this process; false when the file went away or was held open
+// without write sharing (retry the fresh acquire).
+bool Recover74(const std::string& path,const std::string& pid){
+	// No delete sharing: while this handle is open nothing can delete the file, so the path still names it.
+	const HANDLE handle=CreateFileA(path.c_str(),GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+	if(handle==INVALID_HANDLE_VALUE){
+		const DWORD error=GetLastError();
+		if(error==ERROR_SHARING_VIOLATION){Sleep(50);return false;}
+		if(error==ERROR_FILE_NOT_FOUND||error==ERROR_ACCESS_DENIED)return false;
+		Refuse(77,"C6 timing lock open failed");
+	}
+	OVERLAPPED region{};region.Offset=static_cast<DWORD>(kLock74Byte&0xffffffff);region.OffsetHigh=static_cast<DWORD>(kLock74Byte>>32);
+	if(!LockFileEx(handle,LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY,0,1,0,&region)){
+		CloseHandle(handle);Refuse(77,"C6 timing lock is being recovered by another runner");}
+	const auto fail=[&](const char* why){UnlockFileEx(handle,0,1,0,&region);CloseHandle(handle);Refuse(77,why);};
+	const bool stale=BeforeBoot74(handle);
+	if(!stale){
+		unsigned long owner=0;
+		const Owner74 kind=ReadOwner74(ReadCapped74(handle),owner);
+		if(kind==Owner74::Torn)fail("C6 timing lock owner record torn");
+		if(kind==Owner74::Pid){
+			const HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,static_cast<DWORD>(owner));
+			if(process){const DWORD state=WaitForSingleObject(process,0);CloseHandle(process);
+				if(state!=WAIT_OBJECT_0)fail("C6 timing lock already held");}
+			else if(GetLastError()==ERROR_ACCESS_DENIED)fail("C6 timing lock already held");
+			else if(GetLastError()!=ERROR_INVALID_PARAMETER)fail("C6 timing lock owner cannot be checked");
+		}
+	}
+	DWORD written=0;
+	const bool okay=SetFilePointer(handle,0,nullptr,FILE_BEGIN)!=INVALID_SET_FILE_POINTER&&SetEndOfFile(handle)&&
+		WriteFile(handle,pid.data(),static_cast<DWORD>(pid.size()),&written,nullptr)&&written==pid.size();
+	if(!okay)fail("C6 timing lock owner write failed");
+	UnlockFileEx(handle,0,1,0,&region);CloseHandle(handle);
+	return true;
+}
+#else
+std::string ReadCapped74(int fd){
+	std::string data;char buffer[1024];
+	while(data.size()<=kLock74MaxBytes){
+		const ssize_t count=pread(fd,buffer,std::min<size_t>(sizeof(buffer),kLock74MaxBytes+1-data.size()),static_cast<off_t>(data.size()));
+		if(count<=0)break;
+		data.append(buffer,static_cast<size_t>(count));
+	}
+	return data;
+}
+void Release74(){
+	const int fd=open(locked74_path.c_str(),O_RDONLY);
+	if(fd<0)return;
+	const std::string data=ReadCapped74(fd);close(fd);
+	if(OwnsLock74(data,static_cast<unsigned long>(getpid())))unlink(locked74_path.c_str());
+}
+// The file was last written before the last boot: now less CLOCK_BOOTTIME, the reading the Python holders take.
+bool BeforeBoot74(int fd){
+#if defined(CLOCK_BOOTTIME)
+	struct stat info{};timespec now{},uptime{};
+	if(fstat(fd,&info)!=0||clock_gettime(CLOCK_REALTIME,&now)!=0||clock_gettime(CLOCK_BOOTTIME,&uptime)!=0)return false;
+	const double boot=(now.tv_sec-uptime.tv_sec)+(now.tv_nsec-uptime.tv_nsec)*1e-9;
+	return info.st_mtim.tv_sec+info.st_mtim.tv_nsec*1e-9<boot;
+#else
+	(void)fd;return false;
+#endif
+}
+bool Publish74(const std::string& path,const std::string& pid){
+	const std::string temp=path+"."+pid+".new";
+	const int fd=open(temp.c_str(),O_CREAT|O_TRUNC|O_WRONLY,0600);
+	if(fd<0)Refuse(77,"C6 timing lock temporary file create failed");
+	const bool okay=write(fd,pid.data(),pid.size())==static_cast<ssize_t>(pid.size());
+	close(fd);
+	if(!okay){unlink(temp.c_str());Refuse(77,"C6 timing lock owner write failed");}
+	const bool linked=link(temp.c_str(),path.c_str())==0;  // fails when the lock exists
+	const int error=errno;
+	unlink(temp.c_str());
+	if(linked)return true;
+	if(error!=EEXIST)Refuse(77,"C6 timing lock create failed");
+	return false;
+}
+bool Recover74(const std::string& path,const std::string& pid){
+	const int fd=open(path.c_str(),O_RDWR);
+	if(fd<0){if(errno==ENOENT)return false;Refuse(77,"C6 timing lock open failed");}
+	struct flock region{};region.l_type=F_WRLCK;region.l_whence=SEEK_SET;region.l_start=static_cast<off_t>(kLock74Byte);region.l_len=1;
+	if(fcntl(fd,F_SETLK,&region)!=0){close(fd);Refuse(77,"C6 timing lock is being recovered by another runner");}
+	// close() drops this process's record locks on the file
+	const auto fail=[&](const char* why){close(fd);Refuse(77,why);};
+	struct stat held{},named{};
+	if(fstat(fd,&held)!=0)fail("C6 timing lock stat failed");
+	if(stat(path.c_str(),&named)!=0||held.st_dev!=named.st_dev||held.st_ino!=named.st_ino){close(fd);return false;}  // released and replaced after this open
+	const bool stale=BeforeBoot74(fd);
+	if(!stale){
+		unsigned long owner=0;
+		const Owner74 kind=ReadOwner74(ReadCapped74(fd),owner);
+		if(kind==Owner74::Torn)fail("C6 timing lock owner record torn");
+		if(kind==Owner74::Pid){
+			if(kill(static_cast<pid_t>(owner),0)==0||errno==EPERM)fail("C6 timing lock already held");
+			if(errno!=ESRCH)fail("C6 timing lock owner cannot be checked");
+		}
+	}
+	const bool okay=ftruncate(fd,0)==0&&pwrite(fd,pid.data(),pid.size(),0)==static_cast<ssize_t>(pid.size());
+	if(!okay)fail("C6 timing lock owner write failed");
+	close(fd);
+	return true;
+}
+#endif
 void Lock74(const char* path=nullptr) {
 #if defined(_WIN32)
 	if(!path){CreateDirectoryA("D:\\_scratch\\SuperSLM",nullptr);path="D:\\_scratch\\SuperSLM\\pkv-c6-timing.lock";}
-	for(int attempt=0;attempt<10;++attempt){
-		HANDLE handle=CreateFileA(path,GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
-		if(handle!=INVALID_HANDLE_VALUE){
-			const auto pid=std::to_string(GetCurrentProcessId());DWORD written=0;
-			const bool okay=WriteFile(handle,pid.data(),static_cast<DWORD>(pid.size()),&written,nullptr)&&written==pid.size();
-			CloseHandle(handle);
-			if(!okay){DeleteFileA(path);Refuse(77,"C6 timing lock owner write failed");}
-			locked74_path=path;std::atexit([]{DeleteFileA(locked74_path.c_str());});return;
-		}
-		if(GetLastError()!=ERROR_FILE_EXISTS&&GetLastError()!=ERROR_ALREADY_EXISTS)Refuse(77,"C6 timing lock create failed");
-		HANDLE old=CreateFileA(path,GENERIC_READ|DELETE,0,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
-		if(old==INVALID_HANDLE_VALUE){Sleep(50);continue;}
-		char buffer[32]{};DWORD count=0;
-		const bool read=ReadFile(old,buffer,sizeof(buffer)-1,&count,nullptr)!=0;
-		char* end=nullptr;errno=0;const unsigned long owner=read?std::strtoul(buffer,&end,10):0;
-		if(!read||!count){CloseHandle(old);Sleep(50);continue;}
-		if(buffer[0]<'0'||buffer[0]>'9'||errno==ERANGE||!owner||owner>std::numeric_limits<DWORD>::max()||end!=buffer+count){
-			CloseHandle(old);Refuse(77,"C6 timing lock owner record torn");}
-		HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,static_cast<DWORD>(owner));
-		if(process){const DWORD state=WaitForSingleObject(process,0);CloseHandle(process);
-			if(state!=WAIT_OBJECT_0){CloseHandle(old);Refuse(77,"C6 timing lock already held");}}
-		else if(GetLastError()!=ERROR_INVALID_PARAMETER){CloseHandle(old);Refuse(77,"C6 timing lock owner cannot be checked");}
-		FILE_DISPOSITION_INFO disposition{TRUE};
-		const bool removed=SetFileInformationByHandle(old,FileDispositionInfo,&disposition,sizeof(disposition))!=0;
-		CloseHandle(old);
-		if(!removed)Refuse(77,"C6 dead-owner lock cannot be reclaimed");
-	}
-	Refuse(77,"C6 timing lock owner record incomplete");
+	const std::string pid=std::to_string(GetCurrentProcessId());
 #else
 	if(!path)path="/tmp/superslm-pkv-c6-timing.lock";
-	for(int attempt=0;attempt<10;++attempt){
-		const int fd=open(path,O_CREAT|O_EXCL|O_WRONLY,0600);
-		if(fd>=0){const auto pid=std::to_string(getpid());const bool okay=write(fd,pid.data(),pid.size())==static_cast<ssize_t>(pid.size());close(fd);
-			if(!okay){unlink(path);Refuse(77,"C6 timing lock owner write failed");}
-			locked74_path=path;std::atexit([]{unlink(locked74_path.c_str());});return;}
-		if(errno!=EEXIST)Refuse(77,"C6 timing lock create failed");
-		std::ifstream old(path);std::string record;if(!(old>>record)){usleep(50000);continue;}
-		char* end=nullptr;const long owner=std::strtol(record.c_str(),&end,10);
-		if(owner<=0||*end)Refuse(77,"C6 timing lock owner record torn");
-		if(kill(static_cast<pid_t>(owner),0)==0||errno!=ESRCH)Refuse(77,"C6 timing lock already held");
-		if(unlink(path)!=0&&errno!=ENOENT)Refuse(77,"C6 dead-owner lock cannot be reclaimed");
-	}
-	Refuse(77,"C6 timing lock owner record incomplete");
+	const std::string pid=std::to_string(getpid());
 #endif
+	for(int attempt=0;attempt<kLock74Attempts;++attempt){
+		if(Publish74(path,pid)||Recover74(path,pid)){locked74_path=path;std::atexit(Release74);return;}
+	}
+	Refuse(77,"C6 timing lock could not be acquired");
 }
 void LockConstruction(){const char* path=std::getenv("PKV_DEBUNK_74_TEST_LOCK_PATH");
 	if(!path||!*path)Refuse(77,"C6 lock construction path missing");Lock74(path);PKV_CHECK(true);}

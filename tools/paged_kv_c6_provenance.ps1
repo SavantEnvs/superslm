@@ -28,7 +28,8 @@ $PkvC6RecordKeys = @('Schema', 'Leg', 'Head', 'BinarySha256', 'SourceManifestSha
 $PkvC6TimingLock = 'D:\_scratch\SuperSLM\pkv-c6-timing.lock'
 
 # The box timing lock (D-SLM8464): one format and one protocol in every program that takes it
-# (run_paged_kv_rows.py's timing_lock and run_paged_kv_pairs.py's PidLock are the others). The file holds the owner's
+# (run_paged_kv_rows.py's timing_lock, run_paged_kv_pairs.py's PidLock and Lock74 in
+# tests/paged-kv/c6_dim7_reset_adopt_timing.cpp are the others). The file holds the owner's
 # bare decimal pid. A fresh acquire moves a temporary file holding the pid into place without replacing, so the lock is
 # never visible empty. An existing file is recovered only under an exclusive non-blocking OS lock on it (one byte at
 # offset 1 MiB, the same byte the Python legs lock). Then a file modified before the system's last boot is stale

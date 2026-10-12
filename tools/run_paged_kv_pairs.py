@@ -149,8 +149,8 @@ def _before_boot(fd: int) -> bool:
 
 class PidLock:
     """The pid lock: the file holds the owner's bare decimal pid. D-SLM8464 gives the box timing lock one format and one
-    protocol in every program that takes it (run_paged_kv_rows.py's timing_lock and paged_kv_c6_provenance.ps1's
-    Enter-PkvTimingLock are the others): a fresh acquire moves a temporary file holding the pid into place without
+    protocol in every program that takes it (run_paged_kv_rows.py's timing_lock, paged_kv_c6_provenance.ps1's
+    Enter-PkvTimingLock and Lock74 in tests/paged-kv/c6_dim7_reset_adopt_timing.cpp are the others): a fresh acquire moves a temporary file holding the pid into place without
     replacing, so the lock is never visible empty; an existing file is recovered only under an exclusive non-blocking OS
     lock on it; then a file modified before the system's last boot is stale whatever pid it holds (D-SLM8466 (3): that
     pid may now name an unrelated process); otherwise a pid liveness check (a live pid refuses); then an overwrite with
