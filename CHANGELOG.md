@@ -4,9 +4,9 @@ All notable changes to SuperSLM (Layer 1) are recorded here.
 
 ## [Unreleased]
 
-## [1.12.0] - TODO-BOX(release date: fill at the tag, and delete "Not yet tagged" below)
+## [1.12.0] - 2026-10-12
 
-Not yet tagged. The CPU backend stores K/V in pages of
+The CPU backend stores K/V in pages of
 `B` positions (`sslm_kv_page_positions`; `B` follows from the model's head dimension, context cap
 and K/V element width, and is 64 for Qwen2.5-0.5B at cap 4,096 and for Qwen2.5-1.5B at cap 32,768),
 reached through a per-holder page table. Tokens and K/V values are bit-identical to 1.11.0 on every
