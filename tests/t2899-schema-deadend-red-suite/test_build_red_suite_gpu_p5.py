@@ -2,6 +2,8 @@
 
   compile-fails  a failing compile of gpu_1p0_fixed.cpp clears PRISTINE_OK, so the slm4_dump link never runs, and it
                  leaves no gpu_fixed_noslm5 object and no slm4_blob.bin an earlier run wrote
+  dump-fails     a failing compile of cell_gpu_slm4_dump.cpp leaves no obj_gpu\\slm4_dump.obj an earlier run wrote, so
+                 the slm4_dump link cannot pick up a stale object
   control        with every compile passing, the slm4_dump link runs against gpu_fixed_noslm5's objects, which are
                  this run's (an earlier run's objects are replaced), and an earlier run's slm4_blob.bin is removed
                  before the dump step (the stub link writes no executable, so the dump writes no new blob)
@@ -113,6 +115,7 @@ class BuildRedSuiteGpuP5(unittest.TestCase):
         for name in ("gpu_1p0_fixed.obj", "superslm_gpu_pristine.obj"):
             (self.obj / "gpu_fixed_noslm5" / name).write_bytes(STALE)
         (self.obj / "slm4_blob.bin").write_bytes(STALE)
+        (self.obj / "slm4_dump.obj").write_bytes(STALE)
 
     def build_stubs(self):
         source = self.stubs / "stub.c"
@@ -166,12 +169,22 @@ class BuildRedSuiteGpuP5(unittest.TestCase):
                          else [], "an earlier run's gpu_fixed_noslm5 objects survived the failed compile")
         self.assertFalse((self.obj / "slm4_blob.bin").exists(), "an earlier run's slm4_blob.bin survived")
 
+    def test_failed_slm4_dump_compile_leaves_no_stale_object(self):
+        code, output, calls = self.run_script(cl_fail="cell_gpu_slm4_dump.cpp")
+        self.assertTrue([c for c in calls if c.startswith("cl ") and "cell_gpu_slm4_dump.cpp" in c],
+                        "the slm4_dump compile never ran:\n" + output)
+        self.assertIn("BUILD FAILED: slm4_dump.obj", output)
+        self.assertEqual(code, 1, output)
+        self.assertFalse((self.obj / "slm4_dump.obj").exists(),
+                         "an earlier run's slm4_dump.obj survived the failed compile, for the slm4_dump link to use")
+
     def test_control_links_slm4_dump_against_this_runs_objects(self):
         _, output, calls = self.run_script()
         self.assertNotIn("BUILD FAILED: gpu_fixed_noslm5", output)
         links = [c for c in calls if c.startswith("link ") and "slm4_dump.exe" in c]
         self.assertEqual(len(links), 1, "\n".join(calls))
         self.assertIn("gpu_fixed_noslm5\\gpu_1p0_fixed.obj", links[0])
+        self.assertEqual((self.obj / "slm4_dump.obj").read_bytes(), b"stub object", "slm4_dump.obj is not this run's")
         for name in ("gpu_1p0_fixed.obj", "superslm_gpu_pristine.obj"):
             self.assertEqual((self.obj / "gpu_fixed_noslm5" / name).read_bytes(), b"stub object", name)
         self.assertFalse((self.obj / "slm4_blob.bin").exists(), "an earlier run's slm4_blob.bin survived")

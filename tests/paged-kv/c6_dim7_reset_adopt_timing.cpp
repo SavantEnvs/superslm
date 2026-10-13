@@ -124,15 +124,19 @@ bool Publish74(const std::string& path,const std::string& pid){
 	if(error!=ERROR_ALREADY_EXISTS&&error!=ERROR_FILE_EXISTS&&error!=ERROR_ACCESS_DENIED)Refuse(77,"C6 timing lock create failed");
 	return false;
 }
-// True when this call recovered a stale lock for this process; false when the file went away or was held open
-// without write sharing (retry the fresh acquire).
+// True when this call recovered a stale lock for this process; false when the file went away, was held open
+// without write sharing, or is pending delete (retry the fresh acquire).
 bool Recover74(const std::string& path,const std::string& pid){
 	// No delete sharing: while this handle is open nothing can delete the file, so the path still names it.
 	const HANDLE handle=CreateFileA(path.c_str(),GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
 	if(handle==INVALID_HANDLE_VALUE){
 		const DWORD error=GetLastError();
-		if(error==ERROR_SHARING_VIOLATION){Sleep(50);return false;}
-		if(error==ERROR_FILE_NOT_FOUND||error==ERROR_ACCESS_DENIED)return false;
+		// A sharing violation (an open without write sharing) or access denied (the file is pending delete: a release
+		// deleted it while another handle was still open, and Publish74 also fails with access denied until the last
+		// handle closes) clears only with time, so wait before the next attempt; without it all kLock74Attempts finish
+		// in microseconds. A file that went away is retried at once.
+		if(error==ERROR_SHARING_VIOLATION||error==ERROR_ACCESS_DENIED){Sleep(50);return false;}
+		if(error==ERROR_FILE_NOT_FOUND)return false;
 		Refuse(77,"C6 timing lock open failed");
 	}
 	OVERLAPPED region{};region.Offset=static_cast<DWORD>(kLock74Byte&0xffffffff);region.OffsetHigh=static_cast<DWORD>(kLock74Byte>>32);
