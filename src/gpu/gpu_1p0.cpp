@@ -760,6 +760,17 @@ struct SslmGpuSequenceHandle final : public superslm_gpu::inflight::InFlightHand
 	// (gpu_1p0.cpp) -- identical disposition here.
 	bool destroyed = false;
 
+	// The same-sequence decode claim (t2112 dim3 M2, the 1.13 box finding): taken with one atomic
+	// exchange by every decode submission on this handle (SeqDecodeClaim, below) before it reads
+	// `state`, and held until the call returns, by which time a submission that succeeded has moved
+	// the handle to Submitted. A second thread's decode of the SAME handle that finds it held
+	// returns SSLM_BUSY and touches nothing. Without it the Idle check, EntrySubmitGuard and
+	// BeginRecording()'s ledger check are three unlocked reads, so two threads on one handle could
+	// all pass them and record into the singleton's one command list at once (heap corruption under
+	// the D3D12 debug layer, a winevulkan abort on the software GPU, or a silent Ok/Ok). It never
+	// blocks and never serialises different handles: P1's precondition (§4.4) still binds those.
+	std::atomic<bool> decode_claimed{false};
+
 private:
 	friend void SetGpuSeqState(SslmGpuSequenceHandle*, superslm_gpu::SslmSequenceGpuState,
 	                           const SslmGpuAdapterHandle*);
@@ -848,6 +859,25 @@ void SetGpuSeqState(SslmGpuSequenceHandle* seq, superslm_gpu::SslmSequenceGpuSta
 }
 
 namespace {
+
+// The same-sequence decode claim's scope (SslmGpuSequenceHandle::decode_claimed): held() is false
+// when another thread's decode of the same handle holds it, and the caller then returns SSLM_BUSY
+// (the single call) or writes it to the slot (the batch) without touching the handle.
+class SeqDecodeClaim {
+public:
+	explicit SeqDecodeClaim(SslmGpuSequenceHandle* seq) noexcept
+	    : seq_(seq), held_(!seq->decode_claimed.exchange(true, std::memory_order_acq_rel)) {}
+	~SeqDecodeClaim() {
+		if (held_) seq_->decode_claimed.store(false, std::memory_order_release);
+	}
+	SeqDecodeClaim(const SeqDecodeClaim&) = delete;
+	SeqDecodeClaim& operator=(const SeqDecodeClaim&) = delete;
+	bool held() const noexcept { return held_; }
+
+private:
+	SslmGpuSequenceHandle* const seq_;
+	const bool held_;
+};
 
 // Paged KV (G3): the host buffer a sequence's K/V view addresses -- the pool's mirror for a pooled
 // sequence, its own dedicated mirror otherwise -- and its size.
@@ -2785,6 +2815,12 @@ SslmGpuStatus sslm_decode_step_gpuImpl(SslmGpuContext* ctx, SslmGpuSequenceHandl
 		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;  // same "no channel exists for a malformed
 		                                           // handle" disposition as the seq check above.
 	}
+	// The same-sequence claim, before the state read (t2112 dim3 M2): a second thread's decode of
+	// this handle is refused here, so only one call at a time runs the checks below and submits.
+	const SeqDecodeClaim claim(seq);
+	if (!claim.held()) {
+		return SSLM_BUSY;  // the state machine's own collision signal; nothing was touched.
+	}
 	const bool is_submitted = seq->state() == superslm_gpu::SslmSequenceGpuState::Submitted;
 	if (!superslm_gpu::CallProceedsOrBusy_DecodeStepGpu(is_submitted)) {
 		return SSLM_BUSY;  // design Sec4.2's own state table, unchanged policy.
@@ -2938,6 +2974,13 @@ SslmGpuStatus sslm_decode_step_batch_gpuImpl(SslmGpuContext* ctx, SslmGpuSequenc
 		                                                        // adapter mapped against a
 		                                                        // different context.
 			out_statuses[i] = SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+			continue;
+		}
+		// The same-sequence claim (t2112 dim3 M2), held for this slot's submission and its drain:
+		// another thread's decode of this handle makes the slot Busy, untouched.
+		const SeqDecodeClaim claim(seq);
+		if (!claim.held()) {
+			out_statuses[i] = SSLM_BUSY;
 			continue;
 		}
 		const bool is_submitted = seq->state() == superslm_gpu::SslmSequenceGpuState::Submitted;
