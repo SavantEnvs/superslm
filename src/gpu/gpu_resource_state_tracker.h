@@ -273,6 +273,13 @@ inline StateTrackingCounts StateTrackingViolations() { return StateTrackingCount
 inline constexpr bool kStateTrackingBuild = false;
 #endif
 
+// A debug name on a long-lived or per-submission buffer, so the box's debug layer and GPU-based
+// validation name the buffer in each message instead of "Unnamed ID3D12Resource Object". No effect on
+// what any submission does; a failure to set it is ignored.
+inline void NameBuffer(ID3D12Resource* r, const wchar_t* name) {
+	if (r != nullptr) (void)r->SetName(name);
+}
+
 // ---- the recording helpers ----------------------------------------------------------------------
 
 // One transition barrier on `r`, StateBefore -> StateAfter.
@@ -291,6 +298,23 @@ inline void RecordTransition(ID3D12GraphicsCommandList* list, ID3D12Resource* r,
 	(void)at;
 #endif
 	list->ResourceBarrier(1, &b);
+}
+
+// The K/V resume latch (gpu_1p0.h; a dedicated handle's own, a pooled handle's its pool's) names one of
+// the two states a K/V buffer rests in between submissions: set, the last executed submission's readback
+// left it in COPY_SOURCE; clear, it is in UNORDERED_ACCESS. Every barrier that leaves a resting K/V
+// buffer goes through RecordKvTransitionFromLatch, so the latch-to-state rule is written once. It
+// records nothing when the buffer is already in `after`. The caller still owns the latch's writes: the
+// readback sets it, the pool upload clears it once its wait returned, and a submission that did not
+// execute restores the value it found.
+inline D3D12_RESOURCE_STATES KvLatchState(bool latch_set) {
+	return latch_set ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+}
+inline void RecordKvTransitionFromLatch(ID3D12GraphicsCommandList* list, ID3D12Resource* kv, bool latch_set,
+                                        D3D12_RESOURCE_STATES after,
+                                        const std::source_location at = std::source_location::current()) {
+	const D3D12_RESOURCE_STATES before = KvLatchState(latch_set);
+	if (before != after) RecordTransition(list, kv, before, after, at);
 }
 
 // `n` barriers as recorded (transitions are tracked; UAV and aliasing barriers change no state).

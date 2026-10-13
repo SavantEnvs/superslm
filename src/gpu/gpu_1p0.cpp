@@ -2130,6 +2130,7 @@ SslmGpuStatus sslm_gpu_seq_createImpl(SslmGpuContext* ctx, SslmGpuModelHandle* m
 	std::vector<uint8_t> zero_kv(kv_bytes_needed, 0);
 	try {
 		h->kv_buf = UploadResidentUavBufferSync(ctx->device, zero_kv.data(), zero_kv.size());
+		superslm_gpu::harness::NameBuffer(h->kv_buf.Get(), L"SuperSLM dedicated K/V");
 	} catch (const std::bad_alloc&) {
 		throw;
 	} catch (const std::exception&) {
@@ -2314,6 +2315,7 @@ SslmGpuStatus sslm_gpu_kv_pool_createImpl(SslmGpuContext* ctx, SslmGpuModelHandl
 	h->page_count = page_count;
 	h->pool_bytes = static_cast<size_t>(bytes);
 	h->pool_buf = fill.resident;
+	superslm_gpu::harness::NameBuffer(h->pool_buf.Get(), L"SuperSLM K/V page pool");
 	h->kv_needs_resume_barrier = false;  // left in UNORDERED_ACCESS by the zero-fill's barrier
 	ctx->live_handles += 1;
 	model->live_pools += 1;
@@ -2366,6 +2368,7 @@ SslmGpuStatus sslm_gpu_seq_create_budgetedImpl(SslmGpuContext* ctx, SslmGpuModel
 		h->table_buf = ctx->device.MakeBuffer(static_cast<UINT64>(pool->geo.cap_pages) * sizeof(uint32_t),
 		                                      D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
 		                                      D3D12_RESOURCE_STATE_COMMON);
+		superslm_gpu::harness::NameBuffer(h->table_buf.Get(), L"SuperSLM K/V page table");
 	} catch (...) {
 		superslm::kv_pages::HolderRelease(holder);
 		return ClassifyHandleFault(&ctx->device);
@@ -3659,6 +3662,7 @@ SslmGpuStatus sslm_gpu_seq_restoreImpl(SslmGpuContext* ctx, SslmGpuModelHandle* 
 	try {
 		fresh->kv_buf = UploadResidentUavBufferSync(ctx->device, fresh->host_kv_mirror.data(),
 		                                             fresh->host_kv_mirror.size());
+		superslm_gpu::harness::NameBuffer(fresh->kv_buf.Get(), L"SuperSLM dedicated K/V (restored)");
 	} catch (const std::bad_alloc&) {
 		sslm_gpu_seq_release(ctx, fresh);
 		throw;
@@ -5155,10 +5159,8 @@ void SubmitPoolUploadSync(superslm_gpu::harness::Device& dev, SslmGpuKvPoolHandl
 	// stranded check, the boundary guard check and PoolSubmitAssert before it.
 	dev.BeginRecording();
 	// ---- no allocation and no throw from here to CloseListOrThrow ----
-	superslm_gpu::harness::RecordTransition(dev.list.Get(), pool->pool_buf.Get(),
-	                                        pool->kv_needs_resume_barrier ? D3D12_RESOURCE_STATE_COPY_SOURCE
-	                                                                      : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-	                                        D3D12_RESOURCE_STATE_COPY_DEST);
+	superslm_gpu::harness::RecordKvTransitionFromLatch(dev.list.Get(), pool->pool_buf.Get(), pool->kv_needs_resume_barrier,
+	                                                  D3D12_RESOURCE_STATE_COPY_DEST);
 	const uint64_t page_bytes = pool->geo.page_bytes;
 	uint64_t at = 0;
 	for (const superslm_gpu::PoolUploadRegion& r : regions) {
@@ -5216,6 +5218,7 @@ SslmGpuStatus MakePooledSeqUnpublished(SslmGpuContext* ctx, SslmGpuModelHandle* 
 		h->table_buf = ctx->device.MakeBuffer(static_cast<UINT64>(pool->geo.cap_pages) * sizeof(uint32_t),
 		                                      D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
 		                                      D3D12_RESOURCE_STATE_COMMON);
+		superslm_gpu::harness::NameBuffer(h->table_buf.Get(), L"SuperSLM K/V page table");
 	} catch (...) {
 		superslm::kv_pages::HolderRelease(holder);
 		return ClassifyHandleFault(&ctx->device);
