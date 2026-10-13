@@ -276,23 +276,27 @@ figures. The full contract is in
 character a budgeted sequence (`sslm_gpu_seq_create_budgeted`) that adopts its persona
 (`sslm_gpu_seq_adopt_prefix`). Decode, batch and finish them with the calls you already use.
 
-- A budgeted GPU sequence stops with `SSLM_GPU_KV_BUDGET_EXCEEDED` at its budget, and a pool that
+- A budgeted GPU sequence stops with `SSLM_GPU_KV_BUDGET_EXCEEDED` at its budget (a prompt
+  that runs past the budget keeps the tokens that fit and returns the same status), and a pool that
   cannot hold another reservation refuses the create with `SSLM_GPU_KV_POOL_EXHAUSTED`, so you find
   out at create time, not mid-reply.
 - Its save is a new format, `SLM6`, sized by its live tokens. Restore it with
   `sslm_gpu_seq_restore_into_pool` and pass the persona's prefix handle so it shares again. Older
   releases cannot read `SLM6`.
-- Sequences made by `sslm_gpu_seq_create` keep their own whole-context buffer and keep saving
-  `SLM5`, as before.
+- Sequences made by `sslm_gpu_seq_create` keep their own buffer, sized by the context cap you pass,
+  and keep saving `SLM5`, as before.
 - The GPU's page is smaller than the CPU's (16 positions for converted models), so the same cast
   takes a different number of pages on each backend: in the example above, 1,842 GPU pages (172.7
-  MiB) instead of 50 whole-context GPU sequences' 1,200 MiB. That admission is confirmed on the real
-  0.5B artifact on the RTX 2080 SUPER.
+  MiB). Fifty ordinary GPU sequences would take 1,200 MiB at the full 4,096-token context, or about
+  502 MiB if each is created with only the 1,712 positions it needs, so the pool's saving depends on
+  how you would have sized them. The 1,842-page admission is confirmed on the real 0.5B artifact on
+  the RTX 2080 SUPER.
 
-What it costs: on the RTX 2080 SUPER at Qwen2.5-0.5B, decoding a cast member through the page pool
-was measured against a whole-context sequence of the same build, to 1,712 tokens, and stayed within
-the 5% bar this release holds it to (the reading was about 1% faster, which is not promised). Nothing
-is measured on the AMD card, at 1.5B or for batched decode yet. Two older GPU behaviours now return
+What it costs: on the RTX 2080 SUPER at Qwen2.5-0.5B, decoding one cast member through the page pool
+was measured against a whole-context sequence of the same build, from 1,200 to 1,712 tokens, in one
+run, and stayed within the 5% bar this release holds it to (the reading was about 1% faster, which is
+not promised). Nothing is measured on the AMD card, at 1.5B, at shorter contexts or for batched
+decode yet. Two older GPU behaviours now return
 `SSLM_BUSY` instead of being undefined: a second GPU submission while earlier work has not been
 seen to complete (call `sslm_gpu_ready` before the next submission, or use the batch call), and two
 threads decoding the same sequence. The

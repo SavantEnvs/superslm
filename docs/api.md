@@ -288,10 +288,18 @@ GPU's `B`.
 
 - `sslm_gpu_seq_create_budgeted(ctx, model, pool, budget, &seq)` takes
   `1 ≤ budget ≤ cap` and draws `R(budget)` pages, or returns
-  `SSLM_GPU_KV_POOL_EXHAUSTED` with nothing drawn. It writes up to its limit,
-  `min(origin + budget, cap)`; a write at the limit below the cap is
-  `SSLM_GPU_KV_BUDGET_EXCEEDED` with no row written, and at the cap the
-  existing cap behaviour applies. The other sequence calls (embed, both
+  `SSLM_GPU_KV_POOL_EXHAUSTED` with nothing drawn. Its cap is the model's
+  context cap (the artifact's `context_cap`); unlike `sslm_gpu_seq_create`,
+  the host does not choose it. It writes up to its limit,
+  `min(origin + budget, cap)`. Below the cap, a decode at the limit is
+  `SSLM_GPU_KV_BUDGET_EXCEEDED` with no row written; a prefill that reaches
+  the limit commits the tokens below it, sets the ready flag when any
+  landed (so the next bridge decode finishes the last of them and ignores
+  its token argument), leaves no prefill snapshot, and returns
+  `SSLM_GPU_KV_BUDGET_EXCEEDED`. The schema-content bridge's `*consumed`
+  counts the committed tokens; the prompt bridge reports no count (it is
+  the room the budget had left). At the cap the existing cap behaviour
+  applies. The other sequence calls (embed, both
   decodes, `sslm_gpu_ready`, the prefill and finish bridges, schema binding,
   adapter binding, reset, release) take it as they take a dedicated
   sequence; its reset and release touch only its own pages.
@@ -308,10 +316,14 @@ GPU's `B`.
 - `sslm_gpu_seq_adopt_prefix(ctx, seq, prefix)` adopts a frozen prefix onto
   a pooled sequence with the CPU adopt's field and schema rules: full pages
   mapped shared, the tail rows copied. Every check runs before any state
-  change. A prefix that is not frozen, or of another pool, is
-  `SSLM_GPU_PREFIX_REJECTED`; a dedicated sequence is
-  `SSLM_GPU_HOLDER_MODE_MISMATCH`; a schema mismatch is
-  `SSLM_GPU_PREFIX_SCHEMA_MISMATCH`.
+  change. A prefix of another model is `SSLM_SEQUENCE_KV_BUFFER_MISMATCH`;
+  a dedicated sequence is `SSLM_GPU_HOLDER_MODE_MISMATCH`; a prefix that is
+  not frozen, or of another pool of the same model, is
+  `SSLM_GPU_PREFIX_REJECTED`; a schema mismatch is
+  `SSLM_GPU_PREFIX_SCHEMA_MISMATCH`. One failure comes after the checks: if
+  the upload of the prefix's partial last page fails, the adopt returns the
+  fault's status and leaves the sequence reset (its earlier history gone,
+  its bind permission granted again).
 - A shared page is freed when the prefix and every holder that maps it have
   let go of it.
 - A handle of another context or model, or a budget outside `[1, cap]`, is
@@ -345,8 +357,8 @@ writes the size it needs to `*out_blob_size` and returns the status the
   `*out_shared_pages` counts them; a null or non-matching prefix gives a
   private restore with `*out_shared_pages = 0`. Its refusals, in order, each
   changing nothing: malformed handles and arguments; `SSLM_BUSY` while any
-  sequence is Submitted; a blob that is not `SLM6`,
-  `SSLM_GPU_HOLDER_MODE_MISMATCH`; the body, with `sslm_gpu_seq_restore`'s
+  sequence is Submitted; a blob whose magic is not `SLM6` (`SLM5`, `SLM4`
+  or any other bytes), `SSLM_GPU_HOLDER_MODE_MISMATCH`; the body, with `sslm_gpu_seq_restore`'s
   statuses; `SSLM_GPU_KV_POOL_EXHAUSTED`, the first draw rolled back.
 - `sslm_gpu_seq_restore` is unchanged except that it refuses `SLM6` with
   `SSLM_GPU_HOLDER_MODE_MISMATCH`, allocating nothing.
@@ -364,12 +376,14 @@ a dedicated sequence, a model or an adapter returns `SSLM_BUSY` while a
 pooled sequence is Submitted. The other paged calls submit nothing and are
 never refused Busy.
 
-**Speed.** On the NVIDIA RTX 2080 SUPER at Qwen2.5-0.5B, cap 4,096,
-single-sequence decode of a pooled sequence that adopted a prefix is no
-more than 5% slower than a dedicated sequence of the same build, to width
-1,712. That is the only GPU speed statement; the
-[1.13.0 release note](releases/1.13.0.md) has the reading and what is not
-measured, the AMD card among it.
+**Speed.** On the NVIDIA RTX 2080 SUPER at Qwen2.5-0.5B, cap 4,096, one
+run measured single-sequence decode of one cohort member (a pooled
+sequence, budget 512, that adopted a 1,200-token prefix, in a pool of
+1,842 pages) from width 1,200 to 1,712, against a dedicated sequence of
+the same build, and it was no more than 5% slower. Widths below 1,200, a
+pooled sequence without an adopted prefix, other pool occupancies and the
+AMD card are not measured. That is the only GPU speed statement; the
+[1.13.0 release note](releases/1.13.0.md) has the reading.
 
 ### Thread safety
 
@@ -407,10 +421,16 @@ sequence returns `SSLM_BUSY` before its unreachable-first-token
 `SSLM_SEQUENCE_REJECTED`, as it has since 1.6.0.
 
 Two threads driving the *same* sequence handle concurrently is not a
-supported use. From 1.13.0 two decode calls raced on one handle stay
+supported use. From 1.13.0 the four decode entry points,
+`sslm_decode_step_gpu`, each slot of `sslm_decode_step_batch_gpu`,
+`SslmGpuSeqDecodeStepForG5Bridge` and `SslmGpuSeqFinishTokenForG5Bridge`,
+take a per-handle claim before they read the handle and hold it until they
+return, so two of them raced on one handle, in any pairing, stay
 memory-safe: one runs and the other returns `SSLM_BUSY` having changed
-nothing (a batch slot reads `SSLM_BUSY`). Other calls raced on one handle
-remain the caller's to serialize.
+nothing (a batch slot reads `SSLM_BUSY`). The claim lasts one call, so one
+thread's submit, `sslm_gpu_ready` and finish each take it in turn. Other
+calls raced on one handle (embed, the prefill bridges, reset, save, schema
+binding, release) remain the caller's to serialize.
 
 ### Status causes
 
@@ -463,14 +483,14 @@ exactly-once contract, retryable through a correct hook; and
 Six cover paged K/V (1.13.0, ordinals 24 to 29; see
 [Paged KV memory on the GPU](#paged-kv-memory-on-the-gpu-1130)):
 `SSLM_GPU_KV_BUDGET_EXCEEDED`, a budgeted sequence or prefix writing at its
-limit below the cap; `SSLM_GPU_KV_POOL_EXHAUSTED`, a pool too short for a
+limit below the cap (a prefill commits the tokens below the limit first); `SSLM_GPU_KV_POOL_EXHAUSTED`, a pool too short for a
 create, prefix, `begin_from` or restore, with nothing drawn;
 `SSLM_GPU_KV_POOL_TOO_LARGE`, a pool above 2^32 bytes;
 `SSLM_GPU_HOLDER_MODE_MISMATCH`, a pooled and a dedicated holder mixed (an
 adopt onto a dedicated sequence, an `SLM6` blob given to
-`sslm_gpu_seq_restore`, anything but `SLM6` given to
+`sslm_gpu_seq_restore`, a blob whose magic is not `SLM6` given to
 `sslm_gpu_seq_restore_into_pool`); `SSLM_GPU_PREFIX_REJECTED`, a prefix verb
-refused on the prefix's state (not frozen, another pool, prefill after
+refused on the prefix's state (not frozen, another pool of the same model, prefill after
 freeze, a schema bind it can no longer take); and
 `SSLM_GPU_PREFIX_SCHEMA_MISMATCH`, an adopt whose schema binding does not
 match the prefix's.
