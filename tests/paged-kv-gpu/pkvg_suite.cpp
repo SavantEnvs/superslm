@@ -54,7 +54,8 @@ const Job kJobs[] = {
     {"pkvg/g4", 4, 4, "pkvg_g4.exe", PKVG_COMMON " " PKVG_G1C, "fx"},
     {"pkvg/g5", 5, 5, "pkvg_g5.exe", PKVG_COMMON " " PKVG_G1C, "fx"},
     // Allocation-fault engine: 11.4/G3, and its zero-fill leg alone in a fresh process (terminal context).
-    {"11.4/G3", 3, 0, "pkvg_alloc_g3.exe", PKVG_COMMON " 11.4/G3", "fx"},
+    // Not PKVG_COMMON: pkvg_alloc_g3 links group g1b only, which takes no --gpu-ref (an untaken flag fails the run).
+    {"11.4/G3", 3, 0, "pkvg_alloc_g3.exe", "--pkv-fixtures={fx} --pkv-reference={ref} --model05={m05} --model15={m15} 11.4/G3", "fx"},
     {"11.4/G3:zerofill", 3, 0, "pkvg_alloc_g3.exe", "--pkv-fixtures={fx} =11.4/G3:zerofill", "fx"},
     // review-g23 F2: the pooled release that meets a refcount underflow still finishes.
     {"11.3/G3:release", 3, 0, "pkvg_alloc_g3.exe", "--pkv-fixtures={fx} =11.3/G3:release", "fx"},
