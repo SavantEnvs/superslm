@@ -1,6 +1,7 @@
 """Apply one T-2851 production mutant in the isolated scratch worktree.
 
-Use from D:/_slm170 with --tree D:/_t2956-mutants/src. Every invocation
+Use from D:/_slm170 with --tree D:/_t2956-mutants/src (or, on a box that keeps scratch under
+D:\_scratch, any linked worktree with --scratch-tree --expect-head <its HEAD>). Every invocation
 restores the prior production mutation first; this script never touches the
 main checkout. The caller builds and executes the named test cell afterward.
 
@@ -374,17 +375,29 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("ident", help="mutant id, or reset, or 'all' with --check")
     parser.add_argument("--tree", type=Path, default=Path(r"D:\_t2956-mutants\src"))
+    parser.add_argument("--scratch-tree", action="store_true",
+           help="edit --tree although it is not D:\\_t2956-mutants\\src: it must be a linked git worktree "
+                "(never a main checkout), as the box keeps scratch under D:\\_scratch")
+    parser.add_argument("--expect-head", default="c9081e0fd33fccabf52e3fb247ad2f51efb74e6e",
+                        help="the commit the scratch worktree must be at (default: the pinned builder commit)")
     parser.add_argument("--check", action="store_true",
                         help="read-only: report whether the mutant's anchors land in --tree (any tree)")
     args = parser.parse_args()
     if args.check:
         return check(args.tree.resolve(), ALL_MUTANTS if args.ident == "all" else [args.ident])
     tree = args.tree.resolve()
-    if tree != Path(r"D:\_t2956-mutants\src").resolve():
+    if args.scratch_tree:
+        git_dir = subprocess.run(["git", "-C", str(tree), "rev-parse", "--absolute-git-dir"],
+                                 capture_output=True, text=True, check=True).stdout.strip()
+        common = subprocess.run(["git", "-C", str(tree), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        if Path(git_dir).resolve() == Path(common).resolve():
+            raise RuntimeError(f"refusing to edit a main checkout; --scratch-tree needs a linked worktree: {tree}")
+    elif tree != Path(r"D:\_t2956-mutants\src").resolve():
         raise RuntimeError(f"refusing to edit a tree outside the dedicated scratch worktree: {tree}")
     if subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"], capture_output=True,
-                      text=True, check=True).stdout.strip() != "c9081e0fd33fccabf52e3fb247ad2f51efb74e6e":
-        raise RuntimeError("scratch worktree is not at the pinned builder commit")
+                      text=True, check=True).stdout.strip() != args.expect_head:
+        raise RuntimeError(f"scratch worktree is not at the expected commit {args.expect_head}")
     subprocess.run(["git", "-C", str(tree), "restore", "--", *FILES], check=True)
     if args.ident == "reset":
         print("RESET")
