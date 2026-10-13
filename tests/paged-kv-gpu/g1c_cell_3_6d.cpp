@@ -288,9 +288,11 @@ void G3PrecedenceFinishHostLogits() {
 	p.expect_idle = {SSLM_OK};
 	PrecedenceRun(p);
 }
-// Today's status of the embed's refusal of -1 is SSLM_TOKEN_ID_OUT_OF_RANGE (gpu_1p0.cpp's embed, and
-// §7's own follow-on sentence for this cell). §7's bracket for this run reads SSLM_SEQUENCE_REJECTED;
-// §4.4's rule is "today's status otherwise", so the run asserts today's (notes: plan ambiguity).
+// Today's status of the embed's refusal of -1 is SSLM_TOKEN_ID_OUT_OF_RANGE: the code (gpu_1p0.cpp's
+// embed), gpu_1p0.h (sslm_gpu_seq_embed_token: a token outside [0, vocab_size) returns TokenIdOutOfRange;
+// the precedence list: the bridge decode returns "the embed's refusals"), and §7's own follow-on sentence
+// for this cell. §7's bracket for this run reads SSLM_SEQUENCE_REJECTED, which disagrees with all three;
+// §4.4's rule is "today's status otherwise", so the run asserts today's (notes: plan ambiguity, reported).
 void G3PrecedenceBridgeEmbedRefusal() {
 	PrecedenceSpec p;
 	p.name = "3.6d/G3 bridge decode, the embed's refusal (token -1)";
@@ -606,10 +608,10 @@ void G5ResaveBatch() { Run(SpecBatch(AKind::PooledSamePool), "3.6d/G5 re-save", 
 void G5ResavePromptPrefill() { Run(SpecPromptPrefill(AKind::PooledSamePool), "3.6d/G5 re-save", true); }
 void G5ResaveSchemaPrefill() { Run(SpecSchemaPrefill(AKind::PooledSamePool), "3.6d/G5 re-save", true); }
 void G5ResaveAdopt() { Run(SpecAdopt(AKind::PooledSamePool), "3.6d/G5 re-save", true); }
-// §4.10's order puts the magic after the guard. With nothing Submitted the plan states two statuses
-// for a bad magic on this verb: §7 3.6d's G5 part says SSLM_SEQUENCE_KV_BUFFER_MISMATCH, and §4 item 10
-// says anything that is not an SLM6 budget blob is refused SSLM_GPU_HOLDER_MODE_MISMATCH. Both are
-// accepted until the planner settles it (notes: plan ambiguity); the separating leg is the Busy one.
+// §4.10's order puts the magic after the guard. With nothing Submitted a blob whose magic is not 'SLM6'
+// is refused SSLM_GPU_HOLDER_MODE_MISMATCH: §4 item 10's reading (anything that is not an SLM6 budget
+// blob), gpu_1p0.h's step (3) for this verb, and the code (gpu_1p0.cpp's magic check). §7 3.6d's G5
+// part reads SSLM_SEQUENCE_KV_BUFFER_MISMATCH; the §4.10 reading was taken over it (coverage audit 1.13 §3).
 void G5PrecedenceRestoreIntoPoolBadMagic() {
 	PrecedenceSpec p;
 	p.name = "3.6d/G5 restore-into-pool of a bad magic";
@@ -624,7 +626,7 @@ void G5PrecedenceRestoreIntoPoolBadMagic() {
 		G1C_CHECK(!w.out_seq, "restore-into-pool of a bad magic: a non-null out-handle");
 		return st;
 	};
-	p.expect_idle = {SSLM_SEQUENCE_KV_BUFFER_MISMATCH, SSLM_GPU_HOLDER_MODE_MISMATCH};
+	p.expect_idle = {SSLM_GPU_HOLDER_MODE_MISMATCH};
 	PrecedenceRun(p);
 }
 #endif  // PKVG_STEP >= 5

@@ -9,7 +9,8 @@
 //        dedicated buffer to the saved limit (rev 3's text): it returns SSLM_OK.
 //   A14  sslm_gpu_seq_restore_into_pool of an SLM5 and of an SLM4, each with a null prefix and with a
 //        matching prefix handle (9.12's refused case (a): a non-budget blob with a handle): the
-//        status, a null out-handle, and the GPU fill probe unchanged.
+//        status, a null out-handle, and the GPU fill probe unchanged. Also an unknown magic ('SLMX' over
+//        the SLM5 operand), "any non-budget blob": the same status, null out, fill probe unchanged.
 //   §4.10 precedence, step 3 before step 4: an SLM6 with hostile fields (each of 2.3's) given to the
 //        dedicated verb is a mode mismatch, whatever the field; step 4: an SLM6 whose kv_mode is not
 //        budget given to the into-pool verb fails validation with SSLM_SEQUENCE_KV_BUFFER_MISMATCH
@@ -169,6 +170,11 @@ void A14AndStep4(const Env& e, const Blobs& b) {
 		const char* hp = with_prefix ? " with the matching prefix" : " with a null prefix";
 		RefusedIntoPool(e, b.slm5, with_prefix != 0, GS::SSLM_GPU_HOLDER_MODE_MISMATCH, std::string("9.13 A14 SLM5") + hp);
 		RefusedIntoPool(e, b.slm4, with_prefix != 0, GS::SSLM_GPU_HOLDER_MODE_MISMATCH, std::string("9.13 A14 SLM4") + hp);
+		// "Any non-budget blob": an unknown magic is not 'SLM6', so the magic step refuses it (§4.10 step 3,
+		// gpu_1p0.h's step (3)); kills a magic check that refuses only the named 'SLM5'/'SLM4'.
+		std::vector<uint8_t> unk = b.slm5;
+		std::memcpy(unk.data(), "SLMX", 4);
+		RefusedIntoPool(e, unk, with_prefix != 0, GS::SSLM_GPU_HOLDER_MODE_MISMATCH, std::string("9.13 A14 unknown magic") + hp);
 	}
 	// §4.10 step 4: an SLM6 whose kv_mode is not budget fails validation (2.6's status), not the magic.
 	std::vector<uint8_t> wr = b.slm6;
