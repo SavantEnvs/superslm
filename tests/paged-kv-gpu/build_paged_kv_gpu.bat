@@ -12,6 +12,9 @@ rem   --shaders  default <repo>\out\shaders (build.bat's), else <repo>\build\Rel
 rem   --gpu-dir  a whole copy of src\gpu: how a mutant engine is built (3.12's and 11.4's commissioning runs)
 rem   --old-tree the v1.12.0 checkout (5d5ca58) for 9.8's leg 2; --old-cpu-lib its CPU library
 rem              (default <old-tree>\build\Release\superslm.lib)
+rem   --state-tracking  build engine and cells with /DSUPERSLM_GPU_STATE_TRACKING (src\gpu\gpu_resource_state_tracker.h,
+rem              as build_paged_kv_gpu_mingw.sh --state-tracking): "# GPU STATE VIOLATION" lines and an exit summary.
+rem              Default --out becomes <repo>\build\pkvg-track, so tracking and plain objects never mix.
 rem
 rem Each executable is reported LINKED, RED BY LINK (its LNK2019/LNK2001 lines), or RED BY COMPILE. RED BY
 rem LINK is the expected state of every executable of a step that has not landed: a step's executables link
@@ -39,11 +42,14 @@ set GPUDIR=%ENG%\src\gpu
 set OLDTREE=
 set OLDCPULIB=
 set TARGETS=
+set TRACK=
+set OUTGIVEN=
 :parse_args
 if "%~1"=="" goto :args_done
 set "ARG=%~1"
 set "TAKEN="
-if "!ARG:~0,6!"=="--out=" ( set "OUT=!ARG:~6!" & set "TAKEN=1" )
+if "!ARG:~0,6!"=="--out=" ( set "OUT=!ARG:~6!" & set "OUTGIVEN=1" & set "TAKEN=1" )
+if "!ARG!"=="--state-tracking" ( set "TRACK=1" & set "TAKEN=1" )
 if "!ARG:~0,10!"=="--shaders=" ( set "SHADERS=!ARG:~10!" & set "TAKEN=1" )
 if "!ARG:~0,10!"=="--gpu-dir=" ( set "GPUDIR=!ARG:~10!" & set "TAKEN=1" )
 if "!ARG:~0,11!"=="--old-tree=" ( set "OLDTREE=!ARG:~11!" & set "TAKEN=1" )
@@ -53,6 +59,7 @@ shift
 goto :parse_args
 :args_done
 if "%TARGETS%"=="" set TARGETS= g2 g3 g4 g5 g6
+if defined TRACK if not defined OUTGIVEN set OUT=%ENG%\build\pkvg-track
 if "%SHADERS%"=="" set SHADERS=%ENG%\out\shaders
 if not exist "%SHADERS%\*.cso" set SHADERS=%ENG%\build\Release\shaders
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -no_logo
@@ -62,6 +69,7 @@ set T2791=%ENG%\tests\t2791-gpu-prefill-read-red-suite
 set TE425=%ENG%\tests\te425-gpu-alloc-status-red-suite
 set CLF=/nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /I"%ENG%\include" /I"%ENG%\src" /I"%GPUDIR%" /I"%ENG%\tests" ^
  /I"%ENG%\tests\paged-kv" /I"%HEREDIR%." /I"%T2791%" /I"%TE425%"
+if defined TRACK set CLF=%CLF% /DSUPERSLM_GPU_STATE_TRACKING
 set DEF_plain=
 set DEF_alloc=/DSUPERSLM_GPU_ALLOC_FAULT_INJECTION /DSUPERSLM_GPU_TEST_SEAMS
 set DEF_t2169=/DSUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION
