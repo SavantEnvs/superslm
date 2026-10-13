@@ -555,7 +555,9 @@ SslmGpuStatus sslm_gpu_seq_reset(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq
  * sslm_decode_step_batch_gpu and sslm_gpu_ready(block=1)). This design does not build an internal
  * queue-level lock (see src/gpu/gpu_1p0.cpp's own SslmGpuContext comment for the grounded
  * reason). Two threads driving the SAME sequence handle concurrently is an unguarded caller
- * error, not a supported use (see the same comment). */
+ * error, not a supported use (see the same comment). From 1.13.0 two decode calls that race on one
+ * handle stay memory-safe: one runs and the other returns SSLM_BUSY having changed nothing (a batch
+ * slot reads SSLM_BUSY). Other verbs racing on one handle remain the caller's to serialize. */
 SslmGpuStatus sslm_decode_step_gpu(
     SslmGpuContext* ctx,
     SslmGpuSequenceHandle* seq,
