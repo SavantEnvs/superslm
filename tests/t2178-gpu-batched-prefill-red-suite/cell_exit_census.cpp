@@ -119,11 +119,11 @@ static void TestCensus_S1_DfaRejection(SslmGpuContext* ctx, SslmGpuModelHandle* 
 	sslm_gpu_seq_release(ctx, seq);
 }
 
-// Source-grounded ordering (src/gpu/gpu_1p0.cpp:2202-2217): the DFA `Transition` check runs
-// BEFORE the `seq->state != Idle` busy check inside SslmGpuSeqPrefillSchemaContentForG5Bridge --
-// a token that is not DFA-reachable from the walk state's current position returns
-// SSLM_SEQUENCE_REJECTED before the busy check is ever reached, which would make this cell
-// report the wrong exit path for the wrong reason. Finds a token the fixture's own schema
+// Ordering since v1.6.0 (663dd87; gpu_1p0.h's Status precedence): inside
+// SslmGpuSeqPrefillSchemaContentForG5Bridge an own-handle Submitted sequence returns SSLM_BUSY
+// first, and only an idle one reaches the DFA `Transition` check, where a token that is not
+// DFA-reachable from the walk state's position returns SSLM_SEQUENCE_REJECTED. A cell aimed at
+// one branch must not be decided by the other. Finds a token the fixture's own schema
 // actually admits from a fresh walk state, on a throwaway probe sequence, so the real cell below
 // exercises the busy branch specifically. SKIPs (never asserts a false claim) if none of the
 // probed range is DFA-reachable on this schema/fixture pairing.
