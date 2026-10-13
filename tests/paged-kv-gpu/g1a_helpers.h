@@ -10,7 +10,7 @@
 //     (--model05= / --model15=); a missing fixture fails the cell, never skips it;
 //   - the byte-equality oracle: tests/paged-kv/reference/v1.11.0_<fixture>.ref (step R0) through
 //     reference/pkv_scenarios.h's Stream and RowsFromBlock, and an in-process CPU paged twin driven
-//     through the 1.12.0 C ABI and read through the CPU's page peek and table seams;
+//     through the 1.12.0 C ABI and read from its saved blob (SSB5 or SSB6; CpuRows says why not the seams);
 //   - one scenario script per R0 scenario a cell needs, run on three backends (CPU paged, GPU pooled,
 //     GPU dedicated), so the GPU half and its CPU twin are the same calls;
 //   - the GPU K/V readers: a dedicated sequence's rows from its 'SLM5' blob (flat layout, B = cap),
@@ -70,12 +70,6 @@
 #include <new>
 #include <string>
 #include <vector>
-
-// ---- the CPU's test seams (C4; defined in every library build, src/sslm_abi.cpp) ---------------
-extern "C" sslm_status sslm_pkv_test_only_peek_page_bytes(sslm_kv_pool pool, uint32_t page_index, uint8_t* out_buf,
-                                                          size_t n);
-extern "C" sslm_status sslm_pkv_test_only_seq_table_entry(sslm_seq seq, uint32_t i, uint32_t* out_page,
-                                                          uint32_t* out_mapped);
 
 // ---- G3 seams this group needs and the plan does not name (see the header comment) ----------------
 // Table entry i (< mapped) of a pooled GPU sequence; reading at or past `mapped`, or on a dedicated
@@ -529,21 +523,47 @@ inline bool RowsFromTable(const Fx& fx, const std::vector<uint32_t>& table, int6
 	return true;
 }
 
-// A CPU holder's table (entries [0, mapped)) through the CPU's table seam.
-inline std::vector<uint32_t> CpuTable(sslm_seq s) {
-	std::vector<uint32_t> t;
-	uint32_t page = 0, mapped = 0;
-	if (sslm_pkv_test_only_seq_table_entry(s, 0, &page, &mapped) != SSLM_OK) return t;
-	for (uint32_t i = 0; i < mapped; ++i)
-		if (sslm_pkv_test_only_seq_table_entry(s, i, &page, nullptr) == SSLM_OK) t.push_back(page);
-	return t;
-}
-inline bool CpuRows(const Fx& fx, sslm_kv_pool pool, sslm_seq s, int64_t L, std::vector<uint8_t>* rows) {
-	return RowsFromTable(fx, CpuTable(s), L,
-	                     [&](uint32_t page, uint8_t* out) {
-		                     return sslm_pkv_test_only_peek_page_bytes(pool, page, out, fx.page_bytes) == SSLM_OK;
-	                     },
-	                     rows);
+// A CPU holder's rows [0, L) from its saved blob, as 1.12.0's own CPU cells read them (pkv_common.h's
+// BlobRows, pkv_scenarios.h's Run::Save), in pkv::RowsFromBlock's position-major order:
+//   - a no-budget (whole_reserve) holder saves 1.9.0's 'SSB5', whose K/V section, the blob's last
+//     sslm_kv_block_size bytes, is the whole block in the flat layout (context_cap positions);
+//   - a budget holder saves 'SSB6': the 172-byte header, the residual (hidden_size), the history (4 bytes
+//     each; history_count u64 at 112), kv_positions u64 = L', then rows [0, L') in the canonical layout
+//     (the flat layout with context_cap replaced by L').
+// Not through the CPU's page seams: since 1.12.0 the CPU's B is §3.1's rule (sslm_kv_page_positions, 128
+// on pkv_def and 64 on pkv_qk) with rotated page slots, not the artifact's kv_block_size that Fx::B,
+// page_bytes and InPage are written at, so a table read at this file's geometry finds too few pages
+// ("rows unreadable") or reads the wrong bytes. The blob's layout does not depend on B.
+inline bool CpuRows(const Fx& fx, sslm_seq s, int64_t L, std::vector<uint8_t>* rows) {
+	rows->clear();
+	size_t need = 0;
+	if (sslm_seq_save(s, nullptr, &need) != SSLM_BUFFER_TOO_SMALL || need == 0) return false;
+	std::vector<uint8_t> b(need, 0);
+	size_t wrote = need;
+	if (sslm_seq_save(s, b.data(), &wrote) != SSLM_OK) return false;
+	b.resize(wrote);
+	if (L < 0 || L > fx.geo.context_cap || b.size() < 4) return false;
+	if (std::memcmp(b.data(), "SSB5", 4) == 0) {
+		const size_t block = sslm_kv_block_size(fx.cpu);
+		if (block == 0 || b.size() < block) return false;
+		*rows = pkv::RowsFromBlock(b.data() + b.size() - block, fx.geo, L);
+		return true;
+	}
+	if (std::memcmp(b.data(), "SSB6", 4) != 0 || b.size() < 172) return false;
+	uint64_t history = 0, lprime = 0;
+	std::memcpy(&history, b.data() + 112, 8);
+	if (history > b.size()) return false;
+	const size_t at = 172 + fx.hidden + 4 * static_cast<size_t>(history);
+	if (at + 8 > b.size()) return false;
+	std::memcpy(&lprime, b.data() + at, 8);
+	const size_t per_pos = size_t{fx.geo.layers} * 2u * fx.geo.kv_heads * fx.geo.head_dim * fx.elem;
+	if (static_cast<uint64_t>(L) > lprime || lprime > static_cast<uint64_t>(fx.geo.context_cap) ||
+	    b.size() - (at + 8) < lprime * per_pos)
+		return false;
+	pkv::Geometry g = fx.geo;
+	g.context_cap = static_cast<int64_t>(lprime);
+	*rows = pkv::RowsFromBlock(b.data() + at + 8, g, L);
+	return true;
 }
 
 // A pooled GPU sequence's table through the G3 table seam, and its rows through the GPU mirror peek.
@@ -708,7 +728,7 @@ struct CpuPagedBackend : Backend {
 		return sslm_seq_adopt_prefix(static_cast<sslm_seq>(s), static_cast<sslm_prefix>(p));
 	}
 	bool Rows(void* s, int64_t L, std::vector<uint8_t>* rows) override {
-		return CpuRows(fx, pool, static_cast<sslm_seq>(s), L, rows);
+		return CpuRows(fx, static_cast<sslm_seq>(s), L, rows);
 	}
 };
 

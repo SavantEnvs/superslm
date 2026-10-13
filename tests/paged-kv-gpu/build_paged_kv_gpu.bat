@@ -28,6 +28,8 @@ rem
 rem Then run the whole suite at a step, once per GPU (see g1-unify-notes.md for the full command block):
 rem   set SSLM_GPU_ADAPTER_INDEX=0
 rem   <out>\bin\pkvg_suite.exe "--bin=<out>\bin" --step=G3 "--pkv-fixtures=%FX%" "--gpu-ref=%REFS%" ...
+rem Debug layer: every job runs with it ON except the te425 hook jobs (3.6d first touch, 3.6f stranded/waitnoarm,
+rem 3.6g stranded/percontext, the nine pins), which run with it OFF; each job line and the summary say which.
 setlocal enabledelayedexpansion
 set HEREDIR=%~dp0
 for %%I in ("%HEREDIR%..\..") do set ENG=%%~fI
