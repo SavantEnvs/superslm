@@ -484,6 +484,9 @@ rem ---- cell_gpu_slm4_dump (checked-return-FIXED/no-SLM5 -- must genuinely dead
 rem real legacy 'SLM4' blob; T-2903 fix, see gpu_fixed_noslm5 above -- gpu_asbuilt alone cannot
 rem dead-end at all, so linking against it made the pre-save assertion below unwinnable) /
 rem cell_gpu_slm4_restore (FIXED only) ----
+rem The object is removed before its compile, so a failed compile leaves none for the link below to
+rem pick up from an earlier run (the save-speed fix's final review).
+if exist obj_gpu\slm4_dump.obj del /f /q obj_gpu\slm4_dump.obj
 cl /nologo /std:c++20 /O2 /W3 /fp:precise /EHsc %STOCKINC% /c cell_gpu_slm4_dump.cpp /Fo"obj_gpu\slm4_dump.obj" ^
     > obj_gpu\slm4_dump.buildlog 2>&1 || (echo BUILD FAILED: slm4_dump.obj & type obj_gpu\slm4_dump.buildlog & set OVERALL_OK=0)
 rem The blob is removed before the dump that writes it, so slm4_restore below reads only a blob this
