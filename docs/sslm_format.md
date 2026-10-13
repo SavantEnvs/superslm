@@ -329,7 +329,9 @@ model," so it is rejected, never repaired.
 
 `kv_block_size` is validated (`> 0`) and converters write 16. It does not select the positions per K/V page of the
 CPU C ABI (`sslm_kv_page_positions`): from 1.12.0 that page size is derived from the model's head dimension, context
-cap and K/V element width (`docs/api.md`, *Paged KV memory*).
+cap and K/V element width (`docs/api.md`, *Paged KV memory*). From 1.13.0 it does select the GPU's: a GPU page
+pool's page is `kv_block_size` positions when it divides the context cap, and the cap otherwise (`docs/api.md`,
+*Paged KV memory on the GPU*).
 
 ### Weight-scale fold blob — `WSC1` (reuses the tensor manifest)
 

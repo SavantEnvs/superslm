@@ -849,8 +849,7 @@ SslmGpuStatus sslm_gpu_seq_read_prefill_final_hidden(SslmGpuContext* ctx, SslmGp
 
 /* ============================================================================
  * Paged KV (1.13.0): the GPU page pool, budgeted sequences, shared prefixes and restore into a
- * pool. DECLARED for the GPU red suite; defined from G3 (pool, budgeted create, stats, peek,
- * wait seam), G4 (prefixes, adopt, begin_from) and G5 (restore into pool).
+ * pool. Every verb below is defined (src/gpu/gpu_1p0.cpp).
  * ============================================================================
  *
  * A pool is one device buffer of `page_count` pages of the model's page geometry (B positions per

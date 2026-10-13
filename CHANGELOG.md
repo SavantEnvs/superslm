@@ -4,6 +4,76 @@ All notable changes to SuperSLM (Layer 1) are recorded here.
 
 ## [Unreleased]
 
+## [1.13.0] - Unreleased
+
+The GPU backend gains 1.12.0's paged K/V memory: GPU page pools, budgeted GPU sequences and prefixes,
+shared prefix pages, and the `SLM6` save blob. `gpu_1p0.h` adds 12 verbs, 2 handle types, 2 test-only
+verbs and 6 statuses (ordinals 24 to 29); no existing declaration, struct layout or ordinal changes.
+The CPU C ABI is unchanged. GPU sequences made by `sslm_gpu_seq_create` keep a whole-cap buffer and
+keep saving `SLM5`; they now address K/V through a one-page table, the old flat layout by
+construction. Verified on the NVIDIA RTX 2080 SUPER only: the AMD RX 7900 XTX legs are a known gap,
+to run on their own machine before any AMD statement. The shipped shaders changed: deploy the whole 1.13.0 shader set. Folds in
+the planned 1.12.1 fixes. `docs/api.md` (*Paged KV memory on the GPU*) summarizes the surface,
+`gpu_1p0.h` is the contract, and `docs/releases/1.13.0.md` is the release note.
+- **GPU page pools.** `sslm_gpu_kv_pool_create`, `sslm_gpu_kv_pool_destroy`, `sslm_gpu_kv_pool_stats`.
+  A GPU page is `kv_block_size` positions when it divides the cap, else the cap (16 for converted
+  artifacts at cap 4,096; 96 KiB at Qwen2.5-0.5B), not the CPU's page. A pool above 2^32 bytes is
+  `SSLM_GPU_KV_POOL_TOO_LARGE`.
+- **Budgeted GPU sequences.** `sslm_gpu_seq_create_budgeted` reserves
+  `R(budget) = min(ceil(budget/B) + 1, ceil(cap/B))` pages, or returns `SSLM_GPU_KV_POOL_EXHAUSTED`
+  with nothing drawn; a write at or past `min(origin + budget, cap)` below the cap returns
+  `SSLM_GPU_KV_BUDGET_EXCEEDED` with no row written.
+- **Shared GPU prefixes.** `sslm_gpu_prefix_begin`, `sslm_gpu_prefix_begin_from`,
+  `sslm_gpu_prefix_set_schema`, `sslm_gpu_prefix_prefill`, `sslm_gpu_prefix_freeze`,
+  `sslm_gpu_prefix_release` and `sslm_gpu_seq_adopt_prefix`: full pages shared, the partial last
+  page copied, the CPU adopt's field and schema rules. Refusals: `SSLM_GPU_PREFIX_REJECTED`,
+  `SSLM_GPU_PREFIX_SCHEMA_MISMATCH`, and `SSLM_GPU_HOLDER_MODE_MISMATCH` for a dedicated sequence.
+- **`SLM6`.** A pooled sequence saves `SLM6` (the `SLM5` header and tail, mode, budget, origin, the
+  residual, then rows `[0, L')`), restored by `sslm_gpu_seq_restore_into_pool` with an optional
+  prefix handle that re-shares the prefix's pages when it matches. `sslm_gpu_seq_restore` refuses
+  `SLM6` and `sslm_gpu_seq_restore_into_pool` refuses `SLM5` and `SLM4`, each with
+  `SSLM_GPU_HOLDER_MODE_MISMATCH`. 1.12.0 and earlier refuse `SLM6` on its magic with
+  `SSLM_SEQUENCE_KV_BUFFER_MISMATCH` (cell 9.8, a 1.12.0 binary on the release machine, at
+  `845918e`; TODO-BOX: its check count).
+- **Work in flight.** `gpu_1p0.h` states that no command allocator is reset while work on it is
+  unobserved, that a guarded verb returns `SSLM_BUSY` (or `SSLM_DEVICE_LOST` once a submission is
+  stranded) instead, which device each verb submits on, and each guarded verb's refusal order.
+- **Behaviour changes for every GPU host:** two decodes raced on one sequence handle: one runs, the
+  other returns `SSLM_BUSY` (was undefined, and could corrupt the heap). A second call that reaches
+  the process's submission device while earlier work is unobserved (decode A, then decode B before
+  `sslm_gpu_ready(A)`) returns `SSLM_BUSY` (was undefined). A stranded submission makes every later
+  such guarded verb return `SSLM_DEVICE_LOST`. The external-serialization rule now lists every verb
+  that resets or submits on a device, not only the two decodes and the blocking `sslm_gpu_ready`.
+  `SslmGpuSeqPrefillSchemaContentForG5Bridge` on a Submitted sequence returns `SSLM_BUSY` before its
+  first-token reachability refusal, unchanged since 1.6.0 and now documented.
+- **Fixed: a barrier race in the shipped shaders.** The residual candidate (attention and MLP
+  residual sites), the bias reconcile and the funnel maximum reset a shared flag or slot for their
+  second run in a dispatch without a barrier after the first run's reads. Found on a software
+  Vulkan device, where it fired every run (16 GPU-against-CPU mismatches in `superslm_tests`); the
+  certified GPUs' certification runs were byte-identical to the CPU. No output is meant to change;
+  `superslm_tests` with its GPU cells passes with the fix on the RTX 2080 SUPER.
+- **Fixed: no-budget CPU save speed.** A no-budget `sslm_seq_save` of a block of 16 MiB or more
+  writes with streaming stores on x64; the bytes are unchanged (equal to 1.11.0's and 1.12.0's at 9
+  lengths, and at every destination offset 0 to 63 against the pinned 1.11.0 blobs). Smaller blocks
+  and non-x64 targets keep 1.12.0's copy. TODO-BOX: the release machine's save readings against
+  1.11.0; until then no save speed is stated.
+- **Speed (GPU, reading against a bar).** On the release machine's RTX 2080 SUPER, at Qwen2.5-0.5B,
+  cap 4,096, decoding a cohort member from 1,200 to 1,712 tokens: paged decode against the same
+  build's dedicated one-page view, median slowdown −1.21%, sign interval −1.29% to −1.11%
+  (n = 2,540 pairs over five constructions, a commissioned harness, debug layer off). The bar, no
+  more than 5% slower, passes; the paged arm read about 1.2% faster in this run, which is a reading,
+  not a claimed speed-up. Not measured: the AMD card, 1.5B, other widths and caps, batched decode,
+  and any comparison with 1.12.0's GPU decode. TODO-BOX: the AMD legs, on their own machine.
+- **Memory (by admission, 0.5B, cap 4,096, 1.12.0's example cohort):** a GPU pool of 1,842 pages
+  (172.7 MiB) admits the cohort and 1,841 refuses exactly the 50th create, against 1,200 MiB for 50
+  dedicated sequences (arithmetic); restored with prefix handles the cohort fits in 1,842 pages,
+  without them 5,592 until each re-adopts, then 113 more; every sequence's tokens equal the CPU's.
+  Confirmed on the real artifact on the RTX 2080 SUPER, debug layer on, at `845918e` (cells 10.3,
+  10.5, 10.7; TODO-BOX: their check counts); not run on the AMD card.
+- **Not in this release:** memory savings for dedicated GPU sequences, a GPU page larger than
+  `kv_block_size`, cross-backend save blobs, and the items 1.12.0 left out (a removed cap,
+  automatic prefix matching, adapter-shaped prefixes, batched shared-prefix attention).
+
 ## [1.12.0] - 2026-10-12
 
 The CPU backend stores K/V in pages of

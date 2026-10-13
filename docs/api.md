@@ -24,10 +24,12 @@ acceleration surface, Windows-only, and it is what
 
 ### Handles
 
-Four opaque handle types own the API's state: a context (`SslmGpuContext`,
+Six opaque handle types own the API's state: a context (`SslmGpuContext`,
 one per device), a mapped model (`SslmGpuModelHandle`), a mapped LoRA
-adapter (`SslmGpuAdapterHandle`), and a decoding sequence
-(`SslmGpuSequenceHandle`). Every fallible call takes the handles it needs
+adapter (`SslmGpuAdapterHandle`), a decoding sequence
+(`SslmGpuSequenceHandle`), and, from 1.13.0, a K/V page pool
+(`SslmGpuKvPoolHandle`) and a shared prompt prefix (`SslmGpuPrefixHandle`);
+see [Paged KV memory on the GPU](#paged-kv-memory-on-the-gpu-1130). Every fallible call takes the handles it needs
 and returns a status; values the call produces — a new handle, a readiness
 flag, a batch's per-sequence outcomes — come back through an out-parameter,
 never through the return value itself.
@@ -84,7 +86,11 @@ never through the return value itself.
   current `SLM5` format; restore also still accepts an older `SLM4` blob
   exactly as before, defaulting the schema binding it carries to unbound.
   Older `SSLM`, `SLM2`, and `SLM3` layouts are rejected on their versioned
-  magic rather than misread.
+  magic rather than misread. From 1.13.0 a sequence made from a page pool
+  saves `SLM6` instead, which `sslm_gpu_seq_restore` refuses with
+  `SSLM_GPU_HOLDER_MODE_MISMATCH` (restore it with
+  `sslm_gpu_seq_restore_into_pool`); a sequence made by
+  `sslm_gpu_seq_create` keeps saving `SLM5`.
 - **Adapter binding**: `sslm_gpu_seq_bind_adapter` binds (or, passed a
   null adapter, unbinds) a LoRA adapter to a sequence handle *across*
   calls — distinct from the per-call `adapter_or_null` argument every
@@ -241,23 +247,170 @@ the host in every case for token embedding, so no second copy is taken
 (before 1.7.0 there were two). An untied model mapped without the flag keeps
 a host copy of its `lm_head`.
 
+### Paged KV memory on the GPU (1.13.0)
+
+From 1.13.0 the GPU backend has the CPU's paged, shared-prefix K/V memory
+([Paged KV memory](#paged-kv-memory-1120) describes the model). The
+paged-KV block at the end of `include/superslm/gpu_1p0.h` is the contract;
+this section summarizes it. Sequences made by `sslm_gpu_seq_create` are
+unchanged: each keeps its own whole-cap buffer and saves `SLM5`, and the
+GPU has no block pool and no no-budget pooled mode.
+
+**Page geometry.** A GPU page is `B` positions: the artifact's
+`kv_block_size` when it divides the context cap, otherwise the cap. That is
+16 for converted artifacts at cap 4,096. It is not the CPU's
+`sslm_kv_page_positions` (64 at Qwen2.5-0.5B, cap 4,096), so a cohort takes
+a different number of pages on each backend. A page is
+`layers · 2 · kv_heads · B · head_dim` bytes (the GPU's K/V is int8): 96 KiB
+at Qwen2.5-0.5B and 224 KiB at Qwen2.5-1.5B. A budgeted holder reserves the
+CPU's `R(budget) = min(ceil(budget / B) + 1, ceil(cap / B))` pages, with the
+GPU's `B`.
+
+**Pools.**
+
+- `sslm_gpu_kv_pool_create(ctx, model, page_count, &pool)` creates one
+  device buffer of `page_count` pages, zero-filled before it returns, with a
+  host mirror of the same size. A pool above 2^32 bytes, the reach of the
+  shaders' 32-bit offsets, is `SSLM_GPU_KV_POOL_TOO_LARGE` (43,690 pages at
+  Qwen2.5-0.5B, 18,724 at Qwen2.5-1.5B). A pool the device or the host
+  cannot allocate is `SSLM_GPU_ALLOCATION_FAILED` on a device that is not
+  removed, and a smaller pool may be tried at once.
+- `sslm_gpu_kv_pool_destroy` destroys an empty pool, refuses with
+  `SSLM_MODEL_HAS_LIVE_SEQUENCES` while anything drawn from it lives, and
+  accepts a null pool. `sslm_gpu_model_unmap` refuses while the model has
+  live pools.
+- `sslm_gpu_kv_pool_stats(pool, &out)` fills an `SslmGpuKvPoolStats` (set
+  `struct_size`): `page_count`, `free_pages`, `shared_pages` and
+  `page_positions` (`B`), the CPU's pool stats field for field. Size
+  admissions from `free_pages`, not from handle counts.
+
+**Budgeted sequences and prefixes.**
+
+- `sslm_gpu_seq_create_budgeted(ctx, model, pool, budget, &seq)` takes
+  `1 ≤ budget ≤ cap` and draws `R(budget)` pages, or returns
+  `SSLM_GPU_KV_POOL_EXHAUSTED` with nothing drawn. It writes up to its limit,
+  `min(origin + budget, cap)`; a write at the limit below the cap is
+  `SSLM_GPU_KV_BUDGET_EXCEEDED` with no row written, and at the cap the
+  existing cap behaviour applies. The other sequence calls (embed, both
+  decodes, `sslm_gpu_ready`, the prefill and finish bridges, schema binding,
+  adapter binding, reset, release) take it as they take a dedicated
+  sequence; its reset and release touch only its own pages.
+- `sslm_gpu_prefix_begin(ctx, model, pool, budget, &prefix)` makes a
+  budgeted prefix (origin 0). `sslm_gpu_prefix_set_schema` binds a schema
+  before any content. `sslm_gpu_prefix_prefill(ctx, prefix, tokens, count,
+  kind, dispatch_budget, &consumed)` prefills through the prompt (`kind` 0)
+  or schema-content (`kind` 1) path, base-only, with the bridges' partial
+  consumption. `sslm_gpu_prefix_freeze` freezes it and
+  `sslm_gpu_prefix_release` releases it.
+- `sslm_gpu_prefix_begin_from(ctx, parent, budget, &prefix)` continues a
+  frozen parent in the parent's pool: the parent's full pages shared, its
+  partial page and its state copied, origin the parent's length.
+- `sslm_gpu_seq_adopt_prefix(ctx, seq, prefix)` adopts a frozen prefix onto
+  a pooled sequence with the CPU adopt's field and schema rules: full pages
+  mapped shared, the tail rows copied. Every check runs before any state
+  change. A prefix that is not frozen, or of another pool, is
+  `SSLM_GPU_PREFIX_REJECTED`; a dedicated sequence is
+  `SSLM_GPU_HOLDER_MODE_MISMATCH`; a schema mismatch is
+  `SSLM_GPU_PREFIX_SCHEMA_MISMATCH`.
+- A shared page is freed when the prefix and every holder that maps it have
+  let go of it.
+- A handle of another context or model, or a budget outside `[1, cap]`, is
+  `SSLM_SEQUENCE_KV_BUFFER_MISMATCH` with a null out-handle. Every
+  out-handle is null on every status but `SSLM_OK`.
+
+**Save and restore.** A pooled sequence's `sslm_gpu_seq_save` writes `SLM6`
+(little-endian; offsets as the 1.13.0 writer lays them out):
+
+| Offset | Field |
+|---|---|
+| 0–119 | the `SLM5` header, magic `SLM6` |
+| 120–131 | the `SLM5` tail (schema index, walk state, ready flag) |
+| 132 | `kv_mode`, u32: 1 (budget; every `SLM6` is a budget blob) |
+| 136 | `budget`, i32 |
+| 140 | `origin`, i64 |
+| 148 | the residual (the header's hidden-codes size) |
+| then | `kv_positions`, u64: `L' = context_length + (1 if mid-token else 0)` |
+| then | rows `[0, L')`, `[layer][K|V][kv_head][position][head_dim]` |
+
+Mid-token means a layer index strictly between 0 and the layer count: a
+sequence resting after a completed token carries no row at
+`context_length`. As with `SLM5`, a save into a null or too-small buffer
+writes the size it needs to `*out_blob_size` and returns the status the
+`SLM5` save returns then (`SSLM_DEVICE_LOST`).
+
+- `sslm_gpu_seq_restore_into_pool(ctx, model, pool, blob, size,
+  prefix_or_null, &seq, &out_shared_pages)` restores an `SLM6` blob into a
+  fresh pooled sequence with its budget and origin. The prefix is a sharing
+  hint: when it matches, the restored sequence maps its pages again and
+  `*out_shared_pages` counts them; a null or non-matching prefix gives a
+  private restore with `*out_shared_pages = 0`. Its refusals, in order, each
+  changing nothing: malformed handles and arguments; `SSLM_BUSY` while any
+  sequence is Submitted; a blob that is not `SLM6`,
+  `SSLM_GPU_HOLDER_MODE_MISMATCH`; the body, with `sslm_gpu_seq_restore`'s
+  statuses; `SSLM_GPU_KV_POOL_EXHAUSTED`, the first draw rolled back.
+- `sslm_gpu_seq_restore` is unchanged except that it refuses `SLM6` with
+  `SSLM_GPU_HOLDER_MODE_MISMATCH`, allocating nothing.
+- 1.12.0 and earlier refuse `SLM6` on its magic with
+  `SSLM_SEQUENCE_KV_BUFFER_MISMATCH`. GPU and CPU blobs are separate
+  formats; neither backend restores the other's.
+
+**In flight.** `sslm_gpu_kv_pool_create`, `sslm_gpu_prefix_prefill`,
+`sslm_gpu_prefix_begin_from`, `sslm_gpu_seq_adopt_prefix` and
+`sslm_gpu_seq_restore_into_pool` submit GPU work: they are serialized as
+every submitting call is (below), and each returns `SSLM_BUSY`, changing
+nothing, while any sequence in the process is Submitted. Every guarded call
+on a pooled sequence has the same any-sequence scope, and a guarded call on
+a dedicated sequence, a model or an adapter returns `SSLM_BUSY` while a
+pooled sequence is Submitted. The other paged calls submit nothing and are
+never refused Busy.
+
+**Speed.** On the NVIDIA RTX 2080 SUPER at Qwen2.5-0.5B, cap 4,096,
+single-sequence decode of a pooled sequence that adopted a prefix is no
+more than 5% slower than a dedicated sequence of the same build, to width
+1,712. That is the only GPU speed statement; the
+[1.13.0 release note](releases/1.13.0.md) has the reading and what is not
+measured, the AMD card among it.
+
 ### Thread safety
 
 Calls against **different** sequence handles are safe to make from
-different threads concurrently. Any call that submits GPU work — either
-decode call, `sslm_gpu_ready` with `block` set, or `sslm_gpu_seq_restore`
-(which uploads the restored sequence's K/V state to a fresh device
-buffer, and refuses `Busy` while *any* sequence anywhere in the process
-— any model, any context — has unfenced in-flight work, because the
-decode dispatch path shares one process-global command allocator/list
-regardless of which model or context submitted it) — must be externally
-serialized by the caller relative to every other GPU-submitting call on
-the same context; the API does not build an internal queue lock. Two
-threads driving the *same* sequence handle concurrently is not a
-supported use. A token finish on a model mapped with
-`SSLM_GPU_RESIDENCY_HEAD_ON_DEVICE` submits its logits dispatch on the
-context too, so it is serialized the same way, as is
-`sslm_gpu_context_set_host_parallel_for`.
+different threads concurrently. Every call that resets or submits work on a
+device, and `sslm_gpu_ready` with `block` set, must be externally
+serialized by the caller against every other such call on that device; the
+API does not build an internal queue lock. Up to 1.12.0 the header named
+the two decode calls and the blocking `sslm_gpu_ready`; from 1.13.0
+`gpu_1p0.h` (*In-flight work*) lists every such call and the device it
+uses: the decode calls, the blocking `sslm_gpu_ready`, the prefill bridges,
+the prefix prefill, `sslm_gpu_prefix_begin_from`, `sslm_gpu_seq_adopt_prefix`
+and `sslm_gpu_seq_restore_into_pool` on the process's submission device;
+`sslm_gpu_model_map`, `sslm_gpu_adapter_map`, `sslm_gpu_seq_create`,
+`sslm_gpu_kv_pool_create` and the finish of a model mapped with
+`SSLM_GPU_RESIDENCY_HEAD_ON_DEVICE` on the context's own device; and
+`sslm_gpu_seq_restore` and `SslmGpuSeqDecodeStepForG5Bridge` on both.
+`sslm_gpu_ready` with `block` clear may run beside a submitter.
+`sslm_gpu_context_set_host_parallel_for` is serialized with the context's
+calls too.
+
+Within that rule the library keeps two promises (1.13.0). It never resets a
+device's command allocator while work submitted on it has not been observed
+complete. And a guarded call that would need to returns `SSLM_BUSY` and
+changes nothing, or `SSLM_DEVICE_LOST` once a submission is stranded (its
+completion cannot be confirmed), until the process restarts. So a second
+call that reaches the submission device while an earlier submission is
+unobserved (a decode of sequence A, then of sequence B before
+`sslm_gpu_ready` has reported A) returns `SSLM_BUSY`; before 1.13.0 it was
+undefined. Finish each submission before the next, or decode several
+sequences in one `sslm_decode_step_batch_gpu` call. The header states the
+scope of each guard and the order of every guarded call's refusals; for
+example, `SslmGpuSeqPrefillSchemaContentForG5Bridge` on a Submitted
+sequence returns `SSLM_BUSY` before its unreachable-first-token
+`SSLM_SEQUENCE_REJECTED`, as it has since 1.6.0.
+
+Two threads driving the *same* sequence handle concurrently is not a
+supported use. From 1.13.0 two decode calls raced on one handle stay
+memory-safe: one runs and the other returns `SSLM_BUSY` having changed
+nothing (a batch slot reads `SSLM_BUSY`). Other calls raced on one handle
+remain the caller's to serialize.
 
 ### Status causes
 
@@ -306,6 +459,21 @@ field, refused by `sslm_gpu_context_set_host_parallel_for`;
 exactly-once contract, retryable through a correct hook; and
 `SSLM_GPU_RESIDENCY_FLAGS_INVALID`, a model map with an undefined
 `GpuResidencyConfig::flags` bit.
+
+Six cover paged K/V (1.13.0, ordinals 24 to 29; see
+[Paged KV memory on the GPU](#paged-kv-memory-on-the-gpu-1130)):
+`SSLM_GPU_KV_BUDGET_EXCEEDED`, a budgeted sequence or prefix writing at its
+limit below the cap; `SSLM_GPU_KV_POOL_EXHAUSTED`, a pool too short for a
+create, prefix, `begin_from` or restore, with nothing drawn;
+`SSLM_GPU_KV_POOL_TOO_LARGE`, a pool above 2^32 bytes;
+`SSLM_GPU_HOLDER_MODE_MISMATCH`, a pooled and a dedicated holder mixed (an
+adopt onto a dedicated sequence, an `SLM6` blob given to
+`sslm_gpu_seq_restore`, anything but `SLM6` given to
+`sslm_gpu_seq_restore_into_pool`); `SSLM_GPU_PREFIX_REJECTED`, a prefix verb
+refused on the prefix's state (not frozen, another pool, prefill after
+freeze, a schema bind it can no longer take); and
+`SSLM_GPU_PREFIX_SCHEMA_MISMATCH`, an adopt whose schema binding does not
+match the prefix's.
 
 `SslmGpuSeqPrefillPromptForG5Bridge` and `SslmGpuSeqPrefillSchemaContentForG5Bridge`
 diverge on one refusal: when a device-side domain guard refuses one of the admitted
@@ -790,7 +958,9 @@ figures.
   readings across four captures on the release machine; readings, not resolved
   changes: the release note's lifecycle comparison resolves a change only at 4
   times or more), with the same bytes. A later release is planned to remove the
-  slowdown.
+  slowdown. (1.13.0 writes a no-budget block of 16 MiB or more with streaming
+  stores on x64, with the same bytes; its
+  [release note](releases/1.13.0.md) states what is measured.)
 - **A higher context cap.** The cap is not removed: RoPE tables and the
   attention score scratch are still sized by it, and a write at the cap still
   fails. Paging only makes a high cap cheaper to reserve.
@@ -798,7 +968,8 @@ figures.
   GPU, or for batched decode.
 - **GPU paging.** The GPU API (`SslmGpu*`, `sslm_gpu_*`) is unchanged: GPU
   sequences keep one whole-cap buffer each and have no prefix or adopt verbs.
-  GPU paging is planned for a later release.
+  GPU paging is planned for a later release. (1.13.0 adds it: see
+  [Paged KV memory on the GPU](#paged-kv-memory-on-the-gpu-1130).)
 - **Automatic prefix matching.** Prefixes are explicit handles; the library
   does not find shared prefixes by itself.
 - **Adapter-shaped prefixes.** Prefixes are computed without an adapter. An

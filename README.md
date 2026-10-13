@@ -14,7 +14,19 @@ slicing produces the exact same output tokens as running the whole step at
 once. A game can therefore throttle inference to fit whatever GPU headroom a
 frame has left without changing what the model says.
 
-Current release: **1.12.0**. On the CPU, K/V memory is stored in pages. A sequence can declare a
+Current release: **1.13.0** (not yet released). The GPU backend gets the same shared prompt prefixes
+and budgeted sequences the CPU got in 1.12.0: a cast of characters that share a world and persona
+prompt can keep that prompt in GPU memory once, and each character reserves only the memory its own
+reply budget needs. Existing GPU code keeps working, with two changes to calls that were undefined
+before (a second GPU submission while earlier work is unobserved, and two threads decoding one
+sequence, now return `SSLM_BUSY`), and the shader set must be redeployed. On the CPU, large saves on x64
+are now written with streaming stores, aimed at 1.12.0's save slowdown; the saved bytes are the same
+(TODO-BOX: the release machine's save timings, before anything is said about speed). The GPU work is
+checked on the NVIDIA RTX 2080 SUPER only so far. See
+[Shared prompt prefixes and budgeted sequences](#shared-prompt-prefixes-and-budgeted-sequences)
+and the [1.13.0 release note](docs/releases/1.13.0.md).
+
+1.12.0: on the CPU, K/V memory is stored in pages. A sequence can declare a
 token budget and reserve only what that budget needs, and sequences that start from the same prompt
 prefix can share the prefix's memory instead of each holding a copy. Every output stays
 bit-identical to 1.11.0 (read on Windows x64 with MSVC), and code written for 1.11.0 needs no
@@ -247,8 +259,8 @@ Existing code needs no changes: `sslm_seq_create`, `sslm_prefix_begin` and the o
 behave as before in what they return and save in the same format, which older releases can read.
 One call differs in speed: `sslm_seq_save` of a no-budget sequence takes 1.14 to 2.00 times as long
 as in 1.11.0 on the release code, at every length measured (24 of 24 readings across four captures;
-readings, not resolved changes), and a later release is planned to fix that. The savings apply only
-to budgeted sequences, the context cap is still the cap, and GPU sequences are not paged yet. Speed
+readings, not resolved changes), and 1.13.0 changes how large saves are written to address it. The savings apply only
+to budgeted sequences, and the context cap is still the cap. Speed
 is claimed for single-conversation decode on Windows x64 CPU only, at ordinary background load: paged decode is held to within 5%
 of the contiguous cache of the same build, to the 0.5B model's 4,096-token cap and to width 18,682 at
 1.5B (measured with whole-token calls and no host parallel-for hook, on the AVX2 tier), and reset
@@ -257,6 +269,35 @@ larger cap), measured with the page size held equal at the two caps (except that
 tail copy). Batched decode works and stays bit-identical, with no speed claim. The release note has the
 figures. The full contract is in
 [docs/api.md](docs/api.md#paged-kv-memory-1120).
+
+**On the GPU, from 1.13.0.** The same cast can live in GPU memory. Create a GPU page pool with
+`sslm_gpu_kv_pool_create`, build the world and persona prefixes in it (`sslm_gpu_prefix_begin`,
+`sslm_gpu_prefix_begin_from`, `sslm_gpu_prefix_prefill`, `sslm_gpu_prefix_freeze`), and give each
+character a budgeted sequence (`sslm_gpu_seq_create_budgeted`) that adopts its persona
+(`sslm_gpu_seq_adopt_prefix`). Decode, batch and finish them with the calls you already use.
+
+- A budgeted GPU sequence stops with `SSLM_GPU_KV_BUDGET_EXCEEDED` at its budget, and a pool that
+  cannot hold another reservation refuses the create with `SSLM_GPU_KV_POOL_EXHAUSTED`, so you find
+  out at create time, not mid-reply.
+- Its save is a new format, `SLM6`, sized by its live tokens. Restore it with
+  `sslm_gpu_seq_restore_into_pool` and pass the persona's prefix handle so it shares again. Older
+  releases cannot read `SLM6`.
+- Sequences made by `sslm_gpu_seq_create` keep their own whole-context buffer and keep saving
+  `SLM5`, as before.
+- The GPU's page is smaller than the CPU's (16 positions for converted models), so the same cast
+  takes a different number of pages on each backend: in the example above, 1,842 GPU pages (172.7
+  MiB) instead of 50 whole-context GPU sequences' 1,200 MiB. That admission is confirmed on the real
+  0.5B artifact on the RTX 2080 SUPER.
+
+What it costs: on the RTX 2080 SUPER at Qwen2.5-0.5B, decoding a cast member through the page pool
+was measured against a whole-context sequence of the same build, to 1,712 tokens, and stayed within
+the 5% bar this release holds it to (the reading was about 1% faster, which is not promised). Nothing
+is measured on the AMD card, at 1.5B or for batched decode yet. Two older GPU behaviours now return
+`SSLM_BUSY` instead of being undefined: a second GPU submission while earlier work has not been
+seen to complete (call `sslm_gpu_ready` before the next submission, or use the batch call), and two
+threads decoding the same sequence. The
+[1.13.0 release note](docs/releases/1.13.0.md) has the figures and what was checked where, and
+[docs/api.md](docs/api.md#paged-kv-memory-on-the-gpu-1130) the summary of the calls.
 
 ## Status
 
@@ -404,11 +445,11 @@ and closed forks remain permitted.
 
 Named follow-on work after 1.5:
 
-- **Shared-prefix KV memory on the GPU.** 1.12.0 pages the CPU backend's K/V
-  memory, so budgeted sequences that share a prompt prefix share its memory
-  instead of each holding a copy (see
-  [Shared prompt prefixes and budgeted sequences](#shared-prompt-prefixes-and-budgeted-sequences)).
-  The same paging for GPU sequences is planned for a later release.
+- **Paged GPU memory on the AMD card.** 1.12.0 paged the CPU backend's K/V
+  memory and 1.13.0 the GPU's (see
+  [Shared prompt prefixes and budgeted sequences](#shared-prompt-prefixes-and-budgeted-sequences)),
+  checked so far on the certified NVIDIA GPU only. Running the same checks on
+  the certified AMD GPU is the next step for it.
 - **Async-wrapper overhead reduction.** The API's convenience wrapper
   around the dispatch path measurably costs throughput versus the raw
   dispatch path — see the Direct dispatch vs. Async wrapper API rows in
