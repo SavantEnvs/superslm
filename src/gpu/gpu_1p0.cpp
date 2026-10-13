@@ -938,14 +938,8 @@ Microsoft::WRL::ComPtr<ID3D12Resource> UploadResidentBufferSyncTo(
 	// G3 the reset, the submission and the wait are the ledger's (plan §4.4): BeginRecording(),
 	// Submit(no retry), the submission's Wait().
 	dev.BeginRecording();
-	dev.list->CopyResource(resident.Get(), upload.Get());
-	D3D12_RESOURCE_BARRIER barrier{};
-	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barrier.Transition.pResource = resident.Get();
-	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-	barrier.Transition.StateAfter = final_state;
-	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	dev.list->ResourceBarrier(1, &barrier);
+	superslm_gpu::harness::RecordCopyResource(dev.list.Get(), resident.Get(), upload.Get());
+	superslm_gpu::harness::RecordTransition(dev.list.Get(), resident.Get(), D3D12_RESOURCE_STATE_COPY_DEST, final_state);
 	dev.CloseListOrThrow();
 	dev.SubmitAndWaitKeepingAlive(/*retry=*/false, upload, resident);  // kept alive if it strands (F1)
 	return resident;
@@ -1063,15 +1057,10 @@ void ZeroFillResidentUavBufferSync(superslm_gpu::harness::Device& dev, const Zer
 	for (uint64_t i = 0; i < chunks; ++i) {
 		uint64_t offset = 0, len = 0;
 		superslm_gpu::kv_pool::ZeroFillChunk(b.bytes, i, &offset, &len);
-		dev.list->CopyBufferRegion(b.resident.Get(), offset, b.staging.Get(), 0, len);
+		superslm_gpu::harness::RecordCopyBufferRegion(dev.list.Get(), b.resident.Get(), offset, b.staging.Get(), 0, len);
 	}
-	D3D12_RESOURCE_BARRIER barrier{};
-	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barrier.Transition.pResource = b.resident.Get();
-	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	dev.list->ResourceBarrier(1, &barrier);
+	superslm_gpu::harness::RecordTransition(dev.list.Get(), b.resident.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+	                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	dev.CloseListOrThrow();
 	// ---- end of the recording window ----
 	// The ledger's submission and wait (G3): Submit(no retry), as before, then its Wait(); both
@@ -1150,14 +1139,8 @@ void ExecuteSignalAndWait(superslm_gpu::harness::Device& dev, const Microsoft::W
 }
 
 void TransitionBuffer(ID3D12GraphicsCommandList* list, ID3D12Resource* r, D3D12_RESOURCE_STATES before,
-                D3D12_RESOURCE_STATES after) {
-	D3D12_RESOURCE_BARRIER b{};
-	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	b.Transition.pResource = r;
-	b.Transition.StateBefore = before;
-	b.Transition.StateAfter = after;
-	b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	list->ResourceBarrier(1, &b);
+                D3D12_RESOURCE_STATES after, const std::source_location at = std::source_location::current()) {
+	superslm_gpu::harness::RecordTransition(list, r, before, after, at);
 }
 
 // logits_site.hlsl's root signature: four root constants (hidden, vocab, groups_x, unused) at
@@ -1324,19 +1307,19 @@ SslmGpuStatus RunDeviceLogits(SslmGpuContext* ctx, const DeviceLogitsBuffers& b,
 		dev.BeginRecording();  // the ledger's reset (G3, plan §4.4); the PSO is set right after it
 		dev.list->SetPipelineState(b.pso.Get());
 		ID3D12GraphicsCommandList* list = dev.list.Get();
-		list->CopyBufferRegion(b.x.Get(), 0, b.x_upload.Get(), 0, static_cast<UINT64>(b.H) * 4);
+		superslm_gpu::harness::RecordCopyBufferRegion(list, b.x.Get(), 0, b.x_upload.Get(), 0, static_cast<UINT64>(b.H) * 4);
 		TransitionBuffer(list, b.x.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
 		           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		list->SetComputeRootSignature(b.root.Get());
 		const uint32_t constants[4] = {b.H, b.V, b.groups_x, 0u};
 		list->SetComputeRoot32BitConstants(0, 4, constants, 0);
-		list->SetComputeRootShaderResourceView(1, b.head->GetGPUVirtualAddress());
-		list->SetComputeRootShaderResourceView(2, b.x->GetGPUVirtualAddress());
-		list->SetComputeRootUnorderedAccessView(3, b.out->GetGPUVirtualAddress());
-		list->Dispatch(b.groups_x, b.groups_y, 1);
+		superslm_gpu::harness::BindRootSrv(list, 1, b.head.Get());
+		superslm_gpu::harness::BindRootSrv(list, 2, b.x.Get());
+		superslm_gpu::harness::BindRootUav(list, 3, b.out.Get());
+		superslm_gpu::harness::RecordDispatch(list, b.groups_x, b.groups_y, 1);
 		TransitionBuffer(list, b.out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 		           D3D12_RESOURCE_STATE_COPY_SOURCE);
-		list->CopyBufferRegion(b.readback.Get(), 0, b.out.Get(), 0, static_cast<UINT64>(b.V) * 8);
+		superslm_gpu::harness::RecordCopyBufferRegion(list, b.readback.Get(), 0, b.out.Get(), 0, static_cast<UINT64>(b.V) * 8);
 		// Back to the resting states the next dispatch starts from.
 		TransitionBuffer(list, b.out.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
 		           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2147,6 +2130,7 @@ SslmGpuStatus sslm_gpu_seq_createImpl(SslmGpuContext* ctx, SslmGpuModelHandle* m
 	std::vector<uint8_t> zero_kv(kv_bytes_needed, 0);
 	try {
 		h->kv_buf = UploadResidentUavBufferSync(ctx->device, zero_kv.data(), zero_kv.size());
+		superslm_gpu::harness::NameBuffer(h->kv_buf.Get(), L"SuperSLM dedicated K/V");
 	} catch (const std::bad_alloc&) {
 		throw;
 	} catch (const std::exception&) {
@@ -2331,6 +2315,7 @@ SslmGpuStatus sslm_gpu_kv_pool_createImpl(SslmGpuContext* ctx, SslmGpuModelHandl
 	h->page_count = page_count;
 	h->pool_bytes = static_cast<size_t>(bytes);
 	h->pool_buf = fill.resident;
+	superslm_gpu::harness::NameBuffer(h->pool_buf.Get(), L"SuperSLM K/V page pool");
 	h->kv_needs_resume_barrier = false;  // left in UNORDERED_ACCESS by the zero-fill's barrier
 	ctx->live_handles += 1;
 	model->live_pools += 1;
@@ -2383,6 +2368,7 @@ SslmGpuStatus sslm_gpu_seq_create_budgetedImpl(SslmGpuContext* ctx, SslmGpuModel
 		h->table_buf = ctx->device.MakeBuffer(static_cast<UINT64>(pool->geo.cap_pages) * sizeof(uint32_t),
 		                                      D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
 		                                      D3D12_RESOURCE_STATE_COMMON);
+		superslm_gpu::harness::NameBuffer(h->table_buf.Get(), L"SuperSLM K/V page table");
 	} catch (...) {
 		superslm::kv_pages::HolderRelease(holder);
 		return ClassifyHandleFault(&ctx->device);
@@ -3676,6 +3662,7 @@ SslmGpuStatus sslm_gpu_seq_restoreImpl(SslmGpuContext* ctx, SslmGpuModelHandle* 
 	try {
 		fresh->kv_buf = UploadResidentUavBufferSync(ctx->device, fresh->host_kv_mirror.data(),
 		                                             fresh->host_kv_mirror.size());
+		superslm_gpu::harness::NameBuffer(fresh->kv_buf.Get(), L"SuperSLM dedicated K/V (restored)");
 	} catch (const std::bad_alloc&) {
 		sslm_gpu_seq_release(ctx, fresh);
 		throw;
@@ -5172,23 +5159,17 @@ void SubmitPoolUploadSync(superslm_gpu::harness::Device& dev, SslmGpuKvPoolHandl
 	// stranded check, the boundary guard check and PoolSubmitAssert before it.
 	dev.BeginRecording();
 	// ---- no allocation and no throw from here to CloseListOrThrow ----
-	D3D12_RESOURCE_BARRIER barrier{};
-	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barrier.Transition.pResource = pool->pool_buf.Get();
-	barrier.Transition.StateBefore = pool->kv_needs_resume_barrier ? D3D12_RESOURCE_STATE_COPY_SOURCE
-	                                                               : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	dev.list->ResourceBarrier(1, &barrier);
+	superslm_gpu::harness::RecordKvTransitionFromLatch(dev.list.Get(), pool->pool_buf.Get(), pool->kv_needs_resume_barrier,
+	                                                  D3D12_RESOURCE_STATE_COPY_DEST);
 	const uint64_t page_bytes = pool->geo.page_bytes;
 	uint64_t at = 0;
 	for (const superslm_gpu::PoolUploadRegion& r : regions) {
-		dev.list->CopyBufferRegion(pool->pool_buf.Get(), uint64_t{r.page} * page_bytes + r.offset, staging.Get(), at, r.bytes);
+		superslm_gpu::harness::RecordCopyBufferRegion(dev.list.Get(), pool->pool_buf.Get(),
+		                                              uint64_t{r.page} * page_bytes + r.offset, staging.Get(), at, r.bytes);
 		at += r.bytes;
 	}
-	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-	dev.list->ResourceBarrier(1, &barrier);
+	superslm_gpu::harness::RecordTransition(dev.list.Get(), pool->pool_buf.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+	                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	dev.CloseListOrThrow();
 	// ---- end of the recording window ----
 	// The ledger's submission and wait (G3), as the zero-fill's: Submit(no retry), then its Wait(); the
@@ -5237,6 +5218,7 @@ SslmGpuStatus MakePooledSeqUnpublished(SslmGpuContext* ctx, SslmGpuModelHandle* 
 		h->table_buf = ctx->device.MakeBuffer(static_cast<UINT64>(pool->geo.cap_pages) * sizeof(uint32_t),
 		                                      D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
 		                                      D3D12_RESOURCE_STATE_COMMON);
+		superslm_gpu::harness::NameBuffer(h->table_buf.Get(), L"SuperSLM K/V page table");
 	} catch (...) {
 		superslm::kv_pages::HolderRelease(holder);
 		return ClassifyHandleFault(&ctx->device);

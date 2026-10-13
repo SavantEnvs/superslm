@@ -1084,15 +1084,10 @@ Microsoft::WRL::ComPtr<ID3D12Resource> MakeInitializedUav(
 	auto buf = dev.MakeBuffer(init.size(), D3D12_HEAP_TYPE_DEFAULT,
 	                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
 	auto upload = dev.Upload(init.data(), init.size());
-	dev.list->CopyResource(buf.Get(), upload.Get());
+	harness::RecordCopyResource(dev.list.Get(), buf.Get(), upload.Get());
 	keep_alive.push_back(upload);
-	D3D12_RESOURCE_BARRIER b{};
-	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	b.Transition.pResource = buf.Get();
-	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-	b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-	b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	dev.list->ResourceBarrier(1, &b);
+	harness::RecordTransition(dev.list.Get(), buf.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+	                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	return buf;
 }
 
@@ -1800,8 +1795,8 @@ void RecordOneTokenFullDepthDispatchBody(
 		                        NQH,        width_u32, I,  N,  lanes,          Q_WIDTH};
 		dev.list->SetComputeRoot32BitConstants(0, 12, consts, 0);
 		dev.list->SetPipelineState(pso);
-		dev.list->Dispatch(num_groups, 1, 1);
-		dev.list->ResourceBarrier(1, &global_uav_barrier);
+		harness::RecordDispatch(dev.list.Get(), num_groups, 1, 1);
+		harness::RecordBarriers(dev.list.Get(), 1, &global_uav_barrier);
 	};
 	auto bind_and_dispatch_tail = [&](ID3D12PipelineState* pso, uint32_t layer_index,
 	                                   std::initializer_list<TailAdapterSlot> slots) {
@@ -1851,8 +1846,8 @@ void RecordOneTokenFullDepthDispatchBody(
 		consts[27] = Q_WIDTH;
 		dev.list->SetComputeRoot32BitConstants(0, 28, consts, 0);
 		dev.list->SetPipelineState(pso);
-		dev.list->Dispatch(1, 1, 1);
-		dev.list->ResourceBarrier(1, &global_uav_barrier);
+		harness::RecordDispatch(dev.list.Get(), 1, 1, 1);
+		harness::RecordBarriers(dev.list.Get(), 1, &global_uav_barrier);
 	};
 
 	const uint32_t KV2 = 2u * NH * HD;
@@ -1964,11 +1959,30 @@ struct GpuLayerLoopChunkOpenState {
 	Microsoft::WRL::ComPtr<ID3D12Resource> scratch_layout_buf;
 	Microsoft::WRL::ComPtr<ID3D12Resource> lw_upload_keep_alive;
 	std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> upload_keep_alive;
+	// A pooled holder's table buffer when this submission uploads it (null otherwise): the readback
+	// transitions it back to COMMON, its resting state, in the same list (see the upload below).
+	ID3D12Resource* kv_table_uploaded = nullptr;
 	// Set immediately after this call's command-list Reset succeeds, and never before: a throw
 	// that leaves it false reached no open list, so the recording window's cleanup
 	// (AbandonRecording) leaves the list alone.
 	bool list_opened = false;
 };
+
+// The readback's table barrier: when this submission uploaded a pooled holder's table buffer, the
+// transition that returns it to COMMON after the last dispatch read it (PrepareGpuLayerLoopChunkOpenState,
+// the table upload). Writes it to `*out` and returns 1, or returns 0 when the table was not uploaded.
+namespace {
+uint32_t TableBackToCommonBarrier(const GpuLayerLoopChunkOpenState& state, D3D12_RESOURCE_BARRIER* out) {
+	if (state.kv_table_uploaded == nullptr) return 0;
+	*out = D3D12_RESOURCE_BARRIER{};
+	out->Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	out->Transition.pResource = state.kv_table_uploaded;
+	out->Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	out->Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	out->Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	return 1;
+}
+}  // namespace
 
 // `dev` is the process's submission device, obtained once by the caller (harness::GetDevice()), so
 // one submission makes at most one attempt at a first-time device setup: a setup that ran out of
@@ -2737,14 +2751,9 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 		Microsoft::WRL::ComPtr<ID3D12Resource> lw_default =
 		    dev.MakeBuffer(lw_bytes.size(), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
 		                    D3D12_RESOURCE_STATE_COPY_DEST);
-		dev.list->CopyResource(lw_default.Get(), lw_upload_keep_alive.Get());
-		D3D12_RESOURCE_BARRIER lw_barrier{};
-		lw_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		lw_barrier.Transition.pResource = lw_default.Get();
-		lw_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-		lw_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-		lw_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		dev.list->ResourceBarrier(1, &lw_barrier);
+		harness::RecordCopyResource(dev.list.Get(), lw_default.Get(), lw_upload_keep_alive.Get());
+		harness::RecordTransition(dev.list.Get(), lw_default.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+		                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		lw_buf = lw_default;
 		g_resident_weights.lw_buf = lw_buf;
 		g_resident_weights.bytes = std::move(lw_bytes);
@@ -2801,24 +2810,28 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 		upload_keep_alive.push_back(kv_page_table_buf);
 	}
 	if (kv_table_resident != nullptr && kv_table_upload) {
-		// The table buffer rests in COMMON (created there, and a buffer decays to COMMON when the
-		// submission that used it completes): the copy promotes it to COPY_DEST implicitly, and one
-		// transition leaves it readable by every dispatch below.
-		dev.list->CopyBufferRegion(kv_table_resident, 0, kv_page_table_buf.Get(), 0,
-		                           static_cast<UINT64>(kv_view.mapped_pages) * sizeof(uint32_t));
-		D3D12_RESOURCE_BARRIER table_barrier{};
-		table_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		table_barrier.Transition.pResource = kv_table_resident;
-		table_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-		table_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-		table_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		dev.list->ResourceBarrier(1, &table_barrier);
+		// The table buffer rests in COMMON between submissions: it is created there, and the submission
+		// that uploads it returns it there explicitly, at its readback (`kv_table_uploaded`). It does not
+		// rely on a buffer decaying to COMMON when its list completes: an explicit state persists across
+		// submissions, which is the premise of the K/V resume latch, so a table left in
+		// NON_PIXEL_SHADER_RESOURCE would make the next upload's copy write a buffer that is not in
+		// COPY_DEST (the box's GPU-based validation, 1.13 G4: every re-upload after a page was mapped).
+		// From COMMON the copy promotes it to COPY_DEST implicitly, and one transition leaves it readable
+		// by every dispatch below. A submission that does not upload it reads it from COMMON by implicit
+		// promotion, which ends with the submission.
+		harness::RecordCopyBufferRegion(dev.list.Get(), kv_table_resident, 0, kv_page_table_buf.Get(), 0,
+		                                static_cast<UINT64>(kv_view.mapped_pages) * sizeof(uint32_t));
+		harness::RecordTransition(dev.list.Get(), kv_table_resident, D3D12_RESOURCE_STATE_COPY_DEST,
+		                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+		out_state->kv_table_uploaded = kv_table_resident;
 	}
 	seq_uav = MakeInitializedUav(dev, seq_bytes, upload_keep_alive);
+	harness::NameBuffer(seq_uav.Get(), L"SuperSLM SeqState");
 	// T-2101: no host content -- see the header comment at `kv_fast_hit`'s own declaration above.
 	scratch_uav = dev.MakeBuffer(scratch_layout.total, D3D12_HEAP_TYPE_DEFAULT,
 	                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
 	                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	harness::NameBuffer(scratch_uav.Get(), L"SuperSLM LayerScratch");
 	// T-2101 (D-SLM3301/D-SLM3294): device-resident K/V. A cache hit reuses the SAME DEFAULT-heap
 	// buffer every call -- no pack, no upload -- and only needs a state transition back to
 	// UNORDERED_ACCESS, since the previous call's own targeted readback (below) left it in
@@ -2838,24 +2851,12 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 		kv_uav = external_kv_resident;
 		const bool needs_resume =
 		    io_external_kv_needs_resume_barrier != nullptr && *io_external_kv_needs_resume_barrier;
-		if (needs_resume) {
-			D3D12_RESOURCE_BARRIER kv_resume_barrier{};
-			kv_resume_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-			kv_resume_barrier.Transition.pResource = kv_uav.Get();
-			kv_resume_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-			kv_resume_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-			kv_resume_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-			dev.list->ResourceBarrier(1, &kv_resume_barrier);
-		}
+		harness::RecordKvTransitionFromLatch(dev.list.Get(), kv_uav.Get(), needs_resume,
+		                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	} else if (kv_fast_hit) {
 		kv_uav = g_resident_kv.kv_buf;
-		D3D12_RESOURCE_BARRIER kv_resume_barrier{};
-		kv_resume_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		kv_resume_barrier.Transition.pResource = kv_uav.Get();
-		kv_resume_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-		kv_resume_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-		kv_resume_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		dev.list->ResourceBarrier(1, &kv_resume_barrier);
+		harness::RecordTransition(dev.list.Get(), kv_uav.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+		                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	} else {
 		// Paged-KV plan §4 item 2 (G2): this pre-1.0 process-wide path uploads the whole host buffer the
 		// view addresses (for its one-page view, the caller's flat workspace, as before) and is addressed
@@ -2893,6 +2894,7 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 	work_scratch_uav = dev.MakeBuffer(work_total, D3D12_HEAP_TYPE_DEFAULT,
 	                                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
 	                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	harness::NameBuffer(work_scratch_uav.Get(), L"SuperSLM WorkScratch");
 
 	auto& attn_norm_pipe = harness::GetOrBuildComposedPipeline("attn_norm_site");
 
@@ -2908,11 +2910,11 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 	// recording window opens and none is reassigned inside it. That removes
 	// 12 * 24 * layers_to_record API calls per call from `record_ms`, re-derived from
 	// Claude/Laplace/t2105-gpu-speed-ceiling-2026-08-14.md Sec2 change 2.
-	dev.list->SetComputeRootShaderResourceView(1, lw_buf->GetGPUVirtualAddress());
-	dev.list->SetComputeRootShaderResourceView(2, layout_buf->GetGPUVirtualAddress());
-	dev.list->SetComputeRootShaderResourceView(3, rope_buf->GetGPUVirtualAddress());
-	dev.list->SetComputeRootShaderResourceView(4, model_const_buf->GetGPUVirtualAddress());
-	dev.list->SetComputeRootShaderResourceView(5, silu_lut_buf->GetGPUVirtualAddress());
+	harness::BindRootSrv(dev.list.Get(), 1, lw_buf.Get());
+	harness::BindRootSrv(dev.list.Get(), 2, layout_buf.Get());
+	harness::BindRootSrv(dev.list.Get(), 3, rope_buf.Get());
+	harness::BindRootSrv(dev.list.Get(), 4, model_const_buf.Get());
+	harness::BindRootSrv(dev.list.Get(), 5, silu_lut_buf.Get());
 	// T-2113 (B5, design Sec6.2/Sec1): this IS the real async resume rebind -- every SEPARATE
 	// `sslm_decode_step_gpu` call reaches this same site fresh (its own `dev.list->Reset()`,
 	// above), unconditionally, exactly matching design Sec6.2's own "rebind never conditioned
@@ -2944,15 +2946,15 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 #endif
 	// The swapped-SRV-rebind violation pin (T-2106): cos/sin land in each other's slot.
 	if (b5_async_swap_srv_rebind) {
-		dev.list->SetComputeRootShaderResourceView(6, sin_table_buf->GetGPUVirtualAddress());
-		dev.list->SetComputeRootShaderResourceView(7, cos_table_buf->GetGPUVirtualAddress());
+		harness::BindRootSrv(dev.list.Get(), 6, sin_table_buf.Get());
+		harness::BindRootSrv(dev.list.Get(), 7, cos_table_buf.Get());
 	} else {
-		dev.list->SetComputeRootShaderResourceView(6, cos_table_buf->GetGPUVirtualAddress());
-		dev.list->SetComputeRootShaderResourceView(7, sin_table_buf->GetGPUVirtualAddress());
+		harness::BindRootSrv(dev.list.Get(), 6, cos_table_buf.Get());
+		harness::BindRootSrv(dev.list.Get(), 7, sin_table_buf.Get());
 	}
-	dev.list->SetComputeRootShaderResourceView(8, scratch_layout_buf->GetGPUVirtualAddress());
-	dev.list->SetComputeRootUnorderedAccessView(9, seq_uav->GetGPUVirtualAddress());
-	dev.list->SetComputeRootUnorderedAccessView(10, scratch_uav->GetGPUVirtualAddress());
+	harness::BindRootSrv(dev.list.Get(), 8, scratch_layout_buf.Get());
+	harness::BindRootUav(dev.list.Get(), 9, seq_uav.Get());
+	harness::BindRootUav(dev.list.Get(), 10, scratch_uav.Get());
 	// The dropped-UAV-rebind violation pin (T-2106): kv_uav's own rebind is replaced with a bind
 	// to a DIFFERENT, still-valid, still-live resource (work_scratch_uav) rather than left fully
 	// unbound -- a raw root UAV descriptor left undefined after SetComputeRootSignature is an
@@ -2961,9 +2963,8 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 	// own subsequent K/V reads/writes land in transient scratch instead of the persistent K/V
 	// store, a real and safely-producible wrong-answer (StandardsDocument.md Sec5.4's own
 	// must-reject construction discipline).
-	dev.list->SetComputeRootUnorderedAccessView(
-	    11, (b5_async_drop_uav_rebind ? work_scratch_uav : kv_uav)->GetGPUVirtualAddress());
-	dev.list->SetComputeRootUnorderedAccessView(12, work_scratch_uav->GetGPUVirtualAddress());
+	harness::BindRootUav(dev.list.Get(), 11, (b5_async_drop_uav_rebind ? work_scratch_uav : kv_uav).Get());
+	harness::BindRootUav(dev.list.Get(), 12, work_scratch_uav.Get());
 	// T-2113 (B6b, design Sec8): the adapter-delta dispatch's own two read-only inputs (t8
 	// LoraAB, t9 Fold), bound in the SAME once-per-call hoist as every other root SRV/UAV
 	// above -- every composed-pipeline root signature carries these two params now (B6b's own
@@ -2974,18 +2975,16 @@ superslm::SslmForwardStatus PrepareGpuLayerLoopChunkOpenState(
 	// binds anyway -- never read by any PSO that does not itself declare t8/t9, i.e. never
 	// read at all when no adapter-delta dispatch is ever issued (see the per-layer loop
 	// below), so this fallback binding is inert, not merely unread-in-practice.
-	dev.list->SetComputeRootShaderResourceView(
-	    13, (adapter_bridge ? adapter_bridge->lora_ab_resident : model_const_buf.Get())->GetGPUVirtualAddress());
-	dev.list->SetComputeRootShaderResourceView(
-	    14, (adapter_bridge ? adapter_bridge->fold_resident : model_const_buf.Get())->GetGPUVirtualAddress());
+	harness::BindRootSrv(dev.list.Get(), 13,
+	                     adapter_bridge ? adapter_bridge->lora_ab_resident : model_const_buf.Get());
+	harness::BindRootSrv(dev.list.Get(), 14, adapter_bridge ? adapter_bridge->fold_resident : model_const_buf.Get());
 	// Paged-KV plan §4 item 1 (G2): the page table (t10) and the two page constants (b1), call-constant
 	// like every binding above, so set once here. `page_positions` is at most the cap (one page) and
 	// fits a uint as the cap does; `page_bytes` is the stride, read only through a nonzero table entry,
 	// and a pool whose bytes pass 2^32 is refused at create (§4 item 3), so the clamp below changes
 	// nothing a shader reads (a one-page view's table entry is 0).
-	dev.list->SetComputeRootShaderResourceView(
-	    harness::Device::kComposedRootParamKvPageTable,
-	    (kv_table_resident != nullptr ? kv_table_resident : kv_page_table_buf.Get())->GetGPUVirtualAddress());
+	harness::BindRootSrv(dev.list.Get(), harness::Device::kComposedRootParamKvPageTable,
+	                     kv_table_resident != nullptr ? kv_table_resident : kv_page_table_buf.Get());
 	{
 		const uint32_t page_constants[harness::Device::kComposedPageConstantCount] = {
 		    static_cast<uint32_t>(kv_view.page_positions),
@@ -3368,7 +3367,7 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 		q_codes_readback = dev.MakeBuffer(q_codes_readback_bytes, D3D12_HEAP_TYPE_READBACK,
 		                                   D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 	}
-	D3D12_RESOURCE_BARRIER pre_copy[3]{};
+	D3D12_RESOURCE_BARRIER pre_copy[4]{};
 	pre_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	pre_copy[0].Transition.pResource = seq_uav.Get();
 	pre_copy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -3378,11 +3377,12 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 	pre_copy[1].Transition.pResource = kv_uav.Get();
 	uint32_t pre_copy_count = 2;
 	if (want_q_codes) {
-		pre_copy[2] = pre_copy[0];
-		pre_copy[2].Transition.pResource = scratch_uav.Get();
-		pre_copy_count = 3;
+		pre_copy[pre_copy_count] = pre_copy[0];
+		pre_copy[pre_copy_count].Transition.pResource = scratch_uav.Get();
+		++pre_copy_count;
 	}
-	dev.list->ResourceBarrier(pre_copy_count, pre_copy);
+	pre_copy_count += TableBackToCommonBarrier(state, &pre_copy[pre_copy_count]);
+	harness::RecordBarriers(dev.list.Get(), pre_copy_count, pre_copy);
 	// T-2113 (B3): kv_uav (whichever buffer it names) is now COPY_SOURCE, same as the
 	// pre-existing g_resident_kv path already left it for kv_fast_hit's own resume
 	// barrier to find on the NEXT call -- latch that fact into the caller-owned flag on
@@ -3390,15 +3390,14 @@ superslm::SslmForwardStatus RunLayerLoopGpuSubmit(
 	if (external_kv_resident != nullptr && io_external_kv_needs_resume_barrier != nullptr) {
 		*io_external_kv_needs_resume_barrier = true;
 	}
-	dev.list->CopyResource(seq_readback.Get(), seq_uav.Get());
+	harness::RecordCopyResource(dev.list.Get(), seq_readback.Get(), seq_uav.Get());
 	for (size_t r = 0; r < kv_row_offsets.size(); ++r) {
-		dev.list->CopyBufferRegion(kv_readback.Get(), r * static_cast<UINT64>(HD), kv_uav.Get(),
-		                            kv_row_offsets[r], HD);
+		harness::RecordCopyBufferRegion(dev.list.Get(), kv_readback.Get(), r * static_cast<UINT64>(HD), kv_uav.Get(),
+		                                kv_row_offsets[r], HD);
 	}
 	if (want_q_codes) {
-		dev.list->CopyBufferRegion(q_codes_readback.Get(), 0, scratch_uav.Get(),
-		                            state.scratch_layout.q_codes,
-		                            static_cast<UINT64>(q_codes_readback_bytes));
+		harness::RecordCopyBufferRegion(dev.list.Get(), q_codes_readback.Get(), 0, scratch_uav.Get(),
+		                                state.scratch_layout.q_codes, static_cast<UINT64>(q_codes_readback_bytes));
 	}
 	} catch (const GpuGemmGroupArithmeticError& e) {
 		// T-2101 (S4, code review 6d9e04e-t2101-gpu-throughput-review.md, confirmation pass @
@@ -3830,20 +3829,12 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 		// COPY_DEST, receives exactly this token's own byte range from the shared upload
 		// buffer at its own offset, transitions back to UNORDERED_ACCESS before this token's
 		// own dispatch chain reads it.
-		D3D12_RESOURCE_BARRIER to_copy_dest{};
-		to_copy_dest.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		to_copy_dest.Transition.pResource = seq_uav.Get();
-		to_copy_dest.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-		to_copy_dest.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-		to_copy_dest.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		dev.list->ResourceBarrier(1, &to_copy_dest);
-		dev.list->CopyBufferRegion(seq_uav.Get(), 0, chunk_embed_upload.Get(),
-		                            static_cast<UINT64>(t) * embed_block_bytes,
-		                            embed_block_bytes);
-		D3D12_RESOURCE_BARRIER to_uav = to_copy_dest;
-		to_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-		to_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-		dev.list->ResourceBarrier(1, &to_uav);
+		harness::RecordTransition(dev.list.Get(), seq_uav.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		                          D3D12_RESOURCE_STATE_COPY_DEST);
+		harness::RecordCopyBufferRegion(dev.list.Get(), seq_uav.Get(), 0, chunk_embed_upload.Get(),
+		                                static_cast<UINT64>(t) * embed_block_bytes, embed_block_bytes);
+		harness::RecordTransition(dev.list.Get(), seq_uav.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+		                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
 		// D-SLM3595: full-depth dispatch chain for this token -- the chunk primitive drives
 		// every admitted token to its complete layer count in one call, since chunking now
@@ -3908,7 +3899,7 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 	const size_t kv_readback_bytes = kv_row_offsets.size() * static_cast<size_t>(HD);
 	kv_readback = dev.MakeBuffer(kv_readback_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
 	                              D3D12_RESOURCE_STATE_COPY_DEST);
-	D3D12_RESOURCE_BARRIER pre_copy[2]{};
+	D3D12_RESOURCE_BARRIER pre_copy[3]{};
 	pre_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	pre_copy[0].Transition.pResource = seq_uav.Get();
 	pre_copy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -3916,14 +3907,15 @@ superslm::SslmForwardStatus SubmitOneSubChunkToFullDepthForG5Bridge(
 	pre_copy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	pre_copy[1] = pre_copy[0];
 	pre_copy[1].Transition.pResource = kv_uav.Get();
-	dev.list->ResourceBarrier(2, pre_copy);
+	const uint32_t pre_copy_count = 2 + TableBackToCommonBarrier(state, &pre_copy[2]);
+	harness::RecordBarriers(dev.list.Get(), pre_copy_count, pre_copy);
 	if (external_kv_resident != nullptr && io_external_kv_needs_resume_barrier != nullptr) {
 		*io_external_kv_needs_resume_barrier = true;
 	}
-	dev.list->CopyResource(seq_readback.Get(), seq_uav.Get());
+	harness::RecordCopyResource(dev.list.Get(), seq_readback.Get(), seq_uav.Get());
 	for (size_t r = 0; r < kv_row_offsets.size(); ++r) {
-		dev.list->CopyBufferRegion(kv_readback.Get(), r * static_cast<UINT64>(HD), kv_uav.Get(),
-		                            kv_row_offsets[r], HD);
+		harness::RecordCopyBufferRegion(dev.list.Get(), kv_readback.Get(), r * static_cast<UINT64>(HD), kv_uav.Get(),
+		                                kv_row_offsets[r], HD);
 	}
 	} catch (const GpuGemmGroupArithmeticError& e) {
 		// D-SLM3634 (§5.1): a mid-recording infrastructural exception is CHUNK-scoped, not
@@ -5031,15 +5023,10 @@ bool RestoreGpuSequenceState(const void* blob, size_t blob_size, superslm::Seque
 		                                    D3D12_RESOURCE_STATE_COPY_DEST);
 		// G3: the ledger's reset (plan §4.4).
 		dev.BeginRecording();
-		dev.list->CopyResource(device_buf.Get(), upload_buf.Get());
-		D3D12_RESOURCE_BARRIER b{};
-		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		b.Transition.pResource = device_buf.Get();
-		b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-		b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-		b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		dev.list->ResourceBarrier(1, &b);
-		dev.list->CopyResource(readback_buf.Get(), device_buf.Get());
+		harness::RecordCopyResource(dev.list.Get(), device_buf.Get(), upload_buf.Get());
+		harness::RecordTransition(dev.list.Get(), device_buf.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+		                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+		harness::RecordCopyResource(dev.list.Get(), readback_buf.Get(), device_buf.Get());
 		// 1.8.0 (TE-426): the Close is confirmed (CloseListConfirmed), and the Signal, which has
 		// no retry here, and the wait are rule 0 on any failure -- each throws the typed error the
 		// caller's classifier (sslm_gpu_seq_restore, gpu_1p0.cpp) reads. From G3 the submission and
@@ -5181,19 +5168,14 @@ bool RunDescriptorTableBind(const int8_t* const* array_pointers, const size_t* a
 	dev.list->SetComputeRootSignature(s_root_sig.Get());
 	const uint32_t n_arrays_u32 = static_cast<uint32_t>(n_arrays);
 	dev.list->SetComputeRoot32BitConstants(0, 1, &n_arrays_u32, 0);
-	dev.list->SetComputeRootShaderResourceView(1, counts_buf->GetGPUVirtualAddress());
-	dev.list->SetComputeRootShaderResourceView(2, offsets_buf->GetGPUVirtualAddress());
+	harness::BindRootSrv(dev.list.Get(), 1, counts_buf.Get());
+	harness::BindRootSrv(dev.list.Get(), 2, offsets_buf.Get());
 	dev.list->SetComputeRootDescriptorTable(3, heap->GetGPUDescriptorHandleForHeapStart());
-	dev.list->SetComputeRootUnorderedAccessView(4, out_uav->GetGPUVirtualAddress());
-	dev.list->Dispatch(static_cast<UINT>((n_arrays + 63) / 64), 1, 1);
-	D3D12_RESOURCE_BARRIER b{};
-	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	b.Transition.pResource = out_uav.Get();
-	b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-	b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-	b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	dev.list->ResourceBarrier(1, &b);
-	dev.list->CopyResource(readback.Get(), out_uav.Get());
+	harness::BindRootUav(dev.list.Get(), 4, out_uav.Get());
+	harness::RecordDispatch(dev.list.Get(), static_cast<UINT>((n_arrays + 63) / 64), 1, 1);
+	harness::RecordTransition(dev.list.Get(), out_uav.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+	                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+	harness::RecordCopyResource(dev.list.Get(), readback.Get(), out_uav.Get());
 	dev.CloseListOrThrow();
 	{
 		// review-g23 F1: every buffer the work reads is kept alive if the submission strands.
