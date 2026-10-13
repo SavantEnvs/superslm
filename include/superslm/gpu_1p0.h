@@ -854,7 +854,9 @@ SslmGpuStatus sslm_gpu_seq_read_prefill_final_hidden(SslmGpuContext* ctx, SslmGp
  * ============================================================================
  *
  * A pool is one device buffer of `page_count` pages of the model's page geometry (B positions per
- * page, as the CPU's sslm_kv_page_positions), with a host mirror of the same size. A budgeted
+ * page: kv_block_size when it divides the context cap, else the cap; the CPU's
+ * sslm_kv_page_positions may be larger since 1.12.0, so the two can differ, and the pool's stats
+ * report the GPU's own B), with a host mirror of the same size. A budgeted
  * sequence or prefix declares 1 <= budget <= context cap positions and reserves R(budget) pages
  * from the pool when it is created, exactly as the CPU's sslm_seq_create_budgeted; it writes up
  * to its limit, min(origin + budget, cap), and SSLM_GPU_KV_BUDGET_EXCEEDED below the cap. There
