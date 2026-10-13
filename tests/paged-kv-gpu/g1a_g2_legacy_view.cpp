@@ -76,7 +76,9 @@ void Cell65a() {
 // The matrix's legacy column: on this GPU, a dedicated sequence on each geometry -- pkv_def (D 48),
 // pkv_qk (D 128, the direct_qk branch), the real 0.5B (cap 4096) and 1.5B (cap 32768) -- prefills
 // 100 tokens and decodes 16; its tokens, context length and K/V rows [0, L) equal a CPU no-budget
-// holder's on the same artifact (the CPU's own one-page-per-B pages, read through its peek seam).
+// holder's on the same artifact (read from its 'SSB5' save, the flat block, as 1.12.0's CPU cells read a
+// no-budget holder: since 1.12.0 the CPU's B is §3.1's rule, not the kv_block_size the GPU geometry here is
+// written at, so its pages are not readable at this file's B; g1a_helpers.h CpuRows).
 // The real artifacts' CPU is pinned against R0 by 10.1. Run once per certified GPU.
 void ShortRun(SRun& d) {
 	void* s = nullptr;

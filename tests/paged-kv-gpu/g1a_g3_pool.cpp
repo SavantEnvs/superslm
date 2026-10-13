@@ -165,7 +165,7 @@ void Cell48Paged() {
 // ---- 6.5b [G3] ------------------------------------------------------------------------------------
 // GPU paged (budgeted sequences, B = 16) on R0's long_prefill and widths: tokens, context length and
 // K/V rows [0, L) through the GPU mirror peek equal the CPU paged twin (budget holders in a CPU page
-// pool, rows through the CPU page peek) and the R0 reference, on pkv_def and pkv_qk, on this GPU.
+// pool, rows from the holder's SSB6 save) and the R0 reference, on pkv_def and pkv_qk, on this GPU.
 // kills: a page-table address off by a page or a row on either vendor; a page run in the attention
 // loop that reads the next table entry early (the widths at 15, 16 and 17); a cap-width view (4096).
 void Cell65bG3() {
