@@ -688,9 +688,13 @@ bool g_last_weight_upload_was_skipped = false;
 // publishes an empty snapshot (PrepareGpuLayerLoopChunkOpenState). The accessors copy it under
 // that mutex, so no finishing poller writes shared timing state unlocked.
 LastCallTimingSnapshot<GpuCallTiming> g_last_call_timing_snapshot;
-// The publishes the catch paths and the chunk open make: a publish allocates its block, and a
-// failed allocation there must not leave a catch clause or the guard ladder by exception. A failed
-// publish keeps the previous snapshot (a diagnostic, not a status).
+// The publishes the catch paths and the chunk open make. A catch path's publish allocates its
+// block, and a failed allocation there must not leave the catch clause by exception: the call
+// already returns its classified status, and a failed publish keeps the previous snapshot. The
+// chunk open's empty publish allocates nothing (LastCallTimingSnapshot::PublishEmpty). The finish
+// tail's success publish is not one of these: it calls Publish inside the tail's try, so a host
+// allocation failure there is the call's own SSLM_GPU_ALLOCATION_FAILED (gpu_1p0.h), never
+// swallowed into SSLM_OK.
 void PublishCallTimingNoThrow(const GpuCallTiming& timing, std::vector<double> per_dispatch_ms) noexcept {
 	try {
 		g_last_call_timing_snapshot.Publish(timing, std::move(per_dispatch_ms));
@@ -4432,6 +4436,11 @@ superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuInFlightToken&& inflight,
 	rec->timing.readback_ms =
 	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_readback_start)
 	        .count();
+	// Decision 80: the call's timing becomes the last call's, under the snapshot's one mutex. The
+	// publish allocates its block; a failure there is a host allocation failure of this call, so it
+	// throws into this try's catch (rule 2) before any `seq` field is written, and a prefill's
+	// derived count stays short. Every timing field is final here.
+	g_last_call_timing_snapshot.Publish(rec->timing, std::move(rec->per_dispatch_ms));
 
 	for (uint32_t i = 0; i < H; ++i) {
 		int32_t v = 0;
@@ -4471,8 +4480,6 @@ superslm::SslmForwardStatus RunLayerLoopGpuFinish(GpuInFlightToken&& inflight,
 	seq.rope_k_saturation_count = (static_cast<uint64_t>(rk_hi_u) << 32) | static_cast<uint64_t>(rk_lo_u);
 	seq.context_length = ctxlen;
 
-	// Decision 80: the call's timing becomes the last call's, under the snapshot's one mutex.
-	PublishCallTimingNoThrow(rec->timing, std::move(rec->per_dispatch_ms));
 	if (out_ready) *out_ready = 1;
 	return DecodeStickyTag(sticky_tag);
 	} catch (const std::exception&) {

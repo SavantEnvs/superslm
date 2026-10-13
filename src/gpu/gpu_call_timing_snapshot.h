@@ -34,14 +34,17 @@ public:
 	LastCallTimingSnapshot(const LastCallTimingSnapshot&) = delete;
 	LastCallTimingSnapshot& operator=(const LastCallTimingSnapshot&) = delete;
 
-	// The tail's end (or a catch path): the call's own timing becomes the last call's.
-	void Publish(const Timing& timing, std::vector<double> per_dispatch_ms) {
+	// The tail's end (or a catch path): the call's own timing becomes the last call's. Allocates
+	// the block, and throws what that allocation throws; `per_dispatch_ms` is moved from only once
+	// the block is allocated, so a failed publish leaves the caller's vector as it was.
+	void Publish(const Timing& timing, std::vector<double>&& per_dispatch_ms) {
 		std::shared_ptr<const Block> fresh = std::make_shared<const Block>(timing, std::move(per_dispatch_ms));
 		Swap(fresh);
 	}
-	// A singleton chunk open: an empty snapshot.
+	// A singleton chunk open: an empty snapshot, held as no block (the copies read no block as the
+	// empty timing and vector). Allocates nothing.
 	void PublishEmpty() {
-		std::shared_ptr<const Block> fresh = std::make_shared<const Block>();
+		std::shared_ptr<const Block> fresh;
 		Swap(fresh);
 	}
 	Timing CopyTiming() const {
