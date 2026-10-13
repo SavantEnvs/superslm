@@ -210,6 +210,18 @@ GuardScope ScopeForHolder(const Handle* seq) noexcept {
 	return seq->pool != nullptr ? GuardScope::kAny : GuardScope::kPooled;
 }
 
+namespace {
+// The live-handle counts (SslmGpuContext::live_handles, SslmGpuModelHandle::live_sequences and
+// live_pools) are changed by verbs the header lets run concurrently on distinct handles (a budgeted
+// create beside a submitter, two pooled releases), so each is atomic (1.13 contract strike S3). A
+// decrement never takes a count below zero, as the plain `if (n > 0) n -= 1` it replaces did not.
+void DecrementLiveCount(std::atomic<int64_t>& count) noexcept {
+	int64_t n = count.load(std::memory_order_acquire);
+	while (n > 0 && !count.compare_exchange_weak(n, n - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+	}
+}
+}  // namespace
+
 struct SslmGpuContext {
 	superslm_gpu::harness::Device device;
 
@@ -230,8 +242,8 @@ struct SslmGpuContext {
 	// ContextHasLiveHandles guard (design Sec4.1.1, Sec9): incremented by every
 	// model/adapter/sequence handle this context issues (B2/B3/B6, not yet wired
 	// -- no such handle type is constructible yet), decremented on release.
-	// destroy() refuses while this is nonzero.
-	int64_t live_handles = 0;
+	// destroy() refuses while this is nonzero. Atomic: see DecrementLiveCount.
+	std::atomic<int64_t> live_handles{0};
 
 	// Set once destroy() has freed this object's own device/GPU state, so a
 	// caller who somehow retains a dangling pointer past a successful destroy
@@ -342,11 +354,11 @@ struct SslmGpuModelHandle {
 
 	// ModelHasLiveSequences guard (design Sec9, Sec4.2's own model_unmap row): T-2113 (B3)
 	// incremented by sslm_gpu_seq_create, decremented on release, below.
-	int64_t live_sequences = 0;
+	std::atomic<int64_t> live_sequences{0};  // atomic: see DecrementLiveCount
 	// Paged KV (G3): GPU page pools created against this model (sslm_gpu_kv_pool_create, destroy).
 	// A pool keeps a `model` pointer for the budgeted create's model check, so unmap refuses while
 	// one lives (SSLM_MODEL_HAS_LIVE_SEQUENCES; the plan names no status for it, noted at G3).
-	int64_t live_pools = 0;
+	std::atomic<int64_t> live_pools{0};  // atomic: see DecrementLiveCount
 
 	// T-2113 (design Sec4.2/Sec9, routed `Claude/Curie/t2112-1p0-red-suite-2026-08-15.md` Sec7.2
 	// item 2, D-SLM3417): design Sec9's own Busy row states `sslm_gpu_model_unmap` returns Busy
@@ -1759,9 +1771,7 @@ SslmGpuStatus sslm_gpu_model_unmapImpl(SslmGpuContext* ctx, SslmGpuModelHandle* 
 	// `ctx` by the check above too, kept as `model->ctx` unchanged since every handle already
 	// carries the context it was created against for exactly this reason (design Sec5.1's own
 	// per-handle ownership).
-	if (model->ctx->live_handles > 0) {
-		model->ctx->live_handles -= 1;
-	}
+	DecrementLiveCount(model->ctx->live_handles);
 	model->destroyed = true;
 	delete model;
 	return SSLM_OK;
@@ -2000,9 +2010,7 @@ SslmGpuStatus sslm_gpu_adapter_unmapImpl(SslmGpuContext* ctx, SslmGpuAdapterHand
 		// increment, above.
 		adapter->model->live_adapters -= 1;
 	}
-	if (adapter->ctx->live_handles > 0) {
-		adapter->ctx->live_handles -= 1;
-	}
+	DecrementLiveCount(adapter->ctx->live_handles);
 	adapter->destroyed = true;
 	delete adapter;
 	return SSLM_OK;
@@ -2275,9 +2283,7 @@ SslmGpuStatus sslm_gpu_seq_releaseImpl(SslmGpuContext* ctx, SslmGpuSequenceHandl
 		}
 		seq->pool = nullptr;
 	}
-	if (seq->model && seq->model->live_sequences > 0) {
-		seq->model->live_sequences -= 1;
-	}
+	if (seq->model) DecrementLiveCount(seq->model->live_sequences);
 	// T-2243 (S2, design plan Sec6.1): unbind before delete -- without this, every released
 	// sequence that was ever bound leaks one count against its adapter's own `bound_sequences`,
 	// making that adapter permanently un-unmappable even after every sequence that bound it is
@@ -2286,9 +2292,7 @@ SslmGpuStatus sslm_gpu_seq_releaseImpl(SslmGpuContext* ctx, SslmGpuSequenceHandl
 		seq->bound_adapter->bound_sequences -= 1;
 		seq->bound_adapter = nullptr;
 	}
-	if (seq->ctx->live_handles > 0) {
-		seq->ctx->live_handles -= 1;
-	}
+	DecrementLiveCount(seq->ctx->live_handles);
 	seq->destroyed = true;
 	delete seq;
 	return holder_status;
@@ -2384,8 +2388,8 @@ SslmGpuStatus sslm_gpu_kv_pool_destroyImpl(SslmGpuContext* ctx, SslmGpuKvPoolHan
 	if (!pool) return SSLM_OK;
 	if (pool->ctx != ctx) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	if (pool->live_refs > 0) return SSLM_MODEL_HAS_LIVE_SEQUENCES;
-	if (pool->model && pool->model->live_pools > 0) pool->model->live_pools -= 1;
-	if (pool->ctx->live_handles > 0) pool->ctx->live_handles -= 1;
+	if (pool->model) DecrementLiveCount(pool->model->live_pools);
+	DecrementLiveCount(pool->ctx->live_handles);
 	delete pool;
 	return SSLM_OK;
 }

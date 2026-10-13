@@ -876,8 +876,9 @@ SslmGpuStatus sslm_gpu_seq_read_prefill_final_hidden(SslmGpuContext* ctx, SslmGp
  * them but sslm_gpu_kv_pool_create, which submits on the context's device) also return SSLM_BUSY
  * while the singleton holds an unobserved submission and SSLM_DEVICE_LOST while it holds a
  * stranded one ("In-flight work" above states the promises, the scope conditions and the status
- * precedence). Every other verb below submits nothing and changes host state under the pool's
- * mutex only, so it is not refused Busy. */
+ * precedence). Every other verb below submits nothing and is not refused Busy: it changes the
+ * pool's pages under the pool's mutex, and the context's and the model's live-handle counts
+ * atomically, so verbs on distinct handles may run beside each other and beside a submitter. */
 
 /* A pool of `page_count` pages for `model`, zero-filled before it returns.
  * page_count * page_bytes above 2^32 returns SSLM_GPU_KV_POOL_TOO_LARGE. A pool the device or the host cannot allocate returns
