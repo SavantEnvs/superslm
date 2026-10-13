@@ -1,7 +1,7 @@
 """Apply one T-2851 production mutant in the isolated scratch worktree.
 
 Use from D:/_slm170 with --tree D:/_t2956-mutants/src (or, on a box that keeps scratch under
-D:\_scratch, any linked worktree with --scratch-tree --expect-head <its HEAD>). Every invocation
+D:/_scratch, any linked worktree with --scratch-tree --expect-head <its HEAD>). Every invocation
 restores the prior production mutation first; this script never touches the
 main checkout. The caller builds and executes the named test cell afterward.
 
