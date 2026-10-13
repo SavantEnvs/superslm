@@ -267,12 +267,21 @@ def apply(p: Patch, ident: str):
         p.replace(g, "\t\t\t\treturn SSLM_DEVICE_LOST;\n\t\t\t}\n\t\t}",
                   "\t\t\t\treturn SSLM_GPU_ALLOCATION_FAILED; // MUTANT k\n\t\t\t}\n\t\t}")
     elif ident.startswith("l") and len(ident) == 2 and ident[1] in "123456":
+        # Bundle allocation `slot` fails by a throw that has lost its cause, instead of being
+        # classified at its own site: the T-2851 "throwing allocation" exactly as it threw then --
+        # through v1.7.1 MakeBuffer's SSLM_GPU_HR threw a plain std::runtime_error for every HRESULT,
+        # so E_OUTOFMEMORY reached the bundle's catch as an anonymous failure (SSLM_DEVICE_LOST).
+        # Since 1.8.0 (TE-426) MakeBuffer throws the typed GpuAllocationError and the catch runs the
+        # fault classifier, so a mutant spelled `dev.MakeBuffer(...)` returns the same
+        # SSLM_GPU_ALLOCATION_FAILED as the production loop: an equivalent mutant, which survived
+        # the 1.13 sweep for that reason alone. The throw is therefore spelled out cause-less here.
         slot = int(ident[1])
         p.replace(g, "\t\tfor (const Allocation& a : allocations) {\n\t\t\tconst HRESULT hr = dev.TryMakeBuffer(a.bytes, a.heap, a.flags, a.state, a.target);",
                   "\t\tuint32_t slot = 0;\n\t\tfor (const Allocation& a : allocations) {\n"
                   f"\t\t\tif (++slot == {slot}) {{\n"
-                  "\t\t\t\t*a.target = dev.MakeBuffer(a.bytes, a.heap, a.flags, a.state);\n"
-                  "\t\t\t\tcontinue; // MUTANT l: throwing allocation\n\t\t\t}\n"
+                  "\t\t\t\tif (FAILED(dev.TryMakeBuffer(a.bytes, a.heap, a.flags, a.state, a.target)))\n"
+                  "\t\t\t\t\tthrow std::runtime_error(\"D3D12 call failed\");\n"
+                  "\t\t\t\tcontinue; // MUTANT l: throwing allocation, cause lost (T-2851 shape)\n\t\t\t}\n"
                   "\t\t\tconst HRESULT hr = dev.TryMakeBuffer(a.bytes, a.heap, a.flags, a.state, a.target);")
     elif ident == "m":
         p.replace(g, "} else if (base->config.tie_word_embeddings) {\n\t\th->head_rows = h->embed_weights.data();",
