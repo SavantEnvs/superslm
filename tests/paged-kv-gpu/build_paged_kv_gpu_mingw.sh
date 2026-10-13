@@ -80,6 +80,7 @@ g1e_cell_9_12|plain|G5|g1e_cell_9_12|
 g1e_cell_9_13|plain|G5|g1e_cell_9_13|
 g1e_cell_8_17|plain|G5|g1e_cell_8_17|
 g1e_cell_slm6_cap|plain|G5|g1e_cell_slm6_cap|
+pkvg_same_handle_race|alloc|G5|pkvg_same_handle_race|
 g1e_cell_10_3|plain|G6|g1e_cell_10_3|
 g1e_cell_10_5|plain|G6|g1e_cell_10_5|
 g1e_cell_10_7|plain|G6|g1e_cell_10_7|

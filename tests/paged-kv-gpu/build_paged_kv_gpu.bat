@@ -139,6 +139,8 @@ call :exe g1e_cell_9_12 plain G5 "g1e_cell_9_12" ""
 call :exe g1e_cell_9_13 plain G5 "g1e_cell_9_13" ""
 call :exe g1e_cell_8_17 plain G5 "g1e_cell_8_17" ""
 call :exe g1e_cell_slm6_cap plain G5 "g1e_cell_slm6_cap" ""
+rem 1.13.0 contract fold: the same-handle decode race for every decode entry point (allocation-fault engine: its claim seam).
+call :exe pkvg_same_handle_race alloc G5 "pkvg_same_handle_race" ""
 rem G6 (plan §7 10.3, 10.5, 10.7; §10 R1): the GPU cohort and admission cells, and the decode timing harness
 rem (plain configuration: the harness refuses any seam definition at compile time).
 call :exe g1e_cell_10_3 plain G6 "g1e_cell_10_3" ""

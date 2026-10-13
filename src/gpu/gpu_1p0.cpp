@@ -858,6 +858,29 @@ void SetGpuSeqState(SslmGpuSequenceHandle* seq, superslm_gpu::SslmSequenceGpuSta
 	}
 }
 
+#if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION)
+// Test seam (test builds only; tests/paged-kv-gpu/pkvg_same_handle_race.cpp): a hook run on the
+// claiming thread each time a decode call takes a handle's same-sequence claim, while it holds it
+// and before it reads or changes anything else on the handle. A race cell pauses the winner there
+// and makes its losing calls inside the window, so the overlap is certain rather than likely.
+using SslmGpuSeqClaimHookForTestFn = void (*)(SslmGpuSequenceHandle* seq, void* user);
+namespace {
+std::atomic<SslmGpuSeqClaimHookForTestFn> g_seq_claim_hook_for_test{nullptr};
+std::atomic<void*> g_seq_claim_hook_user_for_test{nullptr};
+}  // namespace
+void SslmGpuSeqClaimHookForTest(SslmGpuSeqClaimHookForTestFn hook, void* user) noexcept {
+	g_seq_claim_hook_user_for_test.store(user, std::memory_order_release);
+	g_seq_claim_hook_for_test.store(hook, std::memory_order_release);
+}
+namespace {
+void RunSeqClaimHookForTest(SslmGpuSequenceHandle* seq) {
+	if (const SslmGpuSeqClaimHookForTestFn hook = g_seq_claim_hook_for_test.load(std::memory_order_acquire)) {
+		hook(seq, g_seq_claim_hook_user_for_test.load(std::memory_order_acquire));
+	}
+}
+}  // namespace
+#endif
+
 namespace {
 
 // The same-sequence decode claim's scope (SslmGpuSequenceHandle::decode_claimed): held() is false
@@ -866,7 +889,11 @@ namespace {
 class SeqDecodeClaim {
 public:
 	explicit SeqDecodeClaim(SslmGpuSequenceHandle* seq) noexcept
-	    : seq_(seq), held_(!seq->decode_claimed.exchange(true, std::memory_order_acq_rel)) {}
+	    : seq_(seq), held_(!seq->decode_claimed.exchange(true, std::memory_order_acq_rel)) {
+#if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION)
+		if (held_) RunSeqClaimHookForTest(seq_);
+#endif
+	}
 	~SeqDecodeClaim() {
 		if (held_) seq_->decode_claimed.store(false, std::memory_order_release);
 	}

@@ -110,6 +110,8 @@ const Job kJobs[] = {
     {"8.17", 5, 0, "g1e_cell_8_17.exe", "--fixture-dir={fx}", "fx", kOn},
     // G5 review F1/F2: a pooled holder at its cap saves and restores; GPU SLM6 K/V == CPU SSB6 K/V.
     {"G5/slm6-cap", 5, 0, "g1e_cell_slm6_cap.exe", "--fixture-dir={fx}", "fx", kOn},
+    // 1.13.0 contract fold: the same-handle decode race, every decode entry point, dedicated and pooled.
+    {"G5/same-handle-race", 5, 0, "pkvg_same_handle_race.exe", "--fixture-dir={fx}", "fx", kOn},
     // 9.8: leg 1 writes the pooled SLM6 and dedicated SLM5 files into --out98; leg 2 is the v1.12.0
     // reader (built from the other tree, --old-bin) refusing SLM6 with 7. Leg 2 runs after leg 1.
     {"9.8/leg1", 5, 0, "g1e_cell_9_8.exe", "--fixture-dir={fx}", "fx out98", kOn},
