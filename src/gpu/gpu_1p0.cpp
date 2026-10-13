@@ -1326,7 +1326,7 @@ SslmGpuStatus CreateDeviceLogitsBuffers(SslmGpuContext* ctx, const int8_t* head_
 
 		// Phase B. The ledger's reset (G3, plan §4.4).
 		dev.BeginRecording();
-		dev.list->CopyResource(out->head.Get(), staging.Get());
+		superslm_gpu::harness::RecordCopyResource(dev.list.Get(), out->head.Get(), staging.Get());
 		TransitionBuffer(dev.list.Get(), out->head.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
 		           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		dev.CloseListOrThrow();
@@ -5551,9 +5551,10 @@ SslmGpuStatus sslm_gpu_prefix_prefillImpl(SslmGpuContext* ctx, SslmGpuPrefixHand
 SslmGpuStatus sslm_gpu_prefix_freezeImpl(SslmGpuContext* ctx, SslmGpuPrefixHandle* prefix) {
 	if (!ctx || !prefix || prefix->ctx != ctx || prefix->seq == nullptr) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	if (prefix->frozen) return SSLM_OK;
-	prefix->frozen = true;
 	const superslm::kv_pages::PageStatus ps = superslm::kv_pages::HolderReturnReserve(prefix->seq->holder, nullptr);
-	return ps == superslm::kv_pages::PageStatus::kOk ? SSLM_OK : SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (ps != superslm::kv_pages::PageStatus::kOk) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	prefix->frozen = true;  // only once the reserve is back: a refused freeze leaves the prefix unfrozen
+	return SSLM_OK;
 }
 
 // §3.3's release rows: the internal sequence's release (its private pages and reserve back to the pool,
