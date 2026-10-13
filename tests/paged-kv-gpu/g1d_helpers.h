@@ -34,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <stdexcept>
@@ -121,7 +122,18 @@ inline void SetPhase(const char* name) {
 }
 inline void PhaseDone() { Phase().store(kPhaseDone); }
 
-inline void StartWatchdog(int seconds) {
+// Under the debug layer (SSLM_GPU_ENABLE_DEBUG_LAYER=1, which also turns on GPU-based validation) every
+// submission runs many times slower, so a limit sized for a plain run (3.12 asks for 120 s) fires on a run
+// that is only slow. The limit is scaled by kDebugLayerWatchdogScale there and kept as given with the layer
+// off, so a real hang is still caught quickly on a plain run.
+constexpr int kDebugLayerWatchdogScale = 10;
+inline int WatchdogSeconds(int seconds) {
+	const char* v = std::getenv("SSLM_GPU_ENABLE_DEBUG_LAYER");
+	return (v != nullptr && v[0] == '1') ? seconds * kDebugLayerWatchdogScale : seconds;
+}
+
+inline void StartWatchdog(int requested_seconds) {
+	const int seconds = WatchdogSeconds(requested_seconds);
 	std::thread([seconds] {
 		int last = Phase().load();
 		auto t0 = std::chrono::steady_clock::now();
