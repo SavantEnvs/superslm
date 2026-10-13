@@ -85,8 +85,8 @@
 #include <unordered_set>
 #include "detail/int_hash.h"
 #include <vector>
-#if defined(_M_X64) || defined(__x86_64__)
-#include <emmintrin.h>  // GatherFlatBlock's streaming stores (SSE2, baseline on x64)
+#if (defined(_M_X64) && !defined(_M_ARM64EC)) || defined(__x86_64__)
+#include <emmintrin.h>  // GatherFlatBlock's streaming stores (SSE2, baseline on x64; not ARM64EC)
 #endif
 
 #include "superslm/adapter_marshal.h"
@@ -1896,21 +1896,40 @@ size_t KvRuns(const superslm::SslmModelConfig& c) {
 // and one fill per run tail, each small enough that the runtime takes the cached path, so every
 // destination line is read for ownership first and the block is pushed through the cache: a
 // full-length save took 1.88 to 1.93 times 1.11.0's (docs/releases/1.12.0.md, *Speed*). For a block
-// of kGatherStreamBytes or more, these two write with SSE2 streaming stores on x64 (the ends of a
-// misaligned span by plain stores) and GatherFlatBlock fences once before returning; for a smaller
-// block, which a cache holds, and on other targets they are memcpy and memset, which measured faster
-// there. The threshold is a fixed size, not a query of the cache. The bytes are the same either way.
+// of kGatherStreamBytes or more, these two write with SSE2 streaming stores on x64 and
+// GatherFlatBlock fences once before returning. They stream whole 64-byte lines only, four 16-byte
+// stores per line: the head up to the first line boundary and the tail past the last whole line are
+// plain memcpy or memset. A line written partly by streaming and partly by plain stores (a 16-byte
+// alignment, where a slab boundary falls inside a line) measured 5 to 10 per cent slower than
+// memcpy at 12 of the 16 offsets mod 64; with 64-byte alignment every offset measured faster than
+// memcpy. For a smaller block, which a cache holds, they are memcpy and memset, which measured
+// faster there. On every other target, ARM64EC included, they are memcpy and memset. The threshold is a fixed size, not a query of the cache; test libraries
+// can lower it (sslm_pkv_test_only_set_gather_stream_bytes) so the CPU suites, whose fixtures'
+// blocks are all below it, run the streaming path. The bytes are the same either way.
 constexpr size_t kGatherStreamBytes = size_t{16} << 20;
+#ifdef SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS
+std::atomic<size_t> g_gather_stream_bytes{kGatherStreamBytes};
+size_t GatherStreamBytes() { return g_gather_stream_bytes.load(std::memory_order_relaxed); }
+#else
+constexpr size_t GatherStreamBytes() { return kGatherStreamBytes; }
+#endif
 
 void BlockCopy(uint8_t* dst, const uint8_t* src, size_t n, bool stream) {
-#if defined(_M_X64) || defined(__x86_64__)
+#if (defined(_M_X64) && !defined(_M_ARM64EC)) || defined(__x86_64__)
 	if (stream) {
-		const size_t head = std::min(n, (16u - (reinterpret_cast<uintptr_t>(dst) & 15u)) & 15u);
+		const size_t head = std::min(n, (64u - (reinterpret_cast<uintptr_t>(dst) & 63u)) & 63u);
 		std::memcpy(dst, src, head);
 		size_t i = head;
-		for (; i + 16 <= n; i += 16)
+		for (; i + 64 <= n; i += 64) {
 			_mm_stream_si128(reinterpret_cast<__m128i*>(dst + i),
 			                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i)));
+			_mm_stream_si128(reinterpret_cast<__m128i*>(dst + i + 16),
+			                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i + 16)));
+			_mm_stream_si128(reinterpret_cast<__m128i*>(dst + i + 32),
+			                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i + 32)));
+			_mm_stream_si128(reinterpret_cast<__m128i*>(dst + i + 48),
+			                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i + 48)));
+		}
 		std::memcpy(dst + i, src + i, n - i);
 		return;
 	}
@@ -1920,13 +1939,18 @@ void BlockCopy(uint8_t* dst, const uint8_t* src, size_t n, bool stream) {
 }
 
 void BlockZero(uint8_t* dst, size_t n, bool stream) {
-#if defined(_M_X64) || defined(__x86_64__)
+#if (defined(_M_X64) && !defined(_M_ARM64EC)) || defined(__x86_64__)
 	if (stream) {
-		const size_t head = std::min(n, (16u - (reinterpret_cast<uintptr_t>(dst) & 15u)) & 15u);
+		const size_t head = std::min(n, (64u - (reinterpret_cast<uintptr_t>(dst) & 63u)) & 63u);
 		std::memset(dst, 0, head);
 		size_t i = head;
 		const __m128i zero = _mm_setzero_si128();
-		for (; i + 16 <= n; i += 16) _mm_stream_si128(reinterpret_cast<__m128i*>(dst + i), zero);
+		for (; i + 64 <= n; i += 64) {
+			_mm_stream_si128(reinterpret_cast<__m128i*>(dst + i), zero);
+			_mm_stream_si128(reinterpret_cast<__m128i*>(dst + i + 16), zero);
+			_mm_stream_si128(reinterpret_cast<__m128i*>(dst + i + 32), zero);
+			_mm_stream_si128(reinterpret_cast<__m128i*>(dst + i + 48), zero);
+		}
 		std::memset(dst + i, 0, n - i);
 		return;
 	}
@@ -1946,7 +1970,7 @@ void GatherFlatBlock(const sslm_kv_pool_s* pool, const sslm_seq_s* seq, const su
 	const size_t runs = KvRuns(c);
 	const size_t run_bytes = cap * D;
 	const size_t slab = static_cast<size_t>(B) * D;  // one run's rows within one page
-	const bool stream = block_size >= kGatherStreamBytes;
+	const bool stream = block_size >= GatherStreamBytes();
 	// Rows [0, L), page by page: each page is read once, one memcpy per run (a page holds every run's
 	// B rows in its own slot, (r + j) mod runs by §3.1's rotation, and the runs are cap * D apart in
 	// the block). The table is read once per page, through the address path; run r's slab is the
@@ -1975,7 +1999,7 @@ void GatherFlatBlock(const sslm_kv_pool_s* pool, const sslm_seq_s* seq, const su
 	}
 	// block_size is runs * cap * D for a one-byte element; any bytes past the runs are zero too.
 	if (runs * run_bytes < block_size) BlockZero(dst + runs * run_bytes, block_size - runs * run_bytes, stream);
-#if defined(_M_X64) || defined(__x86_64__)
+#if (defined(_M_X64) && !defined(_M_ARM64EC)) || defined(__x86_64__)
 	if (stream) _mm_sfence();  // the streaming stores are ordered before the save returns
 #endif
 }
@@ -4907,6 +4931,22 @@ extern "C" sslm_status sslm_pkv_test_only_drain_reserve(sslm_seq seq) {
 	if (!seq || !seq->kv) return SSLM_INVALID_ARGUMENT;
 	std::lock_guard<std::mutex> lock(seq->lifecycle_mutex);
 	return MapPageStatus(superslm::kv_pages::HolderReturnReserve(seq->kv, nullptr));
+}
+
+// The save-speed fix's streaming threshold (GatherFlatBlock): from the next save on, a whole_reserve
+// holder's SSB5 block is written with streaming stores when it is `bytes` or larger; 0 restores
+// kGatherStreamBytes (16 MiB). Process-wide. Every CPU fixture's block is below 16 MiB, so without
+// this no CPU suite runs the streaming path (cell 9.3s). Returns 1 where the threshold is adjustable
+// (the test libraries, SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS) and 0 elsewhere, where it is a constant
+// and the call changes nothing, so a cell can tell it did not run the path rather than pass vacuously.
+extern "C" int sslm_pkv_test_only_set_gather_stream_bytes(size_t bytes) {
+#ifdef SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS
+	g_gather_stream_bytes.store(bytes == 0 ? kGatherStreamBytes : bytes, std::memory_order_relaxed);
+	return 1;
+#else
+	(void)bytes;
+	return 0;
+#endif
 }
 
 #ifdef SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS
