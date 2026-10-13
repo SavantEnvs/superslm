@@ -760,11 +760,13 @@ struct SslmGpuSequenceHandle final : public superslm_gpu::inflight::InFlightHand
 	// (gpu_1p0.cpp) -- identical disposition here.
 	bool destroyed = false;
 
-	// The same-sequence decode claim (t2112 dim3 M2, the 1.13 box finding): taken with one atomic
-	// exchange by every decode submission on this handle (SeqDecodeClaim, below) before it reads
-	// `state`, and held until the call returns, by which time a submission that succeeded has moved
-	// the handle to Submitted. A second thread's decode of the SAME handle that finds it held
-	// returns SSLM_BUSY and touches nothing. Without it the Idle check, EntrySubmitGuard and
+	// The same-sequence decode claim (t2112 dim3 M2, the 1.13 box finding; widened by the 1.13
+	// contract strike's B1): taken with one atomic exchange by every decode entry point on this
+	// handle -- sslm_decode_step_gpu, each batch slot, SslmGpuSeqDecodeStepForG5Bridge and
+	// SslmGpuSeqFinishTokenForG5Bridge (SeqDecodeClaim, below) -- before it reads `state`, and held
+	// until the call returns, by which time a submission that succeeded has moved the handle to
+	// Submitted. A second thread's decode or finish of the SAME handle that finds it held returns
+	// SSLM_BUSY and touches nothing. Without it the Idle check, EntrySubmitGuard and
 	// BeginRecording()'s ledger check are three unlocked reads, so two threads on one handle could
 	// all pass them and record into the singleton's one command list at once (heap corruption under
 	// the D3D12 debug layer, a winevulkan abort on the software GPU, or a silent Ok/Ok). It never
@@ -883,19 +885,40 @@ void RunSeqClaimHookForTest(SslmGpuSequenceHandle* seq) {
 
 namespace {
 
+// The handle whose same-sequence claim this thread holds, null when none: a decode entry point that
+// calls another one on the same handle (the bridge decode drives sslm_decode_step_gpu and calls the
+// finish) re-enters its own claim instead of refusing itself.
+thread_local SslmGpuSequenceHandle* t_claimed_seq = nullptr;
+
 // The same-sequence decode claim's scope (SslmGpuSequenceHandle::decode_claimed): held() is false
 // when another thread's decode of the same handle holds it, and the caller then returns SSLM_BUSY
-// (the single call) or writes it to the slot (the batch) without touching the handle.
+// (the single calls) or writes it to the slot (the batch) without touching the handle. Taken by
+// every decode entry point -- sslm_decode_step_gpu, each batch slot, SslmGpuSeqDecodeStepForG5Bridge
+// and SslmGpuSeqFinishTokenForG5Bridge -- before its first read of the handle's state, and held
+// until that call returns, on every path (an exception unwinds through the destructor). A nested
+// claim on the same thread and handle is held without a second exchange and released by the
+// outermost one. The claim never outlives a call: a thread that submits (sslm_decode_step_gpu),
+// drains (sslm_gpu_ready) and then finishes takes it afresh at each call, and the Submitted state,
+// not the claim, refuses other calls between the submit and the drain.
 class SeqDecodeClaim {
 public:
 	explicit SeqDecodeClaim(SslmGpuSequenceHandle* seq) noexcept
-	    : seq_(seq), held_(!seq->decode_claimed.exchange(true, std::memory_order_acq_rel)) {
+	    : seq_(seq),
+	      nested_(t_claimed_seq == seq),
+	      held_(nested_ || !seq->decode_claimed.exchange(true, std::memory_order_acq_rel)) {
+		if (held_ && !nested_) {
+			prev_ = t_claimed_seq;
+			t_claimed_seq = seq_;
 #if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION)
-		if (held_) RunSeqClaimHookForTest(seq_);
+			RunSeqClaimHookForTest(seq_);
 #endif
+		}
 	}
 	~SeqDecodeClaim() {
-		if (held_) seq_->decode_claimed.store(false, std::memory_order_release);
+		if (held_ && !nested_) {
+			t_claimed_seq = prev_;
+			seq_->decode_claimed.store(false, std::memory_order_release);
+		}
 	}
 	SeqDecodeClaim(const SeqDecodeClaim&) = delete;
 	SeqDecodeClaim& operator=(const SeqDecodeClaim&) = delete;
@@ -903,7 +926,9 @@ public:
 
 private:
 	SslmGpuSequenceHandle* const seq_;
+	const bool nested_;
 	const bool held_;
+	SslmGpuSequenceHandle* prev_ = nullptr;
 };
 
 // Paged KV (G3): the host buffer a sequence's K/V view addresses -- the pool's mirror for a pooled
@@ -4013,6 +4038,10 @@ SslmGpuStatus SslmGpuSeqFinishTokenForG5BridgeImpl(SslmGpuContext* ctx, SslmGpuS
 	if (!ctx || !seq || !seq->model || seq->ctx != ctx) {
 		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	}
+	// The same-sequence claim (strike B1): another thread's decode or finish of this handle makes
+	// this call SSLM_BUSY before it reads anything; re-entered when the bridge decode calls it.
+	const SeqDecodeClaim claim(seq);
+	if (!claim.held()) return SSLM_BUSY;
 	if (seq->state() != superslm_gpu::SslmSequenceGpuState::Idle) {
 		return SSLM_BUSY;  // an in-flight Submitted call must be drained (sslm_gpu_ready) first.
 	}
@@ -4883,6 +4912,12 @@ SslmGpuStatus SslmGpuSeqDecodeStepForG5BridgeImpl(SslmGpuContext* ctx, SslmGpuSe
 	if (!ctx || !seq || !seq->model || seq->ctx != ctx || dispatch_budget < 1) {
 		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	}
+	// The same-sequence claim (strike B1), held across the whole call -- the state read, the guard,
+	// the ready flag, the embed, the drive and the finish -- so a second thread's decode or finish of
+	// this handle returns SSLM_BUSY having changed nothing. The drive's sslm_decode_step_gpu calls and
+	// the finish re-enter it on this thread.
+	const SeqDecodeClaim claim(seq);
+	if (!claim.held()) return SSLM_BUSY;
 	if (seq->state() == superslm_gpu::SslmSequenceGpuState::Submitted) return SSLM_BUSY;
 	// EntrySubmitGuard (§4.4): the bridge decode reaches both devices (the drive on the singleton,
 	// the finish's device logits on the context's own), so the ledger term applies; scope by

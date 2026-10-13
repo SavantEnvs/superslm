@@ -25,13 +25,20 @@
 // Winner verbs: decode (embed, then sslm_decode_step_gpu, drained after), bridge (a fresh handle, bridge
 // decode of a token), bridge-ready (after a 3-token prefill, the ready branch), finish (at full depth).
 // Holders: dedicated (sslm_gpu_seq_create, cap 64) and pooled (budget 64 on one pool).
+// Release: a bridge decode refused inside its drive leaves no claim behind (another thread's next calls are
+// judged on the handle's state).
+// Counters (strike S3): budgeted create and pooled release churned on two threads beside a live dedicated
+// sequence keep the model's and the context's live counts exact (--counter-iterations=N, default 20000).
 //
 // Run: pkvg_same_handle_race.exe --fixture-dir=DIR   (python tools/gen_paged_kv_fixture.py DIR)
 // Software GPU: tools/cloud_gpu/wine_gpu.sh exec <repo>/out/pkvg/pkvg_same_handle_race.exe --fixture-dir=DIR
 #include "g1e_helpers.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <thread>
 
@@ -205,6 +212,89 @@ void RunCase(const Env& e, Park& park, SslmGpuSequenceHandle* s, SslmGpuSequence
 	            parked ? "all inside its claim" : "NOT inside its claim");
 }
 
+// The claim never outlives a call, on a refusal path either: a bridge decode refused inside its drive
+// (a budget below one layer) leaves the handle claimable, so calls from another thread are judged on the
+// handle's state, never refused SSLM_BUSY by a claim left behind.
+void ReleaseAfterRefusal(const Env& e, SslmGpuSequenceHandle* s, const char* holder) {
+	int32_t tok = -1;
+	const GS refused = SslmGpuSeqDecodeStepForG5Bridge(e.ctx, s, kTokA, 1u, &tok);
+	CHECK_MSG(refused == GS::SSLM_DISPATCH_BUDGET_TOO_SMALL, "release %s: a one-dispatch bridge decode returned %s",
+	          holder, StatusName(refused));
+	GS finish = GS::SSLM_DEVICE_LOST, bridge = GS::SSLM_DEVICE_LOST;
+	int32_t ftok = -1, btok = -1;
+	std::thread other([&] {
+		finish = SslmGpuSeqFinishTokenForG5Bridge(e.ctx, s, &ftok);
+		bridge = SslmGpuSeqDecodeStepForG5Bridge(e.ctx, s, kTokA, e.full_budget, &btok);
+	});
+	other.join();
+	CHECK_MSG(finish == GS::SSLM_SEQUENCE_REJECTED, "release %s: another thread's finish after the refusal returned %s, "
+	          "want SSLM_SEQUENCE_REJECTED (not at full depth)", holder, StatusName(finish));
+	CHECK_MSG(bridge == GS::SSLM_OK && btok >= 0, "release %s: another thread's bridge decode after the refusal returned %s "
+	          "token %d", holder, StatusName(bridge), btok);
+	std::printf("release %s: refused %s, then another thread's finish %s and bridge %s\n", holder, StatusName(refused),
+	            StatusName(finish), StatusName(bridge));
+}
+
+// Strike S3: the context's and the model's live-handle counts, changed by verbs on distinct handles that
+// the header lets run concurrently (budgeted create and pooled release on two threads). A dedicated
+// sequence D lives throughout. After both threads finish and the pool is destroyed, the model must still
+// refuse its unmap (D is live: a lost increment, clamped at zero on the way down, lets it through -- the
+// use-after-free the strike describes); once D is released the unmap and the context's destroy must
+// succeed (a lost decrement refuses them for ever).
+void Counters(const std::string& path, int iterations) {
+	SslmGpuContext* ctx = nullptr;
+	const GS cs = sslm_gpu_context_create(GpuContextConfig{}, &ctx);
+	CHECK_MSG(cs == GS::SSLM_OK && ctx, "counters: context: %s", StatusName(cs));
+	if (!ctx) return;
+	GpuModelFixture fx;
+	if (!fx.Open(path, ctx)) {
+		CHECK_MSG(false, "counters: fixture did not open");
+		sslm_gpu_context_destroy(ctx);
+		return;
+	}
+	SslmGpuSequenceHandle* d = nullptr;
+	CHECK(sslm_gpu_seq_create(ctx, fx.model, 64, &d) == GS::SSLM_OK);
+	SslmGpuKvPoolHandle* pool = nullptr;
+	CHECK(sslm_gpu_kv_pool_create(ctx, fx.model, 16, &pool) == GS::SSLM_OK);
+	std::atomic<int> refused{0};
+	std::atomic<bool> go{false};
+	auto churn = [&] {
+		while (!go.load(std::memory_order_acquire)) {
+		}
+		for (int i = 0; i < iterations; ++i) {
+			SslmGpuSequenceHandle* h = nullptr;
+			if (sslm_gpu_seq_create_budgeted(ctx, fx.model, pool, 16, &h) != GS::SSLM_OK || !h) {
+				refused.fetch_add(1);
+				continue;
+			}
+			if (sslm_gpu_seq_release(ctx, h) != GS::SSLM_OK) refused.fetch_add(1);
+		}
+	};
+	std::thread a(churn), b(churn);
+	go.store(true, std::memory_order_release);
+	a.join();
+	b.join();
+	CHECK_MSG(refused.load() == 0, "counters: %d budgeted creates or releases refused", refused.load());
+	CHECK(sslm_gpu_kv_pool_destroy(ctx, pool) == GS::SSLM_OK);
+	const GS early = sslm_gpu_model_unmap(ctx, fx.model);
+	CHECK_MSG(early == GS::SSLM_MODEL_HAS_LIVE_SEQUENCES,
+	          "counters: the model unmap with a dedicated sequence still live returned %s (a lost increment)", StatusName(early));
+	if (early == GS::SSLM_OK) {
+		fx.model = nullptr;  // freed under a live sequence; nothing more is safe on this context
+		std::printf("counters: model unmapped under a live sequence\n");
+		return;
+	}
+	CHECK(sslm_gpu_seq_release(ctx, d) == GS::SSLM_OK);
+	const GS unmap = sslm_gpu_model_unmap(ctx, fx.model);
+	CHECK_MSG(unmap == GS::SSLM_OK, "counters: the model unmap after every sequence was released returned %s (a lost "
+	          "decrement)", StatusName(unmap));
+	if (unmap == GS::SSLM_OK) fx.model = nullptr;
+	const GS destroy = sslm_gpu_context_destroy(ctx);
+	CHECK_MSG(destroy == GS::SSLM_OK, "counters: the context destroy returned %s (a lost decrement)", StatusName(destroy));
+	std::printf("counters: 2 x %d budgeted create + release beside a live dedicated sequence; unmap %s, then %s; destroy %s\n",
+	            iterations, StatusName(early), StatusName(unmap), StatusName(destroy));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -224,6 +314,17 @@ int main(int argc, char** argv) {
 				if (s) CHECK_MSG(sslm_gpu_seq_release(e.ctx, s) == GS::SSLM_OK, "dedicated/%s: release S", WinnerName(w));
 				if (t) CHECK_MSG(sslm_gpu_seq_release(e.ctx, t) == GS::SSLM_OK, "dedicated/%s: release T", WinnerName(w));
 			}
+			{
+				SslmGpuSequenceHandle* s = nullptr;
+				CHECK(sslm_gpu_seq_create(e.ctx, e.model(), 64, &s) == GS::SSLM_OK);
+				if (s) {
+					ReleaseAfterRefusal(e, s, "dedicated");
+					CHECK(sslm_gpu_seq_release(e.ctx, s) == GS::SSLM_OK);
+				}
+				Rig rig(e, static_cast<uint32_t>(e.geo.R(64)));
+				GSeq p = rig.pool ? rig.Budgeted(64) : GSeq{};
+				if (p.h) ReleaseAfterRefusal(e, p.h, "pooled");
+			}
 			for (Winner w : winners) {
 				Rig rig(e, static_cast<uint32_t>(2 * e.geo.R(64)));
 				if (!rig.pool) break;
@@ -232,6 +333,13 @@ int main(int argc, char** argv) {
 			}
 			SslmGpuSeqClaimHookForTest(nullptr, nullptr);
 		}
+	}
+	{
+		int iterations = 20000;
+		for (int i = 1; i < argc; ++i)
+			if (std::strncmp(argv[i], "--counter-iterations=", 21) == 0) iterations = std::atoi(argv[i] + 21);
+		const std::string path = FixturePath(argc, argv);
+		if (!path.empty()) Counters(path, iterations);
 	}
 	return FinishSuite("pkvg_same_handle_race");
 }
