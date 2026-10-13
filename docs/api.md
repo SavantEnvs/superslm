@@ -427,10 +427,12 @@ supported use. From 1.13.0 the four decode entry points,
 take a per-handle claim before they read the handle and hold it until they
 return, so two of them raced on one handle, in any pairing, stay
 memory-safe: one runs and the other returns `SSLM_BUSY` having changed
-nothing (a batch slot reads `SSLM_BUSY`). The claim lasts one call, so one
-thread's submit, `sslm_gpu_ready` and finish each take it in turn. Other
-calls raced on one handle (embed, the prefill bridges, reset, save, schema
-binding, release) remain the caller's to serialize.
+nothing (a batch slot reads `SSLM_BUSY`). The claim lasts one call, so a
+thread that submits, drains and finishes takes it afresh at each decode
+call. `sslm_gpu_ready` takes no claim: two `sslm_gpu_ready` calls on one
+handle, or one beside a decode entry point on that handle, are the caller's
+to serialize, as are other calls raced on one handle (embed, the prefill
+bridges, reset, save, schema binding, release).
 
 ### Status causes
 

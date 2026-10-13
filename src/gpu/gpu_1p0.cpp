@@ -910,8 +910,9 @@ thread_local SslmGpuSequenceHandle* t_claimed_seq = nullptr;
 // until that call returns, on every path (an exception unwinds through the destructor). A nested
 // claim on the same thread and handle is held without a second exchange and released by the
 // outermost one. The claim never outlives a call: a thread that submits (sslm_decode_step_gpu),
-// drains (sslm_gpu_ready) and then finishes takes it afresh at each call, and the Submitted state,
-// not the claim, refuses other calls between the submit and the drain.
+// drains (sslm_gpu_ready, which takes no claim) and then finishes takes it afresh at each decode
+// call, and the Submitted state, not the claim, refuses other decode calls between the submit and
+// the drain. A second sslm_gpu_ready on the same handle is the caller's to serialize (header).
 class SeqDecodeClaim {
 public:
 	explicit SeqDecodeClaim(SslmGpuSequenceHandle* seq) noexcept

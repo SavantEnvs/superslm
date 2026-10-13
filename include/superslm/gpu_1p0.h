@@ -564,10 +564,12 @@ SslmGpuStatus sslm_gpu_seq_reset(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq
  * sslm_decode_step_batch_gpu, SslmGpuSeqDecodeStepForG5Bridge and SslmGpuSeqFinishTokenForG5Bridge
  * -- take a per-handle claim before they read the handle, held until they return, so two of them
  * raced on one handle, in any pairing, stay memory-safe: one runs and the other returns SSLM_BUSY
- * having changed nothing (a batch slot reads SSLM_BUSY). The claim lasts one call: one thread's
- * submit, sslm_gpu_ready and finish each take it afresh, and between the submit and the drain the
- * handle's Submitted state refuses the others. Other verbs racing on one handle (embed, the prefill
- * bridges, reset, save, schema binding, release) remain the caller's to serialize. */
+ * having changed nothing (a batch slot reads SSLM_BUSY). The claim lasts one call: a thread that
+ * submits, drains and then finishes takes it afresh at each decode call, and between the submit and
+ * the drain the handle's Submitted state refuses the others. sslm_gpu_ready takes no claim: two
+ * sslm_gpu_ready calls on one handle, or one beside a decode entry point on that handle, are the
+ * caller's to serialize, as are the other verbs racing on one handle (embed, the prefill bridges,
+ * reset, save, schema binding, release). */
 SslmGpuStatus sslm_decode_step_gpu(
     SslmGpuContext* ctx,
     SslmGpuSequenceHandle* seq,
