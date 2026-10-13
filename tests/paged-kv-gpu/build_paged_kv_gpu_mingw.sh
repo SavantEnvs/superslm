@@ -3,13 +3,18 @@
 # for the software GPU (Wine + vkd3d-proton + lavapipe; tools/cloud_gpu/wine_gpu.sh). It builds the SAME
 # executables as tests/paged-kv-gpu/build_paged_kv_gpu.bat (the box build), from the same table.
 #
-# Usage: tests/paged-kv-gpu/build_paged_kv_gpu_mingw.sh [--out=DIR] [--jobs=N] [--list] [TARGET ...]
+# Usage: tests/paged-kv-gpu/build_paged_kv_gpu_mingw.sh [--out=DIR] [--jobs=N] [--state-tracking] [--list] [TARGET ...]
 #   TARGET   g2 | g3 | g4 | g5 | g6   every executable whose bracket is that step (default: all five)
 #            <exe name>          one executable from the table below (e.g. pkvg_g2, g1d_cell_3_6f)
 #   --out    default <repo>/out/pkvg (the exes must sit under the repo: the shader staleness check walks up
 #            from the exe to src/gpu/shaders)
 #   --jobs   parallel compiles (default 2; the container is shared)
 #   --list   print the table and exit
+#   --state-tracking  build engine and cells with SUPERSLM_GPU_STATE_TRACKING (src/gpu/gpu_resource_state_tracker.h):
+#            the host-side resource-state tracker checks every barrier, copy and dispatch and prints
+#            "# GPU STATE VIOLATION" lines and an exit summary. Default --out becomes <repo>/out/pkvg-track and the
+#            objects are cached apart, so tracking and plain builds never mix. The software GPU has no D3D12
+#            validation; this is its stand-in for the resource-state class.
 #
 # Each executable is reported LINKED, or RED BY LINK with its undefined symbols (also written to
 # <out>/<exe>.undefined), or RED BY COMPILE. RED BY LINK is the expected state of a step's executables until
@@ -31,20 +36,25 @@ REPO="$(cd "$HERE/../.." && pwd)"
 # shellcheck source=../../tools/cloud_gpu/wine_gpu.sh
 WINE_GPU_SOURCED=1 . "$REPO/tools/cloud_gpu/wine_gpu.sh"
 
-OUT="$REPO/out/pkvg"
+OUT=""
 JOBS=2
 LIST=0
+TRACK=0
 TARGETS=()
 for a in "$@"; do
 	case "$a" in
 		--out=*) OUT="${a#--out=}" ;;
 		--jobs=*) JOBS="${a#--jobs=}" ;;
 		--list) LIST=1 ;;
+		--state-tracking) TRACK=1 ;;
 		-*) echo "unknown flag $a" >&2; exit 2 ;;
 		*) TARGETS+=("$a") ;;
 	esac
 done
 [ ${#TARGETS[@]} -eq 0 ] && TARGETS=(g2 g3 g4 g5 g6)
+if [ -z "$OUT" ]; then
+	if [ "$TRACK" = 1 ]; then OUT="$REPO/out/pkvg-track"; else OUT="$REPO/out/pkvg"; fi
+fi
 
 # ---- the suite's executables (keep in step with build_paged_kv_gpu.bat) ------------------------------------
 # name | config | step | sources (tests/paged-kv-gpu/*.cpp; NAME@DEF,DEF compiles NAME with -DDEF ...) | extra
@@ -99,6 +109,10 @@ BASEFLAGS="-std=c++20 -O2 -Iinclude -Isrc -Isrc/gpu -Itests -Itests/paged-kv -It
 -include d3d12.h -include d3d12sdklayers.h"
 CELLWARN="-Wall -Wextra -Wno-unused-parameter"
 OBJ="$CACHE/pkvg-obj-$(echo "$REPO" | tr / _)"
+if [ "$TRACK" = 1 ]; then
+	BASEFLAGS="$BASEFLAGS -DSUPERSLM_GPU_STATE_TRACKING"
+	OBJ="$OBJ-track"
+fi
 mkdir -p "$OBJ" "$OUT/shaders"
 cd "$REPO"
 

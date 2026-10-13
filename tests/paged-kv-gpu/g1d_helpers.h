@@ -218,14 +218,27 @@ Thrown CallInternal(F&& f, std::string* what = nullptr) {
 // The debug layer (Sec7 grading source: "the debug-layer message count, read by the test from the
 // device's info queue"). A cell whose verdict rests on "the debug layer is clean" refuses to run
 // without the layer: a disabled layer returns 0 for everything and would pass vacuously.
+//
+// A state-tracking build (SUPERSLM_GPU_STATE_TRACKING) counts the host-side resource-state tracker's
+// violations (src/gpu/gpu_resource_state_tracker.h) with the layer's messages and runs without the layer:
+// on the software GPU, which has no D3D12 validation, the tracker stands in for the layer's resource-state
+// class (barrier StateBefore, copy and dispatch states), which is the class 3.12 grades, and nothing else.
 // ---------------------------------------------------------------------------------------------
 inline bool RequireDebugLayer() {
-	const bool on = superslm_gpu::harness::GetDevice().debug_layer_enabled;
+	const bool layer = superslm_gpu::harness::GetDevice().debug_layer_enabled;
+	const bool on = layer || superslm_gpu::harness::kStateTrackingBuild;
+	if (!layer && on) std::printf("  note: no D3D12 debug layer; the host resource-state tracker is the count\n");
 	CHECK_MSG(on, "SETUP: the D3D12 debug layer is off -- run with SSLM_GPU_ENABLE_DEBUG_LAYER=1; a clean-debug-layer "
 	              "verdict without it is vacuous");
 	return on;
 }
-inline size_t DebugMessages() { return superslm_gpu::harness::GetDevice().DrainDebugLayerMessages(); }
+inline size_t DebugMessages() {
+	static uint64_t tracked_seen = 0;
+	const uint64_t tracked_total = superslm_gpu::harness::StateTrackingViolations().Total();
+	const size_t tracked = static_cast<size_t>(tracked_total - tracked_seen);
+	tracked_seen = tracked_total;
+	return superslm_gpu::harness::GetDevice().DrainDebugLayerMessages() + tracked;
+}
 
 // ---------------------------------------------------------------------------------------------
 // The in-flight token's type, read off RunLayerLoopGpuSubmit's out-parameter (its 15th parameter), so

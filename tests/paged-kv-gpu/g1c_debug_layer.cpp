@@ -17,8 +17,17 @@
 
 #include "g1c_helpers.h"
 
+// A state-tracking build (SUPERSLM_GPU_STATE_TRACKING, build_paged_kv_gpu_mingw.sh --state-tracking) also
+// counts the host-side resource-state tracker's violations since the last call
+// (src/gpu/gpu_resource_state_tracker.h), and reports the count enabled without the layer: on the software
+// GPU, which has no D3D12 validation, the tracker stands in for the layer's resource-state class (barrier
+// StateBefore, copy and dispatch states) and for nothing else.
 size_t g1c::DebugLayerReportable(bool* enabled) {
 	superslm_gpu::harness::Device& dev = superslm_gpu::harness::GetDevice();
-	*enabled = dev.debug_layer_enabled && dev.debug_info_queue;
-	return dev.DrainDebugLayerMessages();
+	static uint64_t tracked_seen = 0;
+	const uint64_t tracked_total = superslm_gpu::harness::StateTrackingViolations().Total();
+	const size_t tracked = static_cast<size_t>(tracked_total - tracked_seen);
+	tracked_seen = tracked_total;
+	*enabled = (dev.debug_layer_enabled && dev.debug_info_queue) || superslm_gpu::harness::kStateTrackingBuild;
+	return dev.DrainDebugLayerMessages() + tracked;
 }

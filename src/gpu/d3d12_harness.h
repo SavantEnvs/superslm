@@ -32,6 +32,7 @@
 
 #include "submission_ledger.h"
 #include "gpu_inflight_token.h"
+#include "gpu_resource_state_tracker.h"
 
 namespace superslm_gpu {
 namespace harness {
@@ -416,6 +417,9 @@ private:
 	void ResetAllocatorAndList() override {
 		SSLM_GPU_HR(alloc->Reset());
 		SSLM_GPU_HR(list->Reset(alloc.Get(), nullptr));
+#if defined(SUPERSLM_GPU_STATE_TRACKING)
+		state_tracking::OnReset(list.Get());  // whatever the list held unexecuted is discarded
+#endif
 	}
 	// The queue gate's wait (fault-injection builds, the singleton only), then ExecuteCommandLists.
 	// Defined after GetDevice() below.
@@ -607,10 +611,13 @@ public:
 
 	// Throwing wrapper over TryMakeBuffer, through SSLM_GPU_HR: GpuAllocationError for
 	// E_OUTOFMEMORY, a plain std::runtime_error for every other failing HRESULT.
+	// `at` is the creating call, recorded by the resource-state tracker (gpu_resource_state_tracker.h)
+	// in a tracking build and unused otherwise.
 	ComPtr<ID3D12Resource> MakeBuffer(UINT64 bytes, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags,
-	                                   D3D12_RESOURCE_STATES state) {
+	                                   D3D12_RESOURCE_STATES state,
+	                                   const std::source_location at = std::source_location::current()) {
 		ComPtr<ID3D12Resource> r;
-		SSLM_GPU_HR(TryMakeBuffer(bytes, heap, flags, state, &r));
+		SSLM_GPU_HR(TryMakeBuffer(bytes, heap, flags, state, &r, at));
 		return r;
 	}
 
@@ -621,7 +628,8 @@ public:
 	// through here: MakeBuffer wraps it and Upload calls MakeBuffer. In test builds it counts every
 	// call and can fail a chosen occurrence (GpuTestSeamState above).
 	HRESULT TryMakeBuffer(UINT64 bytes, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags,
-	                      D3D12_RESOURCE_STATES state, ComPtr<ID3D12Resource>* out) {
+	                      D3D12_RESOURCE_STATES state, ComPtr<ID3D12Resource>* out,
+	                      const std::source_location at = std::source_location::current()) {
 		out->Reset();
 #if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION)
 		{
@@ -650,8 +658,14 @@ public:
 		rd.SampleDesc.Count = 1;
 		rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 		rd.Flags = flags;
-		return dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr,
-		                                    IID_PPV_ARGS(out->ReleaseAndGetAddressOf()));
+		const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr,
+		                                                IID_PPV_ARGS(out->ReleaseAndGetAddressOf()));
+#if defined(SUPERSLM_GPU_STATE_TRACKING)
+		if (SUCCEEDED(hr)) state_tracking::OnCreate(out->Get(), bytes, heap, state, at);
+#else
+		(void)at;
+#endif
+		return hr;
 	}
 
 	// What CloseListConfirmed found: the first Close's HRESULT, and whether the list ended Closed.
@@ -684,6 +698,9 @@ public:
 			out.closed = true;
 			how = "closed by the retry";
 		} else if (SUCCEEDED(list->Reset(alloc.Get(), nullptr)) && SUCCEEDED(list->Close())) {
+#if defined(SUPERSLM_GPU_STATE_TRACKING)
+			state_tracking::OnReset(list.Get());  // the confirm step discarded the recording
+#endif
 			out.closed = true;
 			how = "confirmed closed";
 		}
@@ -723,9 +740,10 @@ public:
 		return list->Close();
 	}
 
-	ComPtr<ID3D12Resource> Upload(const void* data, UINT64 bytes) {
+	ComPtr<ID3D12Resource> Upload(const void* data, UINT64 bytes,
+	                              const std::source_location at = std::source_location::current()) {
 		auto r = MakeBuffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
-		                     D3D12_RESOURCE_STATE_GENERIC_READ);
+		                     D3D12_RESOURCE_STATE_GENERIC_READ, at);
 		void* p = nullptr;
 		D3D12_RANGE none{0, 0};
 		SSLM_GPU_HR(r->Map(0, &none, &p));
@@ -1000,17 +1018,12 @@ public:
 		BeginRecording();
 		list->SetPipelineState(pso);
 		list->SetComputeRootSignature(rs);
-		list->SetComputeRootShaderResourceView(0, in_buf->GetGPUVirtualAddress());
-		list->SetComputeRootUnorderedAccessView(1, uav->GetGPUVirtualAddress());
-		list->Dispatch(1, 1, 1);
-		D3D12_RESOURCE_BARRIER b{};
-		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		b.Transition.pResource = uav.Get();
-		b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-		b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-		b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		list->ResourceBarrier(1, &b);
-		list->CopyResource(readback.Get(), uav.Get());
+		BindRootSrv(list.Get(), 0, in_buf.Get());
+		BindRootUav(list.Get(), 1, uav.Get());
+		RecordDispatch(list.Get(), 1, 1, 1);
+		RecordTransition(list.Get(), uav.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		                 D3D12_RESOURCE_STATE_COPY_SOURCE);
+		RecordCopyResource(list.Get(), readback.Get(), uav.Get());
 		CloseListOrThrow();
 		SubmitAndWaitKeepingAlive(/*retry=*/false, in_buf, uav, readback);
 		std::vector<uint8_t> out(out_bytes);
@@ -1110,6 +1123,9 @@ inline void Device::ExecuteRecordedList() {
 #endif
 	ID3D12CommandList* lists[] = {list.Get()};
 	queue->ExecuteCommandLists(1, lists);
+#if defined(SUPERSLM_GPU_STATE_TRACKING)
+	state_tracking::OnExecute(list.Get());  // the list's pending states become the buffers' states
+#endif
 }
 
 inline bool Device::SignalFence(uint64_t value, int32_t* failure) noexcept {
