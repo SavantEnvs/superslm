@@ -4,7 +4,7 @@ All notable changes to SuperSLM (Layer 1) are recorded here.
 
 ## [Unreleased]
 
-## [1.13.0] - Unreleased
+## [1.13.0] - 2026-10-14
 
 The GPU backend gains 1.12.0's paged K/V memory: GPU page pools, budgeted GPU sequences and prefixes,
 shared prefix pages, and the `SLM6` save blob. `gpu_1p0.h` adds 12 verbs, 2 handle types, 2 test-only
