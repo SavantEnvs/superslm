@@ -138,7 +138,10 @@ struct Env {
 	Geo geo;
 	uint32_t full_budget = 0;  // one whole token per decode call
 	bool ok = false;
-	bool Open(const std::string& path) {
+	// `pkv_def_geometry`: the cells' page counts are written for pkv_def's (B, cap) = (16, 4096), so Open refuses any
+	// other geometry by default. The G6 timing harness's 1.5B row (plan §10 R1, rev 16.16) runs the shipped 1.5B at
+	// its own cap and passes false: it reads the geometry and counts no pages against a plan figure.
+	bool Open(const std::string& path, bool pkv_def_geometry = true) {
 		if (path.empty()) return false;
 		const GS cs = sslm_gpu_context_create(GpuContextConfig{}, &ctx);
 		CHECK_MSG(cs == GS::SSLM_OK && ctx, "sslm_gpu_context_create: %s", StatusName(cs));
@@ -149,6 +152,12 @@ struct Env {
 		}
 		geo = GeoOf(fx.view);
 		full_budget = fx.one_layer_budget * fx.layers;
+		if (!pkv_def_geometry) {
+			CHECK_MSG(geo.B > 0 && geo.cap > 0, "model geometry: B = %lld, cap = %lld", static_cast<long long>(geo.B),
+			          static_cast<long long>(geo.cap));
+			ok = geo.B > 0 && geo.cap > 0;
+			return ok;
+		}
 		CHECK_MSG(geo.B == 16 && geo.cap == 4096,
 		          "fixture geometry: B = %lld, cap = %lld; the cells' page counts are written for pkv_def (16, 4096)",
 		          static_cast<long long>(geo.B), static_cast<long long>(geo.cap));
