@@ -901,8 +901,10 @@ SslmGpuStatus sslm_gpu_seq_read_prefill_final_hidden(SslmGpuContext* ctx, SslmGp
  * Handles of another context or model -- a model, pool, prefix or parent whose context is not
  * `ctx`, or a pool or prefix of another model -- and a budget outside [1, cap] return
  * SSLM_SEQUENCE_KV_BUFFER_MISMATCH with a null out-handle, as every GPU verb refuses
- * `model->ctx != ctx` today. Every out-handle below is set to nullptr on every status other than
- * SSLM_OK.
+ * `model->ctx != ctx` today. The one exception is sslm_gpu_seq_restore_into_pool's
+ * `prefix_or_null`, which is a sharing hint and not a checked handle: a prefix of another context
+ * or model there is not refused, and gives a private restore (that verb's comment below). Every
+ * out-handle below is set to nullptr on every status other than SSLM_OK.
  *
  * Thread-safety. As the rest of this header, calls on distinct handles may run concurrently, and
  * two threads driving the same handle is a caller error. sslm_gpu_kv_pool_create,
