@@ -429,7 +429,13 @@ private:
 	// ThrowSignalFailure reports it with the seam's own message. Defined below GetDevice().
 	bool SignalFence(uint64_t value, int32_t* failure) noexcept override;
 	[[noreturn]] void ThrowSignalFailure(int32_t failure) override;
-	uint64_t CompletedFenceValue() noexcept override { return fence->GetCompletedValue(); }
+	uint64_t CompletedFenceValue() noexcept override {
+		const uint64_t v = fence->GetCompletedValue();
+#if defined(SUPERSLM_GPU_STATE_TRACKING)
+		state_tracking::OnCompleted(list.Get(), v);  // the submissions signalled at or below `v` are done
+#endif
+		return v;
+	}
 	// A failed SetEventOnCompletion means the wait cannot be confirmed (the ledger's lost_).
 	bool WaitFenceEvent(uint64_t value) noexcept override {
 		const HRESULT hr = fence->SetEventOnCompletion(value, fence_event);
@@ -439,6 +445,9 @@ private:
 			return false;
 		}
 		WaitForSingleObject(fence_event, INFINITE);
+#if defined(SUPERSLM_GPU_STATE_TRACKING)
+		state_tracking::OnCompleted(list.Get(), value);
+#endif
 		return true;
 	}
 
@@ -662,9 +671,8 @@ public:
 		                                                IID_PPV_ARGS(out->ReleaseAndGetAddressOf()));
 #if defined(SUPERSLM_GPU_STATE_TRACKING)
 		if (SUCCEEDED(hr)) state_tracking::OnCreate(out->Get(), bytes, heap, state, at);
-#else
-		(void)at;
 #endif
+		if (SUCCEEDED(hr) && debug_layer_enabled) NameBufferBySite(out->Get(), at, heap);
 		return hr;
 	}
 
@@ -1141,6 +1149,9 @@ inline bool Device::SignalFence(uint64_t value, int32_t* failure) noexcept {
 		*failure = static_cast<int32_t>(hr);
 		return false;
 	}
+#if defined(SUPERSLM_GPU_STATE_TRACKING)
+	state_tracking::OnSignal(list.Get(), value);  // what the execute touched is reachable until `value` completes
+#endif
 	return true;
 }
 

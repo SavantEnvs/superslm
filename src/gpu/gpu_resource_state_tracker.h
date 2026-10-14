@@ -27,6 +27,15 @@
 // executed (Device::ExecuteRecordedList), and are discarded when the list is reset without having
 // been executed, so a recording a fault abandoned changes nothing.
 //
+// It also checks buffer lifetimes against the work that can still reach them. GPU-based validation
+// resolves a root SRV/UAV and a copy by GPU virtual address, so a buffer released while recorded or
+// in-flight work references it would make the layer charge that work's commands to whatever buffer
+// the address belongs to next, in that buffer's state. Each buffer carries a sentinel in its private
+// data, whose last Release is the buffer's destruction (OnDestroy), and:
+//   - a command recorded on a released buffer is released_use;
+//   - a list executed after a buffer it touched was released is released_recorded;
+//   - a buffer released while an executed list that touched it is not known complete (its Signal
+//     not made yet, or its fence value not yet seen complete by the device) is released_in_flight.
 // A violation prints one line to stderr, "# GPU STATE VIOLATION [class] ...", with the recording
 // site and the buffer's creation site, and is counted. StateTrackingViolations() reads the counts;
 // a tracking build prints a summary at exit. SSLM_GPU_STATE_TRACKING_ABORT=1 aborts on the first
@@ -39,8 +48,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <mutex>
 #include <source_location>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+#include <string>
 #include <unordered_map>
 
 namespace superslm_gpu {
@@ -53,8 +67,15 @@ struct StateTrackingCounts {
 	uint64_t copy_dest = 0;       // a copy writes a buffer that is not in COPY_DEST
 	uint64_t dispatch_srv = 0;    // a dispatch reads a root SRV that is not in NON_PIXEL_SHADER_RESOURCE
 	uint64_t dispatch_uav = 0;    // a dispatch binds a root UAV that is not in UNORDERED_ACCESS
+	// Lifetime classes: GPU-based validation finds a root SRV/UAV's or a copy's buffer by its GPU virtual
+	// address, so a buffer released while GPU work can still reach it makes the layer charge that work's
+	// commands to whatever buffer the address belongs to next, in whatever state that one is in.
+	uint64_t released_use = 0;        // a command recorded on a buffer that was already released
+	uint64_t released_recorded = 0;   // a list executed that references a buffer released after it was recorded
+	uint64_t released_in_flight = 0;  // a buffer released while an executed list that references it is not complete
 	uint64_t Total() const noexcept {
-		return barrier_before + copy_source + copy_dest + dispatch_srv + dispatch_uav;
+		return barrier_before + copy_source + copy_dest + dispatch_srv + dispatch_uav + released_use +
+		       released_recorded + released_in_flight;
 	}
 };
 
@@ -76,36 +97,57 @@ struct Binding {
 };
 
 struct ListEntry {
-	std::unordered_map<ID3D12Resource*, BufferEntry> pending;  // states this list changed
+	std::unordered_map<ID3D12Resource*, BufferEntry> pending;  // every buffer the recording touched, its state
 	std::unordered_map<UINT, Binding> bound;                   // root parameter -> SRV/UAV buffer
+	std::vector<ID3D12Resource*> released_since_recorded;      // pending buffers released before the execute
+	// What the GPU can still reach: the buffers of the executed submission whose Signal has not been made
+	// yet, then those of each signalled submission, by fence value, until the device sees that value
+	// complete (Device::CompletedFenceValue / WaitFenceEvent).
+	std::unordered_set<ID3D12Resource*> executed_unsignaled;
+	std::vector<std::pair<uint64_t, std::unordered_set<ID3D12Resource*>>> in_flight;
 };
 
 struct Tracker {
 	std::mutex mutex;
 	std::unordered_map<ID3D12Resource*, BufferEntry> committed;
+	std::unordered_map<ID3D12Resource*, BufferEntry> released;  // until the address is a new buffer's
 	std::unordered_map<ID3D12GraphicsCommandList*, ListEntry> lists;
 	StateTrackingCounts counts;
+	uint64_t buffers_created = 0;   // diagnostics: the lifetime classes see a release only through the
+	uint64_t buffers_released = 0;  // sentinel, so a run that releases nothing has checked nothing
 	bool abort_on_violation = false;
 	Tracker() {
 		const char* a = std::getenv("SSLM_GPU_STATE_TRACKING_ABORT");
 		abort_on_violation = a != nullptr && a[0] == '1';
 	}
-	~Tracker() {
+	void PrintSummary() {
+		std::lock_guard<std::mutex> lock(mutex);
 		std::fprintf(stderr,
 		             "# GPU STATE TRACKING: %llu violation(s): barrier_before %llu, copy_source %llu, copy_dest %llu, "
-		             "dispatch_srv %llu, dispatch_uav %llu\n",
+		             "dispatch_srv %llu, dispatch_uav %llu, released_use %llu, released_recorded %llu, "
+		             "released_in_flight %llu (buffers created %llu, released %llu)\n",
 		             static_cast<unsigned long long>(counts.Total()),
 		             static_cast<unsigned long long>(counts.barrier_before),
 		             static_cast<unsigned long long>(counts.copy_source),
 		             static_cast<unsigned long long>(counts.copy_dest),
 		             static_cast<unsigned long long>(counts.dispatch_srv),
-		             static_cast<unsigned long long>(counts.dispatch_uav));
+		             static_cast<unsigned long long>(counts.dispatch_uav),
+		             static_cast<unsigned long long>(counts.released_use),
+		             static_cast<unsigned long long>(counts.released_recorded),
+		             static_cast<unsigned long long>(counts.released_in_flight),
+		             static_cast<unsigned long long>(buffers_created), static_cast<unsigned long long>(buffers_released));
 	}
 };
 
+// Never destroyed: a buffer a static owns is released during exit, after any static Tracker would be gone,
+// and its release still reaches OnDestroy. The summary prints from an atexit handler.
 inline Tracker& Get() {
-	static Tracker t;
-	return t;
+	static Tracker* t = [] {
+		Tracker* made = new Tracker();
+		std::atexit([] { Get().PrintSummary(); });
+		return made;
+	}();
+	return *t;
 }
 
 inline const char* StateName(D3D12_RESOURCE_STATES s) {
@@ -131,12 +173,23 @@ inline const char* FileTail(const char* f) {
 // The entry a command in `list` sees for `r`: the list's pending entry, else the committed one
 // (copied into the list's pending map, so a promotion or a transition lands there). Null for a
 // buffer the tracker never saw created (none under src/gpu: every buffer comes from TryMakeBuffer).
-inline BufferEntry* Lookup(Tracker& t, ID3D12GraphicsCommandList* list, ID3D12Resource* r) {
+inline void ReportLifetime(Tracker& t, uint64_t StateTrackingCounts::*cls, const char* cls_name, const BufferEntry& e,
+                           const char* what, const std::source_location* at);
+
+inline BufferEntry* Lookup(Tracker& t, ID3D12GraphicsCommandList* list, ID3D12Resource* r,
+                           const std::source_location& at) {
 	ListEntry& le = t.lists[list];
 	auto p = le.pending.find(r);
 	if (p != le.pending.end()) return &p->second;
 	auto c = t.committed.find(r);
-	if (c == t.committed.end()) return nullptr;
+	if (c == t.committed.end()) {
+		auto d = t.released.find(r);
+		if (d != t.released.end()) {
+			ReportLifetime(t, &StateTrackingCounts::released_use, "released_use", d->second,
+			               "the command is recorded on it after its release", &at);
+		}
+		return nullptr;
+	}
 	return &(le.pending[r] = c->second);
 }
 
@@ -152,6 +205,20 @@ inline void Report(Tracker& t, uint64_t StateTrackingCounts::*cls, const char* c
 	if (t.abort_on_violation) std::abort();
 }
 
+inline void ReportLifetime(Tracker& t, uint64_t StateTrackingCounts::*cls, const char* cls_name, const BufferEntry& e,
+                           const char* what, const std::source_location* at) {
+	t.counts.*cls += 1;
+	if (at != nullptr) {
+		std::fprintf(stderr, "# GPU STATE VIOLATION [%s] at %s:%u: buffer of %llu bytes created at %s:%u: %s\n", cls_name,
+		             FileTail(at->file_name()), static_cast<unsigned>(at->line()),
+		             static_cast<unsigned long long>(e.bytes), FileTail(e.created_file), e.created_line, what);
+	} else {
+		std::fprintf(stderr, "# GPU STATE VIOLATION [%s]: buffer of %llu bytes created at %s:%u: %s\n", cls_name,
+		             static_cast<unsigned long long>(e.bytes), FileTail(e.created_file), e.created_line, what);
+	}
+	if (t.abort_on_violation) std::abort();
+}
+
 // Whether `e` satisfies `want` for a read (`want` a read state: every bit present) or a write (the
 // exact state). COMMON satisfies anything once, by promotion, and records the promoted state.
 inline bool Require(BufferEntry& e, D3D12_RESOURCE_STATES want, bool read) {
@@ -162,6 +229,69 @@ inline bool Require(BufferEntry& e, D3D12_RESOURCE_STATES want, bool read) {
 	}
 	if (read) return (e.state & want) == want;
 	return e.state == want;
+}
+
+// The buffer's release, seen through a COM object stored in its private data: the runtime releases a
+// resource's private-data interfaces when it destroys the resource, so the sentinel's last Release is
+// the buffer's destruction. Then: the buffer moves to `released`; a recording that touched it and is
+// later executed is a released_recorded violation (reported at the execute); and a submission the GPU
+// may still be running that touched it is a released_in_flight violation, reported here.
+inline void OnDestroy(ID3D12Resource* r) {
+	Tracker& t = Get();
+	std::lock_guard<std::mutex> lock(t.mutex);
+	auto c = t.committed.find(r);
+	if (c == t.committed.end()) return;
+	const BufferEntry e = c->second;
+	t.committed.erase(c);
+	t.buffers_released += 1;
+	t.released[r] = e;
+	for (auto& kv : t.lists) {
+		ListEntry& le = kv.second;
+		if (le.pending.erase(r) != 0) le.released_since_recorded.push_back(r);
+		bool reachable = le.executed_unsignaled.count(r) != 0;
+		for (const auto& f : le.in_flight) reachable = reachable || f.second.count(r) != 0;
+		if (reachable) {
+			ReportLifetime(t, &StateTrackingCounts::released_in_flight, "released_in_flight", e,
+			               "released while a submission that references it may still be running on the GPU", nullptr);
+		}
+	}
+}
+
+// {9A4C1E73-5B0D-4F6A-9C2E-7D18B3A6E541}
+inline constexpr GUID kDestroySentinelGuid = {0x9a4c1e73, 0x5b0d, 0x4f6a, {0x9c, 0x2e, 0x7d, 0x18, 0xb3, 0xa6, 0xe5, 0x41}};
+
+class DestroySentinel final : public IUnknown {
+public:
+	explicit DestroySentinel(ID3D12Resource* r) : r_(r) {}
+	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+		if (out == nullptr) return E_POINTER;
+		if (IsEqualGUID(iid, __uuidof(IUnknown))) {
+			*out = static_cast<IUnknown*>(this);
+			AddRef();
+			return S_OK;
+		}
+		*out = nullptr;
+		return E_NOINTERFACE;
+	}
+	ULONG STDMETHODCALLTYPE AddRef() override { return refs_.fetch_add(1) + 1; }
+	ULONG STDMETHODCALLTYPE Release() override {
+		const ULONG n = refs_.fetch_sub(1) - 1;
+		if (n == 0) {
+			OnDestroy(r_);
+			delete this;
+		}
+		return n;
+	}
+
+private:
+	std::atomic<ULONG> refs_{1};
+	ID3D12Resource* r_;
+};
+
+inline void AttachDestroySentinel(ID3D12Resource* r) {
+	DestroySentinel* s = new DestroySentinel(r);
+	(void)r->SetPrivateDataInterface(kDestroySentinelGuid, s);  // the resource holds its own reference
+	s->Release();
 }
 
 inline void OnCreate(ID3D12Resource* r, uint64_t bytes, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state,
@@ -175,7 +305,14 @@ inline void OnCreate(ID3D12Resource* r, uint64_t bytes, D3D12_HEAP_TYPE heap, D3
 	e.created_file = at.file_name();
 	e.created_line = static_cast<unsigned>(at.line());
 	t.committed[r] = e;  // a reused address is a new buffer: its old entry is replaced
-	for (auto& kv : t.lists) kv.second.pending.erase(r);
+	t.buffers_created += 1;
+	t.released.erase(r);
+	for (auto& kv : t.lists) {
+		kv.second.pending.erase(r);
+		kv.second.executed_unsignaled.erase(r);
+		for (auto& f : kv.second.in_flight) f.second.erase(r);
+	}
+	AttachDestroySentinel(r);
 }
 
 inline void OnReset(ID3D12GraphicsCommandList* list) {
@@ -184,13 +321,24 @@ inline void OnReset(ID3D12GraphicsCommandList* list) {
 	ListEntry& le = t.lists[list];
 	le.pending.clear();
 	le.bound.clear();
+	le.released_since_recorded.clear();
 }
 
 inline void OnExecute(ID3D12GraphicsCommandList* list) {
 	Tracker& t = Get();
 	std::lock_guard<std::mutex> lock(t.mutex);
 	ListEntry& le = t.lists[list];
+	for (ID3D12Resource* r : le.released_since_recorded) {
+		auto d = t.released.find(r);
+		if (d != t.released.end()) {
+			ReportLifetime(t, &StateTrackingCounts::released_recorded, "released_recorded", d->second,
+			               "the executed list references it, and it was released after the recording touched it",
+			               nullptr);
+		}
+	}
+	le.released_since_recorded.clear();
 	for (auto& kv : le.pending) {
+		le.executed_unsignaled.insert(kv.first);
 		BufferEntry e = kv.second;
 		if (e.promoted) {
 			e.state = D3D12_RESOURCE_STATE_COMMON;  // a promoted state decays when the list completes
@@ -202,11 +350,36 @@ inline void OnExecute(ID3D12GraphicsCommandList* list) {
 	le.bound.clear();
 }
 
+// The Signal made after the execute: the executed buffers stay reachable until `value` completes.
+inline void OnSignal(ID3D12GraphicsCommandList* list, uint64_t value) {
+	Tracker& t = Get();
+	std::lock_guard<std::mutex> lock(t.mutex);
+	ListEntry& le = t.lists[list];
+	if (le.executed_unsignaled.empty()) return;
+	le.in_flight.emplace_back(value, std::move(le.executed_unsignaled));
+	le.executed_unsignaled.clear();
+}
+
+// The device saw its fence reach `completed`: every submission signalled at or below it is done.
+inline void OnCompleted(ID3D12GraphicsCommandList* list, uint64_t completed) {
+	Tracker& t = Get();
+	std::lock_guard<std::mutex> lock(t.mutex);
+	ListEntry& le = t.lists[list];
+	size_t keep = 0;
+	for (size_t i = 0; i < le.in_flight.size(); ++i) {
+		if (le.in_flight[i].first > completed) {
+			if (keep != i) le.in_flight[keep] = std::move(le.in_flight[i]);
+			++keep;
+		}
+	}
+	le.in_flight.resize(keep);
+}
+
 inline void OnTransition(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_TRANSITION_BARRIER& b,
                          const std::source_location& at) {
 	Tracker& t = Get();
 	std::lock_guard<std::mutex> lock(t.mutex);
-	BufferEntry* e = Lookup(t, list, b.pResource);
+	BufferEntry* e = Lookup(t, list, b.pResource, at);
 	if (e == nullptr) return;
 	if (e->state != b.StateBefore) {
 		Report(t, &StateTrackingCounts::barrier_before, "barrier_before", *e, e->state, b.StateBefore, at);
@@ -219,13 +392,13 @@ inline void OnCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* dst, ID3D12R
                    const std::source_location& at) {
 	Tracker& t = Get();
 	std::lock_guard<std::mutex> lock(t.mutex);
-	if (BufferEntry* s = Lookup(t, list, src)) {
+	if (BufferEntry* s = Lookup(t, list, src, at)) {
 		const D3D12_RESOURCE_STATES have = s->state;
 		if (!Require(*s, D3D12_RESOURCE_STATE_COPY_SOURCE, /*read=*/true)) {
 			Report(t, &StateTrackingCounts::copy_source, "copy_source", *s, have, D3D12_RESOURCE_STATE_COPY_SOURCE, at);
 		}
 	}
-	if (BufferEntry* d = Lookup(t, list, dst)) {
+	if (BufferEntry* d = Lookup(t, list, dst, at)) {
 		const D3D12_RESOURCE_STATES have = d->state;
 		if (!Require(*d, D3D12_RESOURCE_STATE_COPY_DEST, /*read=*/false)) {
 			Report(t, &StateTrackingCounts::copy_dest, "copy_dest", *d, have, D3D12_RESOURCE_STATE_COPY_DEST, at);
@@ -245,7 +418,7 @@ inline void OnDispatch(ID3D12GraphicsCommandList* list, const std::source_locati
 	// Copied: Lookup may insert into the same list entry's pending map, never into `bound`.
 	const std::unordered_map<UINT, Binding> bound = t.lists[list].bound;
 	for (const auto& kv : bound) {
-		BufferEntry* e = Lookup(t, list, kv.second.resource);
+		BufferEntry* e = Lookup(t, list, kv.second.resource, at);
 		if (e == nullptr) continue;
 		const D3D12_RESOURCE_STATES have = e->state;
 		if (kv.second.uav) {
@@ -267,6 +440,13 @@ inline StateTrackingCounts StateTrackingViolations() {
 	std::lock_guard<std::mutex> lock(t.mutex);
 	return t.counts;
 }
+// A commissioning cell's must-reject constructions raise violations on purpose: it reads the counts
+// before, checks its deltas, and puts the counts back, so a run's summary counts only unplanned ones.
+inline void RestoreStateTrackingViolations(const StateTrackingCounts& c) {
+	state_tracking::Tracker& t = state_tracking::Get();
+	std::lock_guard<std::mutex> lock(t.mutex);
+	t.counts = c;
+}
 inline constexpr bool kStateTrackingBuild = true;
 #else
 inline StateTrackingCounts StateTrackingViolations() { return StateTrackingCounts{}; }
@@ -278,6 +458,34 @@ inline constexpr bool kStateTrackingBuild = false;
 // what any submission does; a failure to set it is ignored.
 inline void NameBuffer(ID3D12Resource* r, const wchar_t* name) {
 	if (r != nullptr) (void)r->SetName(name);
+}
+
+// The default debug name Device::TryMakeBuffer gives every buffer while the debug layer is on:
+// "SuperSLM buffer (<file>:<line>, <heap>)", the creating call's site (the caller's, through Upload,
+// MakeBuffer, MakeInitializedUav and the resident-upload helpers, which forward their `at`) and its heap,
+// which tells a resident buffer from its UPLOAD staging twin made at the same site. A NameBuffer call
+// after the create replaces it with the buffer's role. So no GPU-based validation message names an
+// "Unnamed" buffer, and every per-buffer count names the line that made the buffer.
+inline void NameBufferBySite(ID3D12Resource* r, const std::source_location& at, D3D12_HEAP_TYPE heap) {
+	if (r == nullptr) return;
+	const char* file = at.file_name();
+	for (const char* p = file; *p; ++p) {
+		if (*p == '/' || *p == '\\') file = p + 1;
+	}
+	const char* heap_name = heap == D3D12_HEAP_TYPE_DEFAULT    ? "DEFAULT"
+	                        : heap == D3D12_HEAP_TYPE_UPLOAD   ? "UPLOAD"
+	                        : heap == D3D12_HEAP_TYPE_READBACK ? "READBACK"
+	                                                           : "other heap";
+	std::string ascii = "SuperSLM buffer (";
+	ascii += file;
+	ascii += ':';
+	ascii += std::to_string(at.line());
+	ascii += ", ";
+	ascii += heap_name;
+	ascii += ')';
+	std::wstring name;
+	for (const char c : ascii) name.push_back(static_cast<wchar_t>(static_cast<unsigned char>(c)));
+	(void)r->SetName(name.c_str());
 }
 
 // ---- the recording helpers ----------------------------------------------------------------------

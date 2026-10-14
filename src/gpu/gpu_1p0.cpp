@@ -988,16 +988,17 @@ SslmGpuStatus MapPooledPagesThrough(SslmGpuSequenceHandle* seq, int64_t rows) {
 // DeviceLost") for everything but memory, which it now reports as memory.
 Microsoft::WRL::ComPtr<ID3D12Resource> UploadResidentBufferSyncTo(
     superslm_gpu::harness::Device& dev, const void* data, size_t bytes,
-    D3D12_RESOURCE_FLAGS resource_flags, D3D12_RESOURCE_STATES final_state) {
+    D3D12_RESOURCE_FLAGS resource_flags, D3D12_RESOURCE_STATES final_state,
+    const std::source_location at = std::source_location::current()) {
 	// T-2851 (design Sec4.6 item 4, R16): phase A allocates both buffers BEFORE the command list
 	// is reset, so an allocation failure throws with the list still Closed -- the state every call
 	// on this context leaves it in -- and the next upload on the same context can reset it. (The
 	// previous order reset first; a failed allocation then left the list recording and every later
 	// upload on the context failed.) Since 1.8.0 the caller classifies the throw
 	// (ClassifyHandleFault): an allocation failure on a live device is SSLM_GPU_ALLOCATION_FAILED.
-	Microsoft::WRL::ComPtr<ID3D12Resource> upload = dev.Upload(data, bytes);
+	Microsoft::WRL::ComPtr<ID3D12Resource> upload = dev.Upload(data, bytes, at);
 	Microsoft::WRL::ComPtr<ID3D12Resource> resident =
-	    dev.MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, resource_flags, D3D12_RESOURCE_STATE_COPY_DEST);
+	    dev.MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, resource_flags, D3D12_RESOURCE_STATE_COPY_DEST, at);
 	// Phase B: reset, record, Close (confirmed, CloseListConfirmed), execute, Signal, wait. The
 	// Signal has no retry here, so a failed Signal or wait is a stranded submission (1.8.0). From
 	// G3 the reset, the submission and the wait are the ledger's (plan §4.4): BeginRecording(),
@@ -1027,10 +1028,11 @@ Microsoft::WRL::ComPtr<ID3D12Resource> UploadResidentBufferSyncTo(
 // DeviceLost") for everything but memory, which it now reports as memory. Read-only for its
 // whole lifetime (SRV state), matching `weights_buf`/`rope_cos_buf`/`rope_sin_buf`'s own
 // contract (design Sec5.4).
-Microsoft::WRL::ComPtr<ID3D12Resource> UploadResidentBufferSync(superslm_gpu::harness::Device& dev,
-                                                                 const void* data, size_t bytes) {
+Microsoft::WRL::ComPtr<ID3D12Resource> UploadResidentBufferSync(
+    superslm_gpu::harness::Device& dev, const void* data, size_t bytes,
+    const std::source_location at = std::source_location::current()) {
 	return UploadResidentBufferSyncTo(dev, data, bytes, D3D12_RESOURCE_FLAG_NONE,
-	                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, at);
 }
 
 // T-2113 (B3, design Sec5.3): the K/V-buffer analogue of UploadResidentBufferSync above,
@@ -1042,10 +1044,11 @@ Microsoft::WRL::ComPtr<ID3D12Resource> UploadResidentBufferSync(superslm_gpu::ha
 // buffer path (gpu_port.h, T-2113 B3's own trailing-parameter pair) requires a freshly
 // created sequence handle's kv_buf to already be in before its first call (no resume
 // barrier needed on that first call, design Sec5.3/Sec10 B3).
-Microsoft::WRL::ComPtr<ID3D12Resource> UploadResidentUavBufferSync(superslm_gpu::harness::Device& dev,
-                                                                    const void* data, size_t bytes) {
+Microsoft::WRL::ComPtr<ID3D12Resource> UploadResidentUavBufferSync(
+    superslm_gpu::harness::Device& dev, const void* data, size_t bytes,
+    const std::source_location at = std::source_location::current()) {
 	return UploadResidentBufferSyncTo(dev, data, bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-	                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS, at);
 }
 
 // ---------------------------------------------------------------------------------------------

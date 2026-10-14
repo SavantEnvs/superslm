@@ -1080,10 +1080,11 @@ superslm::SslmForwardStatus DecodeStickyTag(int64_t tag) {
 // rope_buf already are by staying in the caller's own local scope.
 Microsoft::WRL::ComPtr<ID3D12Resource> MakeInitializedUav(
     harness::Device& dev, const std::vector<uint8_t>& init,
-    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& keep_alive) {
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& keep_alive,
+    const std::source_location at = std::source_location::current()) {
 	auto buf = dev.MakeBuffer(init.size(), D3D12_HEAP_TYPE_DEFAULT,
-	                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-	auto upload = dev.Upload(init.data(), init.size());
+	                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST, at);
+	auto upload = dev.Upload(init.data(), init.size(), at);
 	harness::RecordCopyResource(dev.list.Get(), buf.Get(), upload.Get());
 	keep_alive.push_back(upload);
 	harness::RecordTransition(dev.list.Get(), buf.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
