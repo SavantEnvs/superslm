@@ -139,10 +139,12 @@ class Scoped:
     def replace(self, name: str, old: str, new: str, within: str | None = None):
         self.patch.replace(name, old, new, within=within or ANCHOR_FUNCTION.get((self.key, name)))
 
-    def has_function(self, name: str, symbol: str) -> bool:
-        content = self.patch.files[name] if name in getattr(self.patch, "files", {}) else \
+    def text(self, name: str) -> str:
+        return self.patch.files[name] if name in getattr(self.patch, "files", {}) else \
             (self.patch.tree / name).read_text(encoding="utf-8")
-        return function_body(content, symbol) is not None
+
+    def has_function(self, name: str, symbol: str) -> bool:
+        return function_body(self.text(name), symbol) is not None
 
 
 ALL_MUTANTS = ["a", "c", "c_exact", "q_cpu", "q_gpu", "b", "b2", "d", "e", "f", "g", "h", "h2", "i", "j",
@@ -299,10 +301,14 @@ def apply(p: Patch, ident: str):
     elif ident in ("n2_upload", "n3_upload"):
         # TE-425: anchored on the code lines only, so a rewritten comment between phase A and phase B
         # (1.8.0 rewrote it) does not move the mutant. Phase A's two allocations are removed where
-        # they stand, and re-inserted around the phase-B reset in the mutant's order.
+        # they stand, and re-inserted around the phase-B reset in the mutant's order. Since 97756e3 both
+        # allocations forward the caller's std::source_location (`, at`); a tree with the signature
+        # parameter takes that spelling, an older tree the original one -- the same two lines either way.
+        at = ", at" if p.has_function(g, "UploadResidentBufferSyncTo") and re.search(
+            r"UploadResidentBufferSyncTo\([^)]*std::source_location at", p.text(g)) else ""
         resident = ("\tMicrosoft::WRL::ComPtr<ID3D12Resource> resident =\n"
-                    "\t    dev.MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, resource_flags, D3D12_RESOURCE_STATE_COPY_DEST);\n")
-        upload = "\tMicrosoft::WRL::ComPtr<ID3D12Resource> upload = dev.Upload(data, bytes);\n"
+                    f"\t    dev.MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, resource_flags, D3D12_RESOURCE_STATE_COPY_DEST{at});\n")
+        upload = f"\tMicrosoft::WRL::ComPtr<ID3D12Resource> upload = dev.Upload(data, bytes{at});\n"
         reset = "\tdev.BeginRecording();\n"  # G3: the ledger's reset (re-anchored)
         p.replace(g, upload + resident, "")
         new = (reset + upload + resident if ident == "n2_upload"
