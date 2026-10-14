@@ -87,6 +87,9 @@
 #include <vector>
 #if (defined(_M_X64) && !defined(_M_ARM64EC)) || defined(__x86_64__)
 #include <emmintrin.h>  // GatherFlatBlock's streaming stores (SSE2, baseline on x64; not ARM64EC)
+// BlockZero's streaming source: sixteen zero bytes loaded with movdqu (see BlockZero). Mutable and of external linkage so
+// the load is not folded into `xorps xmm, xmm`, which the FP-free scan rejects. Never written.
+alignas(16) unsigned char sslm_gather_stream_zero16[16] = {};
 #endif
 
 #include "superslm/adapter_marshal.h"
@@ -1944,7 +1947,10 @@ void BlockZero(uint8_t* dst, size_t n, bool stream) {
 		const size_t head = std::min(n, (64u - (reinterpret_cast<uintptr_t>(dst) & 63u)) & 63u);
 		std::memset(dst, 0, head);
 		size_t i = head;
-		const __m128i zero = _mm_setzero_si128();
+		// Loaded (movdqu), never _mm_setzero_si128: MSVC lowers that to `xorps xmm, xmm`, an FP-domain instruction the
+		// FP-free scan rejects (tests/ci/check_fp_free_scan.py retired its self-zeroing carve-out). The buffer is mutable
+		// and externally visible so the optimizer cannot fold the load back into a zero idiom.
+		const __m128i zero = _mm_loadu_si128(reinterpret_cast<const __m128i*>(sslm_gather_stream_zero16));
 		for (; i + 64 <= n; i += 64) {
 			_mm_stream_si128(reinterpret_cast<__m128i*>(dst + i), zero);
 			_mm_stream_si128(reinterpret_cast<__m128i*>(dst + i + 16), zero);
