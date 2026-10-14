@@ -125,6 +125,14 @@ int main(int argc, char** argv) {
 			const pkvg::Tally before = g->tally();
 			const int failed = g->run(i);
 			const pkvg::Tally after = g->tally();
+			if (pkvg::DrainFn drain = pkvg::CellBoundaryDrain()) {
+				bool layer_on = false;
+				const size_t messages = drain(&layer_on);
+				if (layer_on) {
+					std::printf("[%s %s] %s: %zu WARNING-or-worse debug-layer message(s) or tracker violation(s) during "
+					            "the cell (diagnostic, not graded)\n", g->step(i), g->name, g->id(i), messages);
+				}
+			}
 			++ran;
 			if (failed) ++red;
 			const int skipped = after.skips - before.skips;

@@ -53,6 +53,19 @@ struct Group {
 	const char* flags_help;
 };
 
+// The cell-boundary drain: when a translation unit that can read the device's info queue is linked in
+// (g1c_debug_layer.cpp registers g1c::DebugLayerReportable here), pkvg_main.cpp calls it after every
+// cell and prints how many WARNING-or-worse debug-layer messages (with the host state tracker's
+// violations, in a tracking build) arrived during that cell. A diagnostic, never graded: it attributes
+// GPU-based validation messages to the cell whose work raised them, where otherwise only the cells that
+// grade the count (3.6, 3.6d's scope control) would show them, inside their own windows. Null when no
+// such unit is linked (pkvg_g2).
+using DrainFn = size_t (*)(bool* enabled);
+inline DrainFn& CellBoundaryDrain() {
+	static DrainFn f = nullptr;
+	return f;
+}
+
 inline std::vector<const Group*>& Groups() {
 	static std::vector<const Group*> g;
 	return g;
