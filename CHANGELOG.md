@@ -40,9 +40,9 @@ the planned 1.12.1 fixes. `docs/api.md` (*Paged KV memory on the GPU*) summarize
   prefix handle that re-shares the prefix's pages when it matches. `sslm_gpu_seq_restore` refuses
   `SLM6` and `sslm_gpu_seq_restore_into_pool` refuses `SLM5` and `SLM4`, each with
   `SSLM_GPU_HOLDER_MODE_MISMATCH`. 1.12.0 and earlier refuse `SLM6` on its magic with
-  `SSLM_SEQUENCE_KV_BUFFER_MISMATCH` (cell 9.8 on the release machine, at `845918e`, with a reader
-  built from a 1.12.0 development commit whose `src/gpu/` equals the tag's; TODO-BOX: its check
-  count).
+  `SSLM_SEQUENCE_KV_BUFFER_MISMATCH` (cell 9.8 on the release machine, at `845918e` and again at
+  `05e09d8`, 21 checks and 14 in the leg with a reader built from a 1.12.0 development commit whose
+  `src/gpu/` equals the tag's).
 - **Work in flight.** `gpu_1p0.h` states that no command allocator is reset while work on it is
   unobserved, that a guarded verb returns `SSLM_BUSY` (or `SSLM_DEVICE_LOST` once a submission is
   stranded) instead, which device each verb submits on, and each guarded verb's refusal order.
@@ -97,9 +97,9 @@ the planned 1.12.1 fixes. `docs/api.md` (*Paged KV memory on the GPU*) summarize
   dedicated sequences hold 1,200 MiB at cap 4,096, or 501.6 MiB sized to the 1,712 positions each
   needs (`sslm_gpu_seq_create` takes the cap); restored with prefix handles the cohort fits in 1,842 pages,
   without them 5,592 until each re-adopts, then 113 more; every sequence's tokens equal the CPU's.
-  Confirmed on the real artifact on the RTX 2080 SUPER, debug layer on, at `845918e` (cells 10.3,
-  10.5, 10.7; TODO-BOX: their check counts), and their fixture legs again after the last library
-  fixes; not run on the AMD card.
+  Confirmed on the real artifact on the RTX 2080 SUPER, debug layer on, at `845918e` and again at
+  `05e09d8`, whose library code is the release's (cells 10.3, 10.5, 10.7: 280, 217 and 793 checks,
+  0 failures), and their fixture legs again after the last library fixes; not run on the AMD card.
 - **Not in this release:** memory savings for dedicated GPU sequences, a GPU page larger than
   `kv_block_size`, cross-backend save blobs, and the items 1.12.0 left out (a removed cap,
   automatic prefix matching, adapter-shaped prefixes, batched shared-prefix attention).
