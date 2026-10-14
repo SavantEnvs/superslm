@@ -295,9 +295,14 @@ def apply(p: Patch, ident: str):
         p.replace(g, "\t\tfor (const Allocation& a : allocations) {",
                   "\t\tdev.BeginRecording();\n"
                   "\t\tfor (const Allocation& a : allocations) { // MUTANT n")
-        p.replace(g, "\t\tdev.BeginRecording();\n\t\tdev.list->CopyResource(out->head.Get(), staging.Get());",
-                  "\t\t// Phase B reset already occurred before allocations (MUTANT n).\n"
-                  "\t\tdev.list->CopyResource(out->head.Get(), staging.Get());")
+        # b81d311 records the head copy through harness::RecordCopyResource (the state tracker sees it);
+        # the copy line is anchored in whichever spelling the tree has, so the phase-B reset is still the
+        # one removed.
+        copy = ("\t\tsuperslm_gpu::harness::RecordCopyResource(dev.list.Get(), out->head.Get(), staging.Get());"
+                if "harness::RecordCopyResource(dev.list.Get(), out->head.Get(), staging.Get());" in p.text(g)
+                else "\t\tdev.list->CopyResource(out->head.Get(), staging.Get());")
+        p.replace(g, "\t\tdev.BeginRecording();\n" + copy,
+                  "\t\t// Phase B reset already occurred before allocations (MUTANT n).\n" + copy)
     elif ident in ("n2_upload", "n3_upload"):
         # TE-425: anchored on the code lines only, so a rewritten comment between phase A and phase B
         # (1.8.0 rewrote it) does not move the mutant. Phase A's two allocations are removed where
