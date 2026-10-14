@@ -89,9 +89,9 @@ the planned 1.12.1 fixes. `docs/api.md` (*Paged KV memory on the GPU*) summarize
   The bar, no more than 5% slower by the largest process median, passes on both rows. This is
   within the bar, not a speed-up: the 0.5B reads about 1% faster, the 1.5B about 3.7% slower. Not
   measured: the AMD card, other widths and caps, other pool occupancies, batched decode, the debug
-  layer, and any comparison with 1.12.0's GPU decode. TODO-BOX: the run's commit, driver version
-  and commissioning date; the harness's commissioning record and receipt filed with the release's
-  records. TODO-BOX: the AMD legs, on their own machine.
+  layer, and any comparison with 1.12.0's GPU decode. Run at `03a2088` on NVIDIA driver
+  32.0.15.6094; the harness was commissioned on 2026-10-14 and its records are filed. The AMD legs
+  belong to their own machine and are not run.
 - **Memory (by admission, 0.5B, cap 4,096, 1.12.0's example cohort):** a GPU pool of 1,842 pages
   (172.7 MiB) admits the cohort and 1,841 refuses exactly the 50th create. By arithmetic, 50
   dedicated sequences hold 1,200 MiB at cap 4,096, or 501.6 MiB sized to the 1,712 positions each
