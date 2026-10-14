@@ -376,14 +376,16 @@ a dedicated sequence, a model or an adapter returns `SSLM_BUSY` while a
 pooled sequence is Submitted. The other paged calls submit nothing and are
 never refused Busy.
 
-**Speed.** On the NVIDIA RTX 2080 SUPER at Qwen2.5-0.5B, cap 4,096, one
-run measured single-sequence decode of one cohort member (a pooled
-sequence, budget 512, that adopted a 1,200-token prefix, in a pool of
-1,842 pages) from width 1,200 to 1,712, against a dedicated sequence of
-the same build, and it was no more than 5% slower. Widths below 1,200, a
-pooled sequence without an adopted prefix, other pool occupancies and the
-AMD card are not measured. That is the only GPU speed statement; the
-[1.13.0 release note](releases/1.13.0.md) has the reading.
+**Speed.** On the NVIDIA RTX 2080 SUPER (one card, one driver),
+single-sequence decode through a pooled sequence's page table was no more
+than 5% slower than a dedicated sequence of the same build on both rows
+measured: at Qwen2.5-0.5B, cap 4,096, a cohort member (budget 512, an
+adopted 1,200-token prefix) at width 1,712 read about 1% faster; at
+Qwen2.5-1.5B, cap 32,768, a pooled sequence restored without a prefix at
+width 16,384 read about 3.7% slower. It is a bar, not a speed-up. Other
+widths and caps, other pool occupancies, batched decode and the AMD card
+are not measured. That is the only GPU speed statement; the
+[1.13.0 release note](releases/1.13.0.md) has the readings.
 
 ### Thread safety
 

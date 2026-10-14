@@ -20,9 +20,13 @@ prompt can keep that prompt in GPU memory once, and each character reserves only
 reply budget needs. Existing GPU code keeps working, with two changes to calls that were undefined
 before (a second GPU submission while earlier work is unobserved, and two threads decoding one
 sequence, now return `SSLM_BUSY`), and the shader set must be redeployed. On the CPU, large saves on x64
-are now written with streaming stores, aimed at 1.12.0's save slowdown; the saved bytes are the same
-(TODO-BOX: the release machine's save timings, before anything is said about speed). The GPU work is
-checked on the NVIDIA RTX 2080 SUPER only so far. See
+are now written with streaming stores, aimed at 1.12.0's save slowdown; the saved bytes are the same.
+On the test machine a full-length save is faster than in 1.12.0 but still slower than in 1.11.0
+(about 27% slower with the 0.5B model and 14% with the 1.5B model; single readings, not settled
+results). Decoding through the new GPU memory pool stays within 5% of the old layout's speed on the
+one card measured: about 1% faster with the 0.5B model and 3.7% slower with the 1.5B model at a
+16,384-token context. It is not a speed-up. The GPU work is checked on the NVIDIA RTX 2080 SUPER
+only so far, and some test runs are still open (the release note lists them). See
 [Shared prompt prefixes and budgeted sequences](#shared-prompt-prefixes-and-budgeted-sequences)
 and the [1.13.0 release note](docs/releases/1.13.0.md).
 
@@ -292,11 +296,12 @@ character a budgeted sequence (`sslm_gpu_seq_create_budgeted`) that adopts its p
   how you would have sized them. The 1,842-page admission is confirmed on the real 0.5B artifact on
   the RTX 2080 SUPER.
 
-What it costs: on the RTX 2080 SUPER at Qwen2.5-0.5B, decoding one cast member through the page pool
-was measured against a whole-context sequence of the same build, from 1,200 to 1,712 tokens, in one
-run, and stayed within the 5% bar this release holds it to (the reading was about 1% faster, which is
-not promised). Nothing is measured on the AMD card, at 1.5B, at shorter contexts or for batched
-decode yet. Two older GPU behaviours now return
+What it costs: on the RTX 2080 SUPER, decoding one sequence through the page pool was measured
+against a whole-context sequence of the same build, and stayed within the 5% bar this release holds
+it to: a 0.5B cast member at 1,712 tokens read about 1% faster, and a 1.5B sequence at 16,384 tokens
+about 3.7% slower. Neither is a promised speed-up or a promised cost beyond the bar. Nothing is
+measured on the AMD card, at other context lengths or for batched decode yet. Two older GPU
+behaviours now return
 `SSLM_BUSY` instead of being undefined: a second GPU submission while earlier work has not been
 seen to complete (call `sslm_gpu_ready` before the next submission, or use the batch call), and two
 threads decoding the same sequence. The

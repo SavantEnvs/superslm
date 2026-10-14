@@ -49,8 +49,8 @@ the planned 1.12.1 fixes. `docs/api.md` (*Paged KV memory on the GPU*) summarize
 - **Behaviour changes for every GPU host:** two decode calls raced on one sequence handle
   (`sslm_decode_step_gpu`, a batch slot, `SslmGpuSeqDecodeStepForG5Bridge` or
   `SslmGpuSeqFinishTokenForG5Bridge`, in any pairing): one runs, the other returns `SSLM_BUSY`
-  having changed nothing (was undefined, and could corrupt the heap). Checked on the software GPU
-  for every pairing; the release machine has read the `sslm_decode_step_gpu` pair only (TODO-BOX). A second call that reaches
+  having changed nothing (was undefined, and could corrupt the heap). Checked for every pairing on
+  the software GPU and on the release machine (debug layer on). A second call that reaches
   the process's submission device while earlier work is unobserved (decode A, then decode B before
   `sslm_gpu_ready(A)`) returns `SSLM_BUSY` (was undefined). A stranded submission makes every later
   such guarded verb return `SSLM_DEVICE_LOST`. The external-serialization rule now lists every verb
@@ -70,27 +70,36 @@ the planned 1.12.1 fixes. `docs/api.md` (*Paged KV memory on the GPU*) summarize
 - **Fixed: no-budget CPU save speed.** A no-budget `sslm_seq_save` of a block of 16 MiB or more
   writes with streaming stores on x64; the bytes are unchanged (equal to 1.11.0's and 1.12.0's at 9
   lengths, and at every destination offset 0 to 63 against the pinned 1.11.0 blobs). Smaller blocks
-  and non-x64 targets keep 1.12.0's copy. TODO-BOX: the release machine's save readings against
-  1.11.0; until then no save speed is stated. The FP-free scan's check (A) accepts `movntdq`, the
+  and non-x64 targets keep 1.12.0's copy. On the release machine (lifecycle cell at `e30db83`,
+  MSVC 14.44, commissioned instrument, 66 checks green), save time against 1.11.0 reads: 0.5B
+  (cap 4,096) −19.7% at length 16, −18.7% at 1,000, +27.0% at the cap; 1.5B (cap 32,768) −21.1%,
+  −20.4%, +13.8% at the cap. All are readings, NO RESULT under the 4-times rule. Full-length saves
+  are faster than 1.12.0's (1.88 to 1.93 times 1.11.0's, read in another run) but still slower
+  than 1.11.0's. The FP-free scan's check (A) accepts `movntdq`, the
   streaming store this compiles to, on `_X86_VEC_MOVE_ALLOW` in `check_fp_free_scan.py`: a store
   of packed integers with a non-temporal hint (no rounding, no MXCSR, no floating-point operand).
   `movntps`, `movntpd` and `vmovntdq` stay rejected.
-- **Speed (GPU, reading against a bar).** On the release machine's RTX 2080 SUPER, at Qwen2.5-0.5B,
-  cap 4,096, decoding one cohort member (an adopted 1,200-token prefix, budget 512, in a pool of
-  1,842 pages) from 1,200 to 1,712 tokens, one run: paged decode against the same
-  build's dedicated one-page view, median slowdown −1.21%, sign interval −1.29% to −1.11%
-  (n = 2,540 pairs over five constructions, a commissioned harness, debug layer off). The bar, no
-  more than 5% slower, passes; the paged arm read about 1.2% faster in this run, which is a reading,
-  not a claimed speed-up. Not measured: the AMD card, 1.5B, widths below 1,200 or above 1,712, other
-  caps and pool occupancies, a pooled sequence without an adopted prefix, batched decode, and any
-  comparison with 1.12.0's GPU decode. TODO-BOX: the harness's commissioning record and receipt. TODO-BOX: the AMD legs, on their own machine.
+- **Speed (GPU, reading against a bar).** On the release machine's RTX 2080 SUPER (one card, one
+  driver, debug layer off), single-sequence paged decode against the same build's dedicated
+  one-page view, s = paged time / legacy time − 1, five processes of 104 pairs per row, a
+  commissioned harness (a paged arm slowed 17.65% on purpose is rejected): Qwen2.5-0.5B, cap 4,096,
+  a cohort member at width 1,712, process medians −1.14, −1.11, −1.17, −0.94, −1.33% (about 31
+  tok/s); Qwen2.5-1.5B, cap 32,768, a pooled sequence restored without a prefix at width 16,384,
+  +3.78, +3.59, +3.74, +3.73, +3.68% (about 6.2 tok/s). Between-process SD 0.14 and 0.08 points.
+  The bar, no more than 5% slower by the largest process median, passes on both rows. This is
+  within the bar, not a speed-up: the 0.5B reads about 1% faster, the 1.5B about 3.7% slower. Not
+  measured: the AMD card, other widths and caps, other pool occupancies, batched decode, the debug
+  layer, and any comparison with 1.12.0's GPU decode. TODO-BOX: the run's commit, driver version
+  and commissioning date; the harness's commissioning record and receipt filed with the release's
+  records. TODO-BOX: the AMD legs, on their own machine.
 - **Memory (by admission, 0.5B, cap 4,096, 1.12.0's example cohort):** a GPU pool of 1,842 pages
   (172.7 MiB) admits the cohort and 1,841 refuses exactly the 50th create. By arithmetic, 50
   dedicated sequences hold 1,200 MiB at cap 4,096, or 501.6 MiB sized to the 1,712 positions each
   needs (`sslm_gpu_seq_create` takes the cap); restored with prefix handles the cohort fits in 1,842 pages,
   without them 5,592 until each re-adopts, then 113 more; every sequence's tokens equal the CPU's.
   Confirmed on the real artifact on the RTX 2080 SUPER, debug layer on, at `845918e` (cells 10.3,
-  10.5, 10.7; TODO-BOX: their check counts); not run on the AMD card.
+  10.5, 10.7; TODO-BOX: their check counts), and their fixture legs again after the last library
+  fixes; not run on the AMD card.
 - **Not in this release:** memory savings for dedicated GPU sequences, a GPU page larger than
   `kv_block_size`, cross-backend save blobs, and the items 1.12.0 left out (a removed cap,
   automatic prefix matching, adapter-shaped prefixes, batched shared-prefix attention).
