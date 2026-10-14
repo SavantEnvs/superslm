@@ -96,7 +96,12 @@ def main() -> None:
                         help="engine tree apply_mutant.py --check reads for a mutant with no logs "
                              "(default: this checkout)")
     parser.add_argument("--out", type=Path, default=HERE / "mutant_evidence.json")
+    parser.add_argument("--builder-commit", default=None,
+                        help="the commit the mutant builds came from (default: --tree's HEAD)")
     args = parser.parse_args()
+    builder = args.builder_commit or subprocess.run(
+        ["git", "-C", str(args.tree), "rev-parse", "HEAD"], check=True, capture_output=True,
+        text=True).stdout.strip()
     results = []
     for ident in IDS:
         folder = args.logs / ident
@@ -126,7 +131,7 @@ def main() -> None:
                                           "executed production mutant killed"})
     target = args.out
     target.write_text(json.dumps({"builder_commit":
-        "c9081e0fd33fccabf52e3fb247ad2f51efb74e6e", "mutants": results},
+        builder, "mutants": results},
         indent=2) + "\n", encoding="utf-8")
     gone_ids = [r["id"] for r in results if r["classification"] == "target_gone"]
     print(f"WROTE {target} mutants={len(results)} target_gone={len(gone_ids)}"
