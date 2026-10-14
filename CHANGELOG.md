@@ -71,7 +71,10 @@ the planned 1.12.1 fixes. `docs/api.md` (*Paged KV memory on the GPU*) summarize
   writes with streaming stores on x64; the bytes are unchanged (equal to 1.11.0's and 1.12.0's at 9
   lengths, and at every destination offset 0 to 63 against the pinned 1.11.0 blobs). Smaller blocks
   and non-x64 targets keep 1.12.0's copy. TODO-BOX: the release machine's save readings against
-  1.11.0; until then no save speed is stated.
+  1.11.0; until then no save speed is stated. The FP-free scan's check (A) accepts `movntdq`, the
+  streaming store this compiles to, on `_X86_VEC_MOVE_ALLOW` in `check_fp_free_scan.py`: a store
+  of packed integers with a non-temporal hint (no rounding, no MXCSR, no floating-point operand).
+  `movntps`, `movntpd` and `vmovntdq` stay rejected.
 - **Speed (GPU, reading against a bar).** On the release machine's RTX 2080 SUPER, at Qwen2.5-0.5B,
   cap 4,096, decoding one cohort member (an adopted 1,200-token prefix, budget 512, in a pool of
   1,842 pages) from 1,200 to 1,712 tokens, one run: paged decode against the same

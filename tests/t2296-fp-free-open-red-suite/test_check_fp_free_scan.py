@@ -4042,6 +4042,12 @@ def test_check_a_p_vp_structural_accept_census_and_violation():
     land in structural_only, 454 -> 457 -- the same filing the sixteen
     `_X86_BITWISE_FP_FAMILY` members already get. Recomputed by running
     this census, not derived by hand.
+
+    Rebaselined again 2026-10-14 (Dan's decision, ID-PENDING): `movntdq`
+    (the save gather's streaming store) added to `_X86_VEC_MOVE_ALLOW`
+    moves accept_a 574 -> 575 and named_accept 117 -> 118; structural_only
+    stays 457, since the census files a `_X86_VEC_MOVE_ALLOW` member as
+    named. Recomputed by running this census, not derived by hand.
     """
     if not _SCAN_AVAILABLE:
         _fail_absent("(D-SLM4999 p/vp vitality pin, census)", "")
@@ -4051,18 +4057,20 @@ def test_check_a_p_vp_structural_accept_census_and_violation():
         "reproduced 1523 -- this suite's own capstone version may have "
         "changed; got {}".format(len(vocabulary))
     )
-    assert len(accept_a) == 574, (
+    assert len(accept_a) == 575, (
         "check (A)'s own ACCEPT count on a vector operand changed from the "
-        "reproduced 574 (555 pre-D-SLM5037 + 16 vextract/vinsert "
+        "reproduced 575 (555 pre-D-SLM5037 + 16 vextract/vinsert "
         "lane-movement mnemonics D-SLM5037 widened + 3 _X86_INTEGER_HASH_ALLOW "
-        "SHA-256 mnemonics, 2026-09-29); got {}".format(len(accept_a))
+        "SHA-256 mnemonics, 2026-09-29 + movntdq, 2026-10-14); got "
+        "{}".format(len(accept_a))
     )
-    assert len(named_accept) == 117, (
+    assert len(named_accept) == 118, (
         "check (A)'s own explicitly-allow-listed ACCEPT count changed from "
-        "the reproduced 117 (101 pre-D-SLM5037 + 16 -- D-SLM5037's own "
-        "sixteen-mnemonic widening is an EXPLICIT _X86_VEC_MOVE_ALLOW "
-        "addition, unlike D-SLM4987's structural-rule accept, so this count "
-        "moves with it); got {}".format(len(named_accept))
+        "the reproduced 118 (101 pre-D-SLM5037 + 16 + movntdq, 2026-10-14 -- "
+        "D-SLM5037's own sixteen-mnemonic widening and the movntdq addition "
+        "are EXPLICIT _X86_VEC_MOVE_ALLOW additions, unlike D-SLM4987's "
+        "structural-rule accept, so this count moves with them); got "
+        "{}".format(len(named_accept))
     )
     assert len(structural_only) == 457, (
         "check (A)'s own structural-only (not on _X86_VEC_MOVE_ALLOW) ACCEPT "
@@ -4900,6 +4908,66 @@ def test_check_a_still_rejects_neighbouring_sha1_mnemonic(mnemonic):
     assert scan._x86_check_a(mnemonic, "xmm1, xmm2") is None, (
         "{} was never reviewed onto any check (A) list and must still REJECT "
         "as unknown -- the SHA-256 addition must not widen to it".format(mnemonic)
+    )
+    assert not scan._x86_check_b(mnemonic), (
+        "{} must not be on check (B)'s GPR allow-list either".format(mnemonic)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dan, 2026-10-14 (decision ID pending: ID-PENDING): `movntdq` joins
+# `_X86_VEC_MOVE_ALLOW` -- the 1.13.0 save gather's streaming store
+# (`_mm_stream_si128` in `BlockCopy`/`BlockZero`, emitted in
+# `GatherFlatBlock`). The cells below pin that the addition is exactly
+# scoped: movntdq ACCEPTs with the movement list's own reason, it is the only
+# non-temporal store any check (A) list names, and its FP-typed siblings
+# (`movntps`/`movntpd`), its unreviewed VEX form, and an FP arithmetic op
+# still REJECT.
+# ---------------------------------------------------------------------------
+
+_NONTEMPORAL_STORE_FAMILY = (
+    "movntdq", "movntps", "movntpd", "movntdqa", "movnti", "movntq",
+    "movntsd", "movntss", "vmovntdq", "vmovntps", "vmovntpd", "vmovntdqa",
+)
+
+
+def test_check_a_accepts_movntdq_streaming_store():
+    if not _SCAN_AVAILABLE:
+        _fail_absent("(movntdq, must-accept)", "")
+    for ops in ("xmmword ptr [rax], xmm0", "xmmword ptr [rcx + rdx + 0x10], xmm7",
+                "xmmword ptr [r8 + 0x30], xmm15"):
+        assert scan._x86_check_a("movntdq", ops) == "vec_move_allow", (
+            "movntdq {} must ACCEPT under check (A) via _X86_VEC_MOVE_ALLOW; "
+            "got {!r}".format(ops, scan._x86_check_a("movntdq", ops))
+        )
+
+
+def test_movntdq_is_the_only_nontemporal_store_on_any_check_a_list():
+    if not _SCAN_AVAILABLE:
+        _fail_absent("(movntdq, exact scope)", "")
+    for name in ("_X86_VEC_MOVE_ALLOW", "_X86_P_VP_STRUCTURAL_ALLOW",
+                 "_X86_BITWISE_FP_FAMILY", "_X86_INTEGER_HASH_ALLOW"):
+        named = set(getattr(scan, name)) & set(_NONTEMPORAL_STORE_FAMILY)
+        expected = {"movntdq"} if name == "_X86_VEC_MOVE_ALLOW" else set()
+        assert named == expected, (
+            "{} names non-temporal mnemonics {}; only movntdq, on "
+            "_X86_VEC_MOVE_ALLOW, was reviewed (2026-10-14)".format(name, sorted(named))
+        )
+
+
+@pytest.mark.parametrize("mnemonic,ops", (
+    ("movntps", "xmmword ptr [rax], xmm0"),
+    ("movntpd", "xmmword ptr [rax], xmm0"),
+    ("vmovntdq", "xmmword ptr [rax], xmm0"),
+    ("addps", "xmm0, xmm1"),
+))
+def test_check_a_still_rejects_movntdq_neighbour(mnemonic, ops):
+    if not _SCAN_AVAILABLE:
+        _fail_absent("(movntdq, must-reject neighbour)", "")
+    assert scan._x86_check_a(mnemonic, ops) is None, (
+        "{} {} must still REJECT under check (A) -- the movntdq addition must "
+        "not widen to the FP-typed stores, the unreviewed VEX form, or FP "
+        "arithmetic".format(mnemonic, ops)
     )
     assert not scan._x86_check_b(mnemonic), (
         "{} must not be on check (B)'s GPR allow-list either".format(mnemonic)
