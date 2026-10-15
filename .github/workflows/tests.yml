@@ -908,11 +908,14 @@ jobs:
       # Clang's default non-atomic counters lose updates there, which can erase a rare
       # branch when llvm-cov derives it by subtraction (v1.13.0's top_k < 1 refusal).
       # Atomic profile updates preserve those hits; the committed coverage floors stay fixed.
+      # System-header counters add substantial overhead in the SIMD kernels without
+      # contributing to the project report. The profile list omits /usr only; every
+      # project source, header and test keeps its atomic counters and coverage mapping.
       - name: Build with source-coverage instrumentation
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
-            -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping -fprofile-update=atomic" \
+            -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping -fprofile-update=atomic -fprofile-list=$PWD/tools/ci/coverage_profile.list" \
             -DCMAKE_EXE_LINKER_FLAGS="-fprofile-instr-generate"
           cmake --build build --target superslm_tests superslm_tests_sse2_forced \
             superslm_tests_avx2_forced superslm_tests_avx512_forced \

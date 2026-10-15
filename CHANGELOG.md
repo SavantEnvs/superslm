@@ -7,7 +7,9 @@ All notable changes to SuperSLM (Layer 1) are recorded here.
 ## [1.13.0] - 2026-10-15
 
 - **CI coverage accuracy.** Source-coverage builds use atomic profile-counter updates so
-  concurrent tests preserve branch hits. The per-file coverage floors are unchanged.
+  concurrent tests preserve branch hits. System-header functions are omitted from instrumentation
+  to reduce its overhead; all project sources and tests remain instrumented. The per-file coverage
+  floors are unchanged.
 
 The GPU backend gains 1.12.0's paged K/V memory: GPU page pools, budgeted GPU sequences and prefixes,
 shared prefix pages, and the `SLM6` save blob. `gpu_1p0.h` adds 12 verbs, 2 handle types, 2 test-only
