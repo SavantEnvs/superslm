@@ -409,6 +409,31 @@ reproduced locally (`cmake`+`ctest` per platform, `build.bat` on Windows).
 Every number below states the device, the artifact, and the surface it was
 measured through — a number without that context is not included here.
 
+Routine paged-KV coverage uses the executable's registered-cell inventory and omits only
+the 13 measured extended cells and their cache-dependent C2 cell 6.1, listed in
+`tools/ci/paged_kv_extended_cells.json`. In run 38806240499
+(2026-10-15, atomic Clang 18 coverage), those cells accounted for roughly 78 minutes
+according to GitHub's log timestamps; buffering can shift time between neighboring cells.
+Every other cell, including new registrations, remains in routine coverage; an exclusion
+that no longer names a registered cell fails. The per-file coverage floors stay unchanged.
+The coverage job has a 45-minute limit.
+
+The complete five-suite workload is available without profiling overhead. After building
+`superslm_pkv_r0`, `superslm_pkv_c2`, `superslm_pkv_c3`, `superslm_pkv_c4` and
+`superslm_pkv_c5`, and generating fixtures with `tools/gen_paged_kv_fixture.py`, run:
+
+```sh
+python tools/ci/run_paged_kv_suites.py --binary-dir build --mode full --fixture-dir pkv-fixtures
+```
+
+For a multi-configuration generator, point `--binary-dir` at the configuration directory
+(for example, `build/RelWithDebInfo`).
+
+For an explicit hosted run, choose **Run workflow** on `tests` and select
+`paged-kv-full`. Select `coverage` to run only the coverage job. Automatic pushes and
+pull requests retain the platform matrix and routine coverage. Full-suite mode changes
+neither the test cells nor their race repetition counts.
+
 
 ## Known gaps
 

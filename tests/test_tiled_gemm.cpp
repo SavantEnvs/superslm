@@ -428,6 +428,17 @@ static void TestTiledGemmSelectorTable() {
 		}
 	}
 	CHECK_MSG(bad == 0, "cell 4.7(a): %zu of 32 selector rows wrong", bad);
+	// Only explicitly supported tiers may enable SIMD kernels. Both pure selectors
+	// accept arbitrary arguments (matmul.h); an unknown tier must keep the safe path.
+	for (GemmTier unknown : {static_cast<GemmTier>(-1), static_cast<GemmTier>(4)}) {
+		for (int sw : {0, 1}) {
+			for (bool msvc : {false, true}) {
+				CHECK(SelectGemmPath(unknown, 8, sw, msvc) == GemmPath::kDotRowLoop);
+				CHECK(superslm::detail::SelectSitesKernel(unknown, sw, msvc) ==
+				      superslm::detail::SitesKernel::kShipped);
+			}
+		}
+	}
 	using superslm::detail::DispatchGemmPath;
 	CHECK_MSG(DispatchGemmPath(GemmTier::kAvx512, 8) ==
 	              (kMsvcAvx512HeldOff ? GemmPath::kDotRowLoop : GemmPath::kTiled),

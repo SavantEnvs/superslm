@@ -10,6 +10,8 @@
 // argument that matches no registered id (a mistyped or renamed cell, "6.3/C5" against a cell
 // registered as "6.3") is named on stderr and fails the run, so a selection never silently
 // shrinks to the cells that happen to match.
+// --list prints the registered cell ids without running them. The routine coverage driver
+// uses this inventory so newly registered cells run unless explicitly moved to the full suite.
 
 #include "pkv_common.h"
 
@@ -23,6 +25,10 @@ bool Matches(const char* id, const char* arg) {
 }  // namespace
 
 int main(int argc, char** argv) {
+	if (argc == 2 && std::strcmp(argv[1], "--list") == 0) {
+		for (const pkv::CellEntry& c : pkv::Registry()) std::puts(c.id);
+		return pkv::Registry().empty() ? 1 : 0;
+	}
 	int ran = 0, failed_cells = 0;
 	// Every argument must name at least one registered cell, checked before any cell runs.
 	int unmatched = 0;

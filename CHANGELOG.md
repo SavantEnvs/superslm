@@ -9,7 +9,10 @@ All notable changes to SuperSLM (Layer 1) are recorded here.
 - **CI coverage accuracy.** Source-coverage builds use atomic profile-counter updates so
   concurrent tests preserve branch hits. System-header functions are omitted from instrumentation
   to reduce its overhead; all project sources and tests remain instrumented. The per-file coverage
-  floors are unchanged.
+  floors are unchanged. Selector tests cover the fallback paths for unknown CPU tiers.
+- **CI runtime.** The 13 measured extended paged-KV cells and their cache-dependent cell
+  move to the complete local or manually selected suite, without profiling overhead. Routine coverage keeps all other cells
+  and new registrations, retains the existing floors, and has a 45-minute job limit.
 
 The GPU backend gains 1.12.0's paged K/V memory: GPU page pools, budgeted GPU sequences and prefixes,
 shared prefix pages, and the `SLM6` save blob. `gpu_1p0.h` adds 12 verbs, 2 handle types, 2 test-only
