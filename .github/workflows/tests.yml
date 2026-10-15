@@ -904,11 +904,15 @@ jobs:
       # the generator checks its own output against the hashes the committed references record.
       - name: Generate the paged-KV fixtures
         run: python tools/gen_paged_kv_fixture.py pkv-fixtures
+      # The concurrency cells call the same instrumented functions from several threads.
+      # Clang's default non-atomic counters lose updates there, which can erase a rare
+      # branch when llvm-cov derives it by subtraction (v1.13.0's top_k < 1 refusal).
+      # Atomic profile updates preserve those hits; the committed coverage floors stay fixed.
       - name: Build with source-coverage instrumentation
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
-            -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
+            -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping -fprofile-update=atomic" \
             -DCMAKE_EXE_LINKER_FLAGS="-fprofile-instr-generate"
           cmake --build build --target superslm_tests superslm_tests_sse2_forced \
             superslm_tests_avx2_forced superslm_tests_avx512_forced \

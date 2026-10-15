@@ -14,7 +14,7 @@ slicing produces the exact same output tokens as running the whole step at
 once. A game can therefore throttle inference to fit whatever GPU headroom a
 frame has left without changing what the model says.
 
-Current release: **1.13.0** (not yet released). The GPU backend gets the same shared prompt prefixes
+Current release: **[1.13.0](https://github.com/dansupergameprogrammer/SuperSLM/releases/tag/v1.13.0)**. The GPU backend gets the same shared prompt prefixes
 and budgeted sequences the CPU got in 1.12.0: a cast of characters that share a world and persona
 prompt can keep that prompt in GPU memory once, and each character reserves only the memory its own
 reply budget needs. Existing GPU code keeps working, with two changes to calls that were undefined
