@@ -667,11 +667,13 @@ public:
 		rd.SampleDesc.Count = 1;
 		rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 		rd.Flags = flags;
-		// Default-heap buffers physically start in COMMON; requesting another initial state is
+		// Ordinary default-heap buffers physically start in COMMON; requesting another initial state is
 		// ignored by D3D12 and emits CREATERESOURCE_STATE_IGNORED. Use that real creation state.
 		// Upload/readback heaps retain their mandatory GENERIC_READ/COPY_DEST initial states.
+		// Acceleration structures also retain their mandatory immutable initial state.
 		const D3D12_RESOURCE_STATES creation_state =
-		    heap == D3D12_HEAP_TYPE_DEFAULT ? D3D12_RESOURCE_STATE_COMMON : state;
+		    heap == D3D12_HEAP_TYPE_DEFAULT && state != D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE
+		        ? D3D12_RESOURCE_STATE_COMMON : state;
 		const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, creation_state, nullptr,
 		                                                IID_PPV_ARGS(out->ReleaseAndGetAddressOf()));
 #if defined(SUPERSLM_GPU_STATE_TRACKING)
