@@ -920,7 +920,12 @@ SslmGpuStatus sslm_gpu_seq_read_prefill_final_hidden(SslmGpuContext* ctx, SslmGp
  * atomically, so verbs on distinct handles may run beside each other and beside a submitter. */
 
 /* A pool of `page_count` pages for `model`, zero-filled before it returns.
- * page_count * page_bytes above 2^32 returns SSLM_GPU_KV_POOL_TOO_LARGE. A pool the device or the host cannot allocate returns
+ * page_count * page_bytes above the adapter's pool cap returns SSLM_GPU_KV_POOL_TOO_LARGE, before anything
+ * is allocated. The cap is D3D12's required single-resource size for the adapter, max(128 MiB,
+ * min(1/4 of its reported dedicated video memory, 2048 MiB)): 2 GiB on an adapter reporting 8 GiB or more, and
+ * 2,093,744,128 bytes on an RTX 2080 SUPER, which reports 8,374,976,512. It is never above 2^32, the reach of
+ * the shaders' offsets. sslm_gpu_kv_pool_max_page_count reports the largest
+ * admissible page count. A pool the device or the host cannot allocate returns
  * SSLM_GPU_ALLOCATION_FAILED on a device that is not removed (SSLM_DEVICE_LOST on a removed one),
  * and a smaller pool may be tried at once. */
 SslmGpuStatus sslm_gpu_kv_pool_create(SslmGpuContext* ctx, SslmGpuModelHandle* model,
@@ -930,6 +935,11 @@ SslmGpuStatus sslm_gpu_kv_pool_create(SslmGpuContext* ctx, SslmGpuModelHandle* m
  * has live pools). A pool of another context returns SSLM_SEQUENCE_KV_BUFFER_MISMATCH; a null
  * pool returns SSLM_OK. Submits nothing. */
 SslmGpuStatus sslm_gpu_kv_pool_destroy(SslmGpuContext* ctx, SslmGpuKvPoolHandle* pool) noexcept;
+/* The largest page_count sslm_gpu_kv_pool_create admits for `model` on this context's adapter (the pool
+ * cap above over the model's page size), in *out_pages. A null out_pages, or a context or model mismatch,
+ * returns SSLM_SEQUENCE_KV_BUFFER_MISMATCH with *out_pages 0. Allocates and submits nothing. */
+SslmGpuStatus sslm_gpu_kv_pool_max_page_count(SslmGpuContext* ctx, SslmGpuModelHandle* model,
+                                              uint32_t* out_pages) noexcept;
 
 /* A budgeted GPU sequence over `pool`: R(budget) pages drawn, SSLM_GPU_KV_POOL_EXHAUSTED with
  * nothing drawn when the pool has fewer. Its reset and release touch only its own table and

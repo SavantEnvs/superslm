@@ -4,8 +4,9 @@
 // and gpu_1p0.cpp / superslm_gpu.cpp use the same definitions:
 //   - the page geometry (§3.1): B = kv_block_size when it divides the cap, else the cap; page_bytes =
 //     L * 2 * H_kv * B * D at the GPU's int8 K/V element (the GPU tier check admits int8 K/V only);
-//   - the size refusal (§4 item 3): page_count * page_bytes above 2^32, the reach of the shaders'
-//     uint byte offsets, is SSLM_GPU_KV_POOL_TOO_LARGE;
+//   - the size refusal (§4 item 3): page_count * page_bytes above the adapter's pool cap is
+//     SSLM_GPU_KV_POOL_TOO_LARGE. The cap is D3D12's required single-resource size for the adapter
+//     (MaxPoolBytesForAdapter), never above 2^32, the reach of the shaders' uint byte offsets;
 //   - the reservation R(budget) = min(ceil(budget / B) + 1, ceil(cap / B)) and the budget domain
 //     [1, cap] (§3.4, the CPU module's formula);
 //   - the zero-fill's staging size min(bytes, 64 MiB) and its CopyBufferRegion chunks, computed in
@@ -24,6 +25,20 @@ namespace kv_pool {
 
 // The shaders' byte offsets are uint (§4 item 1): a pool of more than 2^32 bytes is refused.
 constexpr uint64_t kMaxPoolBytes = uint64_t{1} << 32;
+
+// D3D12's required single-resource size, from d3d12.h's D3D12_REQ_RESOURCE_SIZE_IN_MEGABYTES_EXPRESSION
+// terms (A = 128, B = 0.25, C = 2048): max(A MiB, min(B x dedicated video memory, C MiB)). A pool is one
+// committed buffer, so a pool above this is beyond what a conforming driver must create. Above it the
+// outcome is the driver's: the RTX 2080 SUPER creates a 4 GiB pool, while the RX 7900 XTX's driver
+// (32.0.23033.1002) removes the device (DXGI_ERROR_DEVICE_REMOVED, reason DXGI_ERROR_DRIVER_INTERNAL_ERROR).
+constexpr uint64_t kResourceSizeTermA = uint64_t{128} << 20;
+constexpr uint64_t kResourceSizeTermC = uint64_t{2048} << 20;
+inline uint64_t MaxPoolBytesForAdapter(uint64_t dedicated_video_memory) {
+	const uint64_t quarter = dedicated_video_memory / 4;
+	uint64_t bytes = quarter < kResourceSizeTermC ? quarter : kResourceSizeTermC;
+	if (bytes < kResourceSizeTermA) bytes = kResourceSizeTermA;
+	return bytes < kMaxPoolBytes ? bytes : kMaxPoolBytes;
+}
 // The zero-fill's staging buffer is at most this size (§4 item 3, rev 15).
 constexpr uint64_t kZeroFillStagingMaxBytes = uint64_t{64} << 20;
 // The GPU's K/V element width: the residency tier check admits int8 K/V only.
@@ -64,15 +79,16 @@ inline GpuPageGeometry ComputeGpuPageGeometry(uint32_t num_hidden_layers, uint32
 
 // §4 item 3: the size refusal. Computed in 128-bit-safe form: page_bytes above 2^32 refuses any
 // nonzero count, and otherwise the u64 product of two values below 2^32 cannot overflow.
-inline bool PoolBytesTooLarge(uint32_t page_count, size_t page_bytes) {
-	if (static_cast<uint64_t>(page_bytes) > kMaxPoolBytes) return page_count != 0;
-	return static_cast<uint64_t>(page_count) * static_cast<uint64_t>(page_bytes) > kMaxPoolBytes;
+// `max_bytes` is the pool cap (MaxPoolBytesForAdapter at create; at most kMaxPoolBytes).
+inline bool PoolBytesTooLarge(uint32_t page_count, size_t page_bytes, uint64_t max_bytes = kMaxPoolBytes) {
+	if (static_cast<uint64_t>(page_bytes) > max_bytes) return page_count != 0;
+	return static_cast<uint64_t>(page_count) * static_cast<uint64_t>(page_bytes) > max_bytes;
 }
 
-// The largest page count PoolBytesTooLarge admits (0 for a zero page size).
-inline uint32_t LargestAdmissiblePageCount(size_t page_bytes) {
+// The largest page count PoolBytesTooLarge admits under `max_bytes` (0 for a zero page size).
+inline uint32_t LargestAdmissiblePageCount(size_t page_bytes, uint64_t max_bytes = kMaxPoolBytes) {
 	if (page_bytes == 0) return 0;
-	const uint64_t n = kMaxPoolBytes / static_cast<uint64_t>(page_bytes);
+	const uint64_t n = max_bytes / static_cast<uint64_t>(page_bytes);
 	return n > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max()
 	                                                 : static_cast<uint32_t>(n);
 }

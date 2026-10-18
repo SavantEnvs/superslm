@@ -17,18 +17,33 @@ constexpr uint32_t kForeignPool = 40;  // every 2.11 pool: probed whole, so 40 p
 
 // ---- 2.6 [G3] ------------------------------------------------------------------------------------
 // "A pool of the largest admissible page count plus one page -> SSLM_GPU_KV_POOL_TOO_LARGE." The
-// page count is the test's own §3.1/§4 item 3 arithmetic: floor(2^32 / page_bytes) + 1 (699,051 at
-// the tiny fixture's 6,144-byte page), never an engine query. The out-handle is null (gpu_1p0.h's
-// page-pool block). The ceiling itself admitted is 11.4's verdict, not this cell's.
-// Green: TOO_LARGE with a null out-handle at ceiling + 1 and at UINT32_MAX; a 2-page pool admitted.
+// page count is the test's own §3.1/§4 item 3 arithmetic: floor(cap / page_bytes) + 1, with the cap
+// from pool_cap_helpers.h (349,526 at the tiny fixture's 6,144-byte page under a 2 GiB cap), never an
+// engine query. The out-handle is null (gpu_1p0.h's page-pool block). The ceiling itself admitted is
+// 11.4's verdict, not this cell's. sslm_gpu_kv_pool_max_page_count must report the same ceiling, and
+// refuses a null out-pointer and a model of another context.
+// Green: TOO_LARGE with a null out-handle at ceiling + 1 and at UINT32_MAX; the verb agrees; a 2-page
+// pool admitted.
 void Cell26G3() {
 	Env& e = GetEnv();
 	if (!e.ok) return;
 	const Geometry& g = e.geo;
+	const uint64_t cap = pool_cap::TestPoolCapBytes();
+	G1B_CHECK_MSG(cap != 0, "2.6: the adapter's dedicated video memory could not be read");
+	if (cap == 0) return;
 	const uint32_t ceil = g.CeilingPages();
-	G1B_CHECK_MSG(uint64_t{ceil} * g.page_bytes <= (uint64_t{1} << 32) && uint64_t{ceil + 1} * g.page_bytes > (uint64_t{1} << 32),
-	              "2.6: the test's own ceiling arithmetic (%u pages of %llu bytes)", ceil,
-	              static_cast<unsigned long long>(g.page_bytes));
+	G1B_CHECK_MSG(uint64_t{ceil} * g.page_bytes <= cap && uint64_t{ceil + 1} * g.page_bytes > cap,
+	              "2.6: the test's own ceiling arithmetic (%u pages of %llu bytes under a %llu-byte cap)", ceil,
+	              static_cast<unsigned long long>(g.page_bytes), static_cast<unsigned long long>(cap));
+	uint32_t reported = 0xFFFFFFFFu;
+	G1B_CHECK_STATUS(sslm_gpu_kv_pool_max_page_count(e.ctx1, e.m1, &reported), S::SSLM_OK, "2.6: max_page_count");
+	G1B_CHECK_MSG(reported == ceil, "2.6: max_page_count reports %u pages, the test's arithmetic %u", reported, ceil);
+	G1B_CHECK_STATUS(sslm_gpu_kv_pool_max_page_count(e.ctx1, e.m1, nullptr), S::SSLM_SEQUENCE_KV_BUFFER_MISMATCH,
+	                 "2.6: max_page_count with a null out-pointer");
+	reported = 0xFFFFFFFFu;
+	G1B_CHECK_STATUS(sslm_gpu_kv_pool_max_page_count(nullptr, e.m1, &reported), S::SSLM_SEQUENCE_KV_BUFFER_MISMATCH,
+	                 "2.6: max_page_count without a context");
+	G1B_CHECK_MSG(reported == 0, "2.6: a refused max_page_count leaves %u in its out-pointer, want 0", reported);
 	for (uint32_t pages : {ceil + 1, 0xFFFFFFFFu}) {
 		SslmGpuKvPoolHandle* p = reinterpret_cast<SslmGpuKvPoolHandle*>(uintptr_t{0x1});
 		const S st = sslm_gpu_kv_pool_create(e.ctx1, e.m1, pages, &p);

@@ -57,25 +57,29 @@ void LogRefusal(const char* model, uint32_t pages, const std::string& log) {
 }
 
 // ---- the ceiling legs, at each model (G3 part, rev 15.1) -------------------------------------------
-// The largest page count whose byte size is at most 2^32 (the test's arithmetic: 43,690 at 0.5B and
-// 18,724 at 1.5B, executed in the plan; 2^32 is a multiple of neither page size). One page more is
+// The largest page count whose byte size is at most the adapter's pool cap (the test's arithmetic,
+// pool_cap_helpers.h: a quarter of the adapter's reported dedicated video memory, at most 2 GiB; the
+// RTX 2080 SUPER reports 8,374,976,512 bytes, so 2,093,744,128 bytes, 21,298 pages at 0.5B and 9,128 at
+// 1.5B; an adapter reporting 8 GiB or more gets 2 GiB, 21,845 and 9,362). One page more is
 // refused SSLM_GPU_KV_POOL_TOO_LARGE. The create at the ceiling returns SSLM_OK or
 // SSLM_GPU_ALLOCATION_FAILED, never SSLM_DEVICE_LOST on a live device and never a crash. On a
 // refusal the operative ceiling is found by bisection on those two statuses only, with a one-page
 // create after each refusal returning SSLM_OK, and each refusal's HRESULT and failing call logged.
-void CeilingLeg(const char* name, const std::string& path, uint32_t plan_ceiling, uint64_t plan_page_bytes) {
+void CeilingLeg(const char* name, const std::string& path, uint64_t plan_page_bytes) {
 	Artifact a;
 	if (!a.Load(path)) {
 		G1B_CHECK_MSG(false, "11.4 %s: artifact '%s' not supplied or unreadable (pass --%s=PATH)", name, path.c_str(),
-		              plan_ceiling == 43690 ? "m05" : "m15");
+		              plan_page_bytes == 98304 ? "m05" : "m15");
 		return;
 	}
 	const Geometry& g = a.geo;
-	G1B_CHECK_MSG(g.page_bytes == plan_page_bytes && g.CeilingPages() == plan_ceiling,
-	              "11.4 %s: page_bytes %llu (plan %llu), ceiling %u (plan %u): not the artifact the plan's figures are for", name,
-	              static_cast<unsigned long long>(g.page_bytes), static_cast<unsigned long long>(plan_page_bytes),
-	              g.CeilingPages(), plan_ceiling);
-	G1B_CHECK_MSG((uint64_t{1} << 32) % g.page_bytes != 0, "11.4 %s: 2^32 is a multiple of the page size", name);
+	G1B_CHECK_MSG(g.page_bytes == plan_page_bytes,
+	              "11.4 %s: page_bytes %llu (plan %llu): not the artifact the plan's figures are for", name,
+	              static_cast<unsigned long long>(g.page_bytes), static_cast<unsigned long long>(plan_page_bytes));
+	G1B_CHECK_MSG(pool_cap::TestPoolCapBytes() != 0, "11.4 %s: the adapter's dedicated video memory could not be read", name);
+	std::printf("11.4 POOL CAP model=%s cap=%llu bytes (adapter video memory %llu) ceiling=%u pages\n", name,
+	            static_cast<unsigned long long>(pool_cap::TestPoolCapBytes()),
+	            static_cast<unsigned long long>(pool_cap::AdapterDedicatedVideoMemory()), g.CeilingPages());
 	SslmGpuContext* ctx = NewContext();
 	SslmGpuModelHandle* model = ctx ? MapModel(ctx, a) : nullptr;
 	if (!model) {
@@ -214,8 +218,8 @@ void SeamLegs(Env& e) {
 #endif  // SUPERSLM_GPU_ALLOC_FAULT_INJECTION
 
 void Cell114G3() {
-	CeilingLeg("0.5B", GArgs().m05, 43690, 98304);
-	CeilingLeg("1.5B", GArgs().m15, 18724, 229376);
+	CeilingLeg("0.5B", GArgs().m05, 98304);
+	CeilingLeg("1.5B", GArgs().m15, 229376);
 #if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION)
 	Env& e = GetEnv();
 	if (e.ok) SeamLegs(e);

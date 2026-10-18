@@ -270,9 +270,17 @@ GPU's `B`.
 
 - `sslm_gpu_kv_pool_create(ctx, model, page_count, &pool)` creates one
   device buffer of `page_count` pages, zero-filled before it returns, with a
-  host mirror of the same size. A pool above 2^32 bytes, the reach of the
-  shaders' 32-bit offsets, is `SSLM_GPU_KV_POOL_TOO_LARGE` (43,690 pages at
-  Qwen2.5-0.5B, 18,724 at Qwen2.5-1.5B). A pool the device or the host
+  host mirror of the same size. A pool above the adapter's pool cap is
+  `SSLM_GPU_KV_POOL_TOO_LARGE`, before anything is allocated. The cap is
+  D3D12's required single-resource size for the adapter, max(128 MiB,
+  min(1/4 of its reported dedicated video memory, 2048 MiB)): 2 GiB on an
+  adapter reporting 8 GiB or more, which is 21,845 pages at Qwen2.5-0.5B and
+  9,362 at Qwen2.5-1.5B. An RTX 2080 SUPER reports 8,374,976,512 bytes, so
+  its cap is 2,093,744,128 bytes: 21,298 and 9,128 pages. It is never above 2^32 bytes, the reach of the shaders'
+  32-bit offsets. A single resource above D3D12's required size is the
+  driver's to accept or refuse; the RX 7900 XTX's driver removes the device.
+  `sslm_gpu_kv_pool_max_page_count(ctx, model, &pages)` reports the largest
+  admissible page count. A pool the device or the host
   cannot allocate is `SSLM_GPU_ALLOCATION_FAILED` on a device that is not
   removed, and a smaller pool may be tried at once.
 - `sslm_gpu_kv_pool_destroy` destroys an empty pool, refuses with

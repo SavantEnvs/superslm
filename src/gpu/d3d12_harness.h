@@ -208,6 +208,9 @@ struct Device final : public SubmissionDevice {
 	ComPtr<IDXGIAdapter1> adapter;
 	ComPtr<ID3D12Device> dev;
 	ComPtr<ID3D12GraphicsCommandList> list;
+	// The selected adapter's DXGI_ADAPTER_DESC1::DedicatedVideoMemory, set by Init() with `dev`: the
+	// input to the GPU page pool's cap (gpu_kv_pool_geometry.h, MaxPoolBytesForAdapter).
+	uint64_t dedicated_video_memory = 0;
 	// Set last by a successful Init() and never cleared. Every other field is written only while
 	// this is false (by Init(), and for the process's device by GetDevice() under its mutex), so a
 	// reader that sees true sees a Device that no longer changes; every reader checks it first.
@@ -572,6 +575,10 @@ private:
 		if (!dev) {
 			if (init_error.empty()) init_error = "no D3D12 hardware compute adapter found";
 			return;
+		}
+		{
+			DXGI_ADAPTER_DESC1 d;
+			if (SUCCEEDED(adapter->GetDesc1(&d))) dedicated_video_memory = static_cast<uint64_t>(d.DedicatedVideoMemory);
 		}
 		// T-2192 O2: the read side of SSLM_GPU_ENABLE_DEBUG_LAYER, queried once `dev` genuinely
 		// exists (the earliest point either device-creation path -- override or default-preference
