@@ -497,7 +497,7 @@ Six cover paged K/V (1.13.0, ordinals 24 to 29; see
 `SSLM_GPU_KV_BUDGET_EXCEEDED`, a budgeted sequence or prefix writing at its
 limit below the cap (a prefill commits the tokens below the limit first); `SSLM_GPU_KV_POOL_EXHAUSTED`, a pool too short for a
 create, prefix, `begin_from` or restore, with nothing drawn;
-`SSLM_GPU_KV_POOL_TOO_LARGE`, a pool above 2^32 bytes;
+`SSLM_GPU_KV_POOL_TOO_LARGE`, a pool above the adapter's pool cap (1.13.1; 2^32 bytes in 1.13.0);
 `SSLM_GPU_HOLDER_MODE_MISMATCH`, a pooled and a dedicated holder mixed (an
 adopt onto a dedicated sequence, an `SLM6` blob given to
 `sslm_gpu_seq_restore`, a blob whose magic is not `SLM6` given to

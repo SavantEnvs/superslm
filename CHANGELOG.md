@@ -4,6 +4,24 @@ All notable changes to SuperSLM (Layer 1) are recorded here.
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-10-19
+
+A GPU fix release. No token, save format, existing status or existing verb changes; one GPU verb is added.
+`docs/releases/1.13.1.md` is the release note.
+
+- **GPU page pools are capped at D3D12's guaranteed resource size**, max(128 MiB, min(2048 MiB, a quarter
+  of the adapter's dedicated video memory)). A larger `sslm_gpu_kv_pool_create` is refused with
+  `SSLM_GPU_KV_POOL_TOO_LARGE` before anything is allocated (1.13.0's only limit was 2^32 bytes). At 1.13.0's
+  4 GiB ceiling the AMD Radeon RX 7900 XTX's driver (32.0.23033.1002) removed the device
+  (`DXGI_ERROR_DEVICE_REMOVED`, reason `DXGI_ERROR_DRIVER_INTERNAL_ERROR`).
+- **`sslm_gpu_kv_pool_max_page_count`**, new: the largest page count the create admits for a model on the
+  context's adapter. Additive; no existing declaration, layout or ordinal changes.
+- **Default-heap GPU buffers are created in COMMON**, the state D3D12 gives them, which removes the debug
+  layer's `CREATERESOURCE_STATE_IGNORED` warning. Upload, readback and acceleration-structure buffers keep
+  their required initial states; logical state tracking is unchanged.
+- **Tests:** the three Windows GPU schema cells' builders link `src/gpu/gpu_inflight_registry.cpp`, which
+  1.13.0 added; they failed to link on a GPU machine since then.
+
 ## [1.13.0] - 2026-10-15
 
 - **CI coverage accuracy.** Source-coverage builds use atomic profile-counter updates so
