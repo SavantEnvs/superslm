@@ -43,14 +43,15 @@ void Cell17G3() {
 // The matrix's paged column: on this GPU, a budgeted sequence (B = 16) on each geometry runs the same
 // short scenario as the legacy column and equals a CPU budget holder's tokens, context length and rows.
 // Then a pool at the largest admissible size on each real artifact: the arithmetic ceiling of §4 item
-// 3 (43,690 pages at 0.5B, 18,724 at 1.5B, from page_bytes computed here), or, when this GPU refuses
+// 3 under the adapter's pool cap (pool_cap_helpers.h: 21,298 pages at 0.5B and 9,128 at 1.5B on the
+// RTX 2080 SUPER, 21,845 and 9,362 at a 2 GiB cap; page_bytes computed here), or, when this GPU refuses
 // it with SSLM_GPU_ALLOCATION_FAILED, the largest page count it admits, found by bisection on SSLM_OK
 // against SSLM_GPU_ALLOCATION_FAILED (11.4's rule; SSLM_DEVICE_LOST fails the cell). On that pool a
 // sequence A is created first, the pool is filled, two 2-page fillers are released, and a sequence Z
 // is created last; both prefill across a page and decode, and each equals its CPU twin. Whatever
 // order the allocator hands out pages, one of the first and the last draws sits at the high end of
-// the pool, so a page at a byte offset above 2^31 is driven (checked through the table seam: the
-// cell's own vacuity guard).
+// the pool, so a page in the pool's upper half is driven (checked through the table seam: the cell's
+// own vacuity guard).
 void ShortRun(SRun& d) {
 	void* s = nullptr;
 	if (!d.Create(static_cast<int32_t>(d.b.fx.geo.context_cap), &s)) return;
@@ -127,15 +128,18 @@ void LargestPool(const Fx& fx, const std::string& adapter) {
 	       c.Mark("a", ca) && c.Prefill(cz, pkv::Stream(92, 12, V)) && c.Decode(cz, 5) && c.Mark("z", cz));
 	ExpectSameRecords(d.records, c.records, Cmp::kTokensAndRows,
 	                  "4.8 " + fx.name + " pool of " + std::to_string(pages) + " pages " + adapter);
-	// The vacuity guard: one of A's or Z's mapped pages ends above 2^31 bytes into the pool.
+	// The vacuity guard: one of A's or Z's mapped pages ends in the upper half of the pool. The pool cap
+	// is at most 2 GiB, so no page offset reaches 2^31 bytes; the upper half is the high end this run
+	// must drive.
 	uint64_t top = 0;
 	for (void* s : {a, z})
 		if (s)
 			for (uint32_t pg : GpuTable(static_cast<SslmGpuSequenceHandle*>(s)))
 				top = std::max<uint64_t>(top, (uint64_t{pg} + 1) * fx.page_bytes);
-	G1A_CHECK_MSG(top > (uint64_t{1} << 31),
-	              "4.8 %s: construction: neither the first nor the last draw maps a page above 2^31 bytes (top %llu)",
-	              fx.name.c_str(), static_cast<unsigned long long>(top));
+	const uint64_t pool_bytes = uint64_t{pages} * fx.page_bytes;
+	G1A_CHECK_MSG(top > pool_bytes / 2,
+	              "4.8 %s: construction: neither the first nor the last draw maps a page in the pool's upper half (top %llu of %llu bytes)",
+	              fx.name.c_str(), static_cast<unsigned long long>(top), static_cast<unsigned long long>(pool_bytes));
 	if (ca) c.Release(ca);
 	if (cz) c.Release(cz);
 	for (void* f : fillers) gpu.Release(f);

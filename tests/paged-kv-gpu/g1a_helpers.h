@@ -55,6 +55,7 @@
 #include "superslm/gpu_port.h"
 #include "superslm/model.h"
 #include "superslm/sslm_abi.h"
+#include "pool_cap_helpers.h"
 
 #include <algorithm>
 #include <cstdarg>
@@ -290,8 +291,9 @@ struct Fx {
 		return ((((size_t{l} * 2u + half) * geo.kv_heads + h) * static_cast<size_t>(B)) +
 		        static_cast<size_t>(pos % B)) * geo.head_dim * elem;
 	}
-	// The largest page count whose pool is at most 2^32 bytes (§4 item 3): 43,690 at 0.5B, 18,724 at 1.5B.
-	uint32_t CeilingPages() const { return static_cast<uint32_t>((uint64_t{1} << 32) / page_bytes); }
+	// The largest page count whose pool is at most the adapter's pool cap (§4 item 3, pool_cap_helpers.h):
+	// 21,298 at 0.5B and 9,128 at 1.5B on the RTX 2080 SUPER; 21,845 and 9,362 at a 2 GiB cap.
+	uint32_t CeilingPages() const { return static_cast<uint32_t>(pool_cap::TestPoolCapBytes() / page_bytes); }
 	~Fx() {
 		if (gpu && Ctx()) sslm_gpu_model_unmap(Ctx(), gpu);
 		if (cpu) sslm_model_unmap(cpu);

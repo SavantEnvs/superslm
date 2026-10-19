@@ -47,6 +47,11 @@ void P1Geometry() {
 	CHECK(m15.ok && m15.page_bytes == 229376 && LargestAdmissiblePageCount(m15.page_bytes) == 18724);
 	const GpuPageGeometry tiny = ComputeGpuPageGeometry(2, 2, 48, 4096, 16);  // 2*2*2*16*48 = 6144
 	CHECK(tiny.ok && tiny.page_bytes == 6144 && LargestAdmissiblePageCount(tiny.page_bytes) + 1 == 699051);
+	// Under the 2 GiB adapter cap (MaxPoolBytesForAdapter at 8 GiB or more of video memory).
+	const uint64_t two_gib = uint64_t{1} << 31;
+	CHECK(LargestAdmissiblePageCount(m05.page_bytes, two_gib) == 21845);
+	CHECK(LargestAdmissiblePageCount(m15.page_bytes, two_gib) == 9362);
+	CHECK(LargestAdmissiblePageCount(tiny.page_bytes, two_gib) + 1 == 349526);
 	const GpuPageGeometry nodiv = ComputeGpuPageGeometry(2, 2, 48, 100, 16);  // 16 does not divide 100
 	CHECK(nodiv.ok && nodiv.page_positions == 100 && nodiv.cap_pages == 1);
 	const GpuPageGeometry zero_b = ComputeGpuPageGeometry(2, 2, 48, 64, 0);
@@ -69,6 +74,28 @@ void P2SizeRefusal() {
 	const size_t huge = static_cast<size_t>((uint64_t{1} << 32) + 1);
 	CHECK(PoolBytesTooLarge(1, huge) && !PoolBytesTooLarge(0, huge));
 	CHECK(!PoolBytesTooLarge(1, static_cast<size_t>(uint64_t{1} << 32)));
+}
+
+// D3D12's required single-resource size: max(128 MiB, min(VRAM / 4, 2048 MiB)), never above 2^32.
+void P2bAdapterCap() {
+	const uint64_t mib = uint64_t{1} << 20, gib = uint64_t{1} << 30;
+	CHECK(MaxPoolBytesForAdapter(0) == 128 * mib);
+	CHECK(MaxPoolBytesForAdapter(256 * mib) == 128 * mib);
+	CHECK(MaxPoolBytesForAdapter(512 * mib) == 128 * mib);
+	CHECK(MaxPoolBytesForAdapter(1 * gib) == 256 * mib);
+	CHECK(MaxPoolBytesForAdapter(4 * gib) == 1 * gib);
+	CHECK(MaxPoolBytesForAdapter(8 * gib) == 2 * gib);
+	CHECK(MaxPoolBytesForAdapter(8 * gib - 4) == 2 * gib - 1);
+	CHECK(MaxPoolBytesForAdapter(24 * gib) == 2 * gib);
+	CHECK(MaxPoolBytesForAdapter(std::numeric_limits<uint64_t>::max()) == 2 * gib);
+	for (uint64_t vram : {uint64_t{0}, 4 * gib, 8 * gib, 24 * gib}) {
+		const uint64_t cap = MaxPoolBytesForAdapter(vram);
+		CHECK(cap <= kMaxPoolBytes);
+		for (size_t pb : {size_t{98304}, size_t{229376}, size_t{6144}}) {
+			const uint32_t ceil = LargestAdmissiblePageCount(pb, cap);
+			CHECK(!PoolBytesTooLarge(ceil, pb, cap) && PoolBytesTooLarge(ceil + 1, pb, cap));
+		}
+	}
 }
 
 void P3Reservation() {
@@ -194,6 +221,7 @@ void P6NeighbourInvariance() {
 int main() {
 	P1Geometry();
 	P2SizeRefusal();
+	P2bAdapterCap();
 	P3Reservation();
 	P4ZeroFillChunks();
 	P5Coverage();

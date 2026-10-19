@@ -2326,7 +2326,10 @@ SslmGpuStatus sslm_gpu_kv_pool_createImpl(SslmGpuContext* ctx, SslmGpuModelHandl
 	    model->num_hidden_layers, model->num_key_value_heads, model->head_dim, model->context_cap,
 	    model->kv_block_size);
 	if (!geo.ok) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
-	if (superslm_gpu::kv_pool::PoolBytesTooLarge(page_count, geo.page_bytes)) return SSLM_GPU_KV_POOL_TOO_LARGE;
+	if (superslm_gpu::kv_pool::PoolBytesTooLarge(page_count, geo.page_bytes,
+	                                             superslm_gpu::kv_pool::MaxPoolBytesForAdapter(ctx->device.dedicated_video_memory))) {
+		return SSLM_GPU_KV_POOL_TOO_LARGE;
+	}
 	// EntrySubmitGuard (§4.4): the create submits its zero-fill on the context's own device, so it
 	// is a guarded arc row (scope: any sequence Submitted; per-context, so no ledger term), placed
 	// before the pool's allocation.
@@ -2380,6 +2383,21 @@ SslmGpuStatus sslm_gpu_kv_pool_createImpl(SslmGpuContext* ctx, SslmGpuModelHandl
 	ctx->live_handles += 1;
 	model->live_pools += 1;
 	*out_pool = h.release();
+	return SSLM_OK;
+}
+
+// The largest page count sslm_gpu_kv_pool_create admits for `model` on this context's adapter: the
+// pool cap (MaxPoolBytesForAdapter over the adapter's dedicated video memory) over the model's page
+// size. Validates as the create does; allocates and submits nothing.
+SslmGpuStatus sslm_gpu_kv_pool_max_page_countImpl(SslmGpuContext* ctx, SslmGpuModelHandle* model, uint32_t* out_pages) {
+	if (!out_pages) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (!ctx || !model || model->ctx != ctx) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	const superslm_gpu::kv_pool::GpuPageGeometry geo = superslm_gpu::kv_pool::ComputeGpuPageGeometry(
+	    model->num_hidden_layers, model->num_key_value_heads, model->head_dim, model->context_cap,
+	    model->kv_block_size);
+	if (!geo.ok) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	*out_pages = superslm_gpu::kv_pool::LargestAdmissiblePageCount(
+	    geo.page_bytes, superslm_gpu::kv_pool::MaxPoolBytesForAdapter(ctx->device.dedicated_video_memory));
 	return SSLM_OK;
 }
 
@@ -6092,6 +6110,10 @@ SslmGpuStatus sslm_gpu_kv_pool_create(SslmGpuContext* ctx, SslmGpuModelHandle* m
 }
 SslmGpuStatus sslm_gpu_kv_pool_destroy(SslmGpuContext* ctx, SslmGpuKvPoolHandle* pool) noexcept {
 	return InvokeGpuApiBoundary(__func__, [&] { return sslm_gpu_kv_pool_destroyImpl(ctx, pool); });
+}
+SslmGpuStatus sslm_gpu_kv_pool_max_page_count(SslmGpuContext* ctx, SslmGpuModelHandle* model, uint32_t* out_pages) noexcept {
+	if (out_pages) *out_pages = 0;
+	return InvokeGpuApiBoundary(__func__, [&] { return sslm_gpu_kv_pool_max_page_countImpl(ctx, model, out_pages); });
 }
 SslmGpuStatus sslm_gpu_seq_create_budgeted(SslmGpuContext* ctx, SslmGpuModelHandle* model, SslmGpuKvPoolHandle* pool,
                                            int32_t budget, SslmGpuSequenceHandle** out_seq) noexcept {

@@ -41,6 +41,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include "pool_cap_helpers.h"
 #include <windows.h>
 #include <fcntl.h>
 #include <io.h>
@@ -209,8 +210,9 @@ struct Geometry {
 	uint32_t E(int64_t origin, int64_t budget) const {
 		return static_cast<uint32_t>(std::min<int64_t>(origin / B, static_cast<int64_t>(cap_pages) - R(budget)));
 	}
-	// The largest page count whose byte size is at most 2^32 (§4 item 3; 11.4).
-	uint32_t CeilingPages() const { return static_cast<uint32_t>((uint64_t{1} << 32) / page_bytes); }
+	// The largest page count whose byte size is at most the adapter's pool cap (§4 item 3; 11.4;
+	// pool_cap_helpers.h).
+	uint32_t CeilingPages() const { return static_cast<uint32_t>(pool_cap::TestPoolCapBytes() / page_bytes); }
 };
 
 inline Geometry GeometryOf(const superslm::SslmModelView& v) {

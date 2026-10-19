@@ -208,6 +208,9 @@ struct Device final : public SubmissionDevice {
 	ComPtr<IDXGIAdapter1> adapter;
 	ComPtr<ID3D12Device> dev;
 	ComPtr<ID3D12GraphicsCommandList> list;
+	// The selected adapter's DXGI_ADAPTER_DESC1::DedicatedVideoMemory, set by Init() with `dev`: the
+	// input to the GPU page pool's cap (gpu_kv_pool_geometry.h, MaxPoolBytesForAdapter).
+	uint64_t dedicated_video_memory = 0;
 	// Set last by a successful Init() and never cleared. Every other field is written only while
 	// this is false (by Init(), and for the process's device by GetDevice() under its mutex), so a
 	// reader that sees true sees a Device that no longer changes; every reader checks it first.
@@ -573,6 +576,10 @@ private:
 			if (init_error.empty()) init_error = "no D3D12 hardware compute adapter found";
 			return;
 		}
+		{
+			DXGI_ADAPTER_DESC1 d;
+			if (SUCCEEDED(adapter->GetDesc1(&d))) dedicated_video_memory = static_cast<uint64_t>(d.DedicatedVideoMemory);
+		}
 		// T-2192 O2: the read side of SSLM_GPU_ENABLE_DEBUG_LAYER, queried once `dev` genuinely
 		// exists (the earliest point either device-creation path -- override or default-preference
 		// -- makes that true). A failed QueryInterface here (an SDK/driver combination that
@@ -667,9 +674,19 @@ public:
 		rd.SampleDesc.Count = 1;
 		rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 		rd.Flags = flags;
-		const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr,
+		// Ordinary default-heap buffers physically start in COMMON; requesting another initial state is
+		// ignored by D3D12 and emits CREATERESOURCE_STATE_IGNORED. Use that real creation state.
+		// Upload/readback heaps retain their mandatory GENERIC_READ/COPY_DEST initial states.
+		// Acceleration structures also retain their mandatory immutable initial state.
+		const D3D12_RESOURCE_STATES creation_state =
+		    heap == D3D12_HEAP_TYPE_DEFAULT && state != D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE
+		        ? D3D12_RESOURCE_STATE_COMMON : state;
+		const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, creation_state, nullptr,
 		                                                IID_PPV_ARGS(out->ReleaseAndGetAddressOf()));
 #if defined(SUPERSLM_GPU_STATE_TRACKING)
+		// Keep the caller's logical state contract unchanged. A COMMON buffer can be promoted
+		// to it on first access, and D3D12 permits any promotable StateBefore for COMMON buffers:
+		// https://learn.microsoft.com/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12#performance-implications
 		if (SUCCEEDED(hr)) state_tracking::OnCreate(out->Get(), bytes, heap, state, at);
 #endif
 		if (SUCCEEDED(hr) && debug_layer_enabled) NameBufferBySite(out->Get(), at, heap);
