@@ -206,3 +206,34 @@ SUPERSLM_API sslm_status sslm_seq_kv_stats(sslm_seq seq, sslm_seq_kv_stats_out* 
  * sslm_seq_restore is this verb with a NULL prefix. */
 SUPERSLM_API sslm_status sslm_seq_restore_shared(sslm_model model, sslm_kv_pool* pool, const void* blob, size_t size,
                                     sslm_prefix prefix_or_null, sslm_seq* out, uint32_t* out_shared_pages);
+/* Schema jump-forward (1.15.0). The forced chain of a schema-bound sequence's current walk state:
+ * from a state where the schema admits exactly one byte string before its next choice, the tokens
+ * that spell it, as the forced-next table built at model map gives them (docs/api.md). Read-only:
+ * writes up to `cap` ids (out_ids may be NULL when cap == 0); *out_count = the full chain length
+ * (may exceed cap), 0 when no schema is bound or the state is unforced; *out_accepting = 1 iff the
+ * walk state is accepting. Changes nothing, including bind eligibility. SSLM_ARTIFACT_REJECTED when
+ * the model has no table (an artifact without SCM1 or TOK1). */
+SUPERSLM_API sslm_status sslm_seq_forced_tokens(sslm_model model, sslm_seq seq,
+                                                int32_t* out_ids, int32_t cap, int32_t* out_count,
+                                                int32_t* out_accepting);
+/* Admits the pending choice token (one decode_step produced and has not yet embedded), if any, then
+ * forced-chain tokens, up to `chunk_budget` tokens in all, in one batched layer pass through the
+ * prefill path; writes the admitted *forced* ids to out_forced (cap >= chunk_budget required) and
+ * their count to *out_forced_count. `params` (NULL = greedy) is validated exactly as
+ * sslm_decode_step_v2 validates it; damped params feed the forced tokens to the anti-LM history.
+ * A no-op (OK, count 0) when no schema is bound or the state is unforced. A limit admits a prefix
+ * and returns the limit status, as sslm_prefill does. The host loop: call this until
+ * sslm_seq_forced_tokens reports 0, then decode_step (docs/api.md gives the contract).
+ * `opts` (1.15.0; NULL = canonical, the behaviour above): with mode SSLM_JUMP_EXACT the verb
+ * admits the pending token and a draft clipped to chunk_budget - 1 tokens and to the context
+ * room, truncated at its first out-of-range, special, byteless or illegal token; checks every
+ * drafted token with the decode step's finish; and keeps the pending token and the drafted
+ * tokens the model confirms, reporting the confirmed ones in out_forced. It returns SSLM_OK for
+ * any draft, and is a no-op (OK, count 0) when there is no pending token, the clipped draft is
+ * empty, or the model lacks the exact legal-row finish. The next decode_step produces the
+ * model's own next token (docs/api.md). */
+SUPERSLM_API sslm_status sslm_seq_jump_forward(sslm_model model, sslm_seq seq, int32_t chunk_budget,
+                                               const sslm_decode_params* params, /* NULL = greedy */
+                                               const sslm_jump_options* opts,     /* NULL = canonical */
+                                               sslm_workspace ws,
+                                               int32_t* out_forced, int32_t cap, int32_t* out_forced_count);
