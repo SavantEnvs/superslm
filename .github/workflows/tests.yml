@@ -967,8 +967,9 @@ jobs:
   # exactly the parser gaps that matter (artifact.cpp and model.cpp were the
   # two files a 97%/92%/75.7% aggregate concealed real gaps inside). Floors
   # are measured, never invented -- tools/ci/check_branch_coverage_floors.py
-  # fails the build if any file's measured branch percentage drops below its
-  # pinned floor, once that floor exists. tools/ci/branch_coverage_floors.json
+  # reports any file whose measured branch percentage drops below its pinned
+  # floor. Since 1.15 (principal's ruling, 2026-10-23) that report is
+  # information for diagnosing a problem, not a gate: a drop never fails the job. tools/ci/branch_coverage_floors.json
   # is committed: twenty-two floors are pinned as of this commit -- thirteen
   # landed at 2809d73 (measured from this job's own artifact run 32113553479;
   # d73f131 removed src/matmul.cpp's then-entry, see the file's own
@@ -1210,8 +1211,24 @@ jobs:
           else
             echo "Coverage measurement unavailable; inspect the earlier build/test step."
           fi
-      - name: Check per-file branch-coverage floors
-        run: python3 tools/ci/check_branch_coverage_floors.py build/coverage.json
+      # Report only (principal's ruling, 2026-10-23): the comparison goes to the log and the job
+      # summary as a warning and never fails the job. Test failures still fail it in the run steps.
+      - name: Report per-file branch coverage against the recorded floors
+        run: |
+          set +e
+          python3 tools/ci/check_branch_coverage_floors.py build/coverage.json > build/floor-report.txt 2>&1
+          ec=$?
+          set -e
+          cat build/floor-report.txt
+          {
+            echo "### Branch coverage against the recorded floors (report only)"
+            echo '```'
+            cat build/floor-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ec" -ne 0 ]; then
+            echo "::warning::branch coverage is below a recorded floor in at least one file (report only; see the job summary)"
+          fi
       # Tiled-matmul plan slice 1, cell 11.4: nonzero counts on the tiled kernel's named spans (flush
       # per instantiation, token tail, panel tail, packer K tail and K pad). The AVX-512 half reads
       # its own binary's exit code and raw profile, and reports SKIPPED, never PASS, without them.
