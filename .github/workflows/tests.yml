@@ -1037,7 +1037,7 @@ jobs:
   branch-coverage:
     if: github.event_name != 'workflow_dispatch' || inputs.suite != 'paged-kv-full'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75  # 1.15 added the schema fast-decode cells to every instrumented binary
     env:
       SUPERSLM_DECODE_THREADING_FIXTURE_DIR: ${{ github.workspace }}/dt-fixtures
       SUPERSLM_SCHEMA_FAST_DECODE_FIXTURE_DIR: ${{ github.workspace }}/sfd-fixtures
@@ -1088,6 +1088,10 @@ jobs:
       # AVX2-forced binary in particular previously ran with no fallback at all,
       # silently requiring an AVX2 runner with nothing stating the assumption.
       - name: Run the five binaries under instrumentation
+        # 6.X1 (the exactness matrix) runs about 37 minutes per binary under instrumentation; the
+        # other exact-mode cells cover the same branches, and every other job still runs it.
+        env:
+          SUPERSLM_SFD_SKIP: "6.X1"
         run: |
           set +e
           LLVM_PROFILE_FILE=build/nonforced.profraw ./build/superslm_tests

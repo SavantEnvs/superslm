@@ -64,6 +64,7 @@
 #include <windows.h>  // VirtualAlloc: cell 2.X2's guarded draft
 #else
 #include <sys/mman.h>  // mmap: cell 2.X2's guarded draft
+#include <unistd.h>    // sysconf(_SC_PAGESIZE): the same guard page (macOS does not pull it in transitively)
 #endif
 
 #if !defined(SUPERSLM_ENABLE_SCHEMA_FAST_DECODE_TEST_SEAMS)
@@ -4760,8 +4761,15 @@ void RunSchemaFastDecodeCells(int& checks, int& failures) {
 	GChecks = 0;
 	GFailures = 0;
 	const char* only = std::getenv("SUPERSLM_SFD_ONLY");  // a cell id, e.g. "10.1" (diagnostic runs only)
+	// A cell id to leave out, e.g. "6.X1": the branch-coverage job only, where the exactness matrix alone runs
+	// about 37 minutes under instrumentation. Every other job runs it.
+	const char* skip = std::getenv("SUPERSLM_SFD_SKIP");
 	auto run = [&](const char* id, void (*fn)()) {
 		if (only && *only && std::string(only) != id) return;
+		if (skip && *skip && std::string(skip) == id) {
+			std::printf("[schema fast-decode] cell %-6s skipped (SUPERSLM_SFD_SKIP)\n", id);
+			return;
+		}
 		const int before = GFailures;
 		const auto t0 = std::chrono::steady_clock::now();
 		fn();
