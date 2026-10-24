@@ -17,6 +17,8 @@
 # plan §4 items 7 and 8.
 # Re-listed by the G5 builder (paged KV, 1.13.0): restore-into-pool's one clause (the pool upload of the pages
 # it wrote, phase A and phase B in one try), authored with --emit and dispositioned from plan §4 items 8 and 10.
+# Re-listed by the schema fast-decode G1-J builder (1.17.0): the GPU jump verb's short-count mapping and the S-GCHUNKFAULT
+# test seam's arm, authored with --emit and dispositioned from plan rev 1.4.4 §6.1 and §11.2 (G12.7).
 # A site the fix adds, removes or rewrites is re-listed here with its disposition in the same change.
 # Tab-separated: kind file function count block disposition token
 catch	src/gpu/d3d12_harness.h	ClassifyInFlightException	1	E-2	classifier input: kind Other, every other type standard or not; rule 3 unless rule 0 or 1	...
@@ -90,6 +92,8 @@ status	src/gpu/gpu_1p0.cpp	SslmGpuSeqPrefillSchemaContentForG5BridgeImpl	1	E-3	E
 status	src/gpu/gpu_1p0.cpp	SubmitAdmittedChunkForG5Bridge	1	T10	E-5 runtime_error clause records a classified fault (rule 2 for GpuAllocationError, else GpuOperationFailed) instead of swallowing it (TE-422 S-2 site 2)	*out_fault = superslm_gpu::harness::ClassifyInFlightException() == superslm_gpu::harness::GpuFaultKind::Allocation ? GpuAllocationFailed : GpuOperationFailed
 status	src/gpu/gpu_1p0.cpp	SubmitAdmittedChunkForG5Bridge	1	E-3	final sub-chunk: the three fault statuses go to out_fault, not the guard-refusal flag (TE-423 F-5)	if (final_finish_status == GpuDeviceRemoved || final_finish_status == GpuAllocationFailed || final_finish_status == GpuOperationFailed)
 status	src/gpu/gpu_1p0.cpp	sslm_gpu_seq_restoreImpl	1	E-3	E-7 restore branch: submission-device setup Allocation -> SSLM_GPU_ALLOCATION_FAILED, Other -> SSLM_DEVICE_LOST, not SSLM_SEQUENCE_KV_BUFFER_MISMATCH	if (setup_status == GpuAllocationFailed)
+status	src/gpu/gpu_1p0.cpp	sslm_gpu_seq_jump_forwardImpl	1	E-3	G1-J jump verb short count (E-5 as the prompt twin): out_fault GpuAllocationFailed -> SSLM_GPU_ALLOCATION_FAILED, every other fault SSLM_DEVICE_LOST, after the entry snapshot is restored	return fail(chunk_fault == GpuAllocationFailed ? SSLM_GPU_ALLOCATION_FAILED : SSLM_DEVICE_LOST)
+status	src/gpu/gpu_1p0.cpp	sslm_gpu_test_only_arm_chunk_fault	1	E-3	S-GCHUNKFAULT test seam (SUPERSLM_GPU_TEST_SEAMS only): maps the public fault status onto the forward status the armed sub-chunk returns	g_chunk_fault_armed.status = status == SSLM_GPU_ALLOCATION_FAILED ? GpuAllocationFailed : GpuDeviceRemoved
 status	src/gpu/superslm_gpu.cpp	ForwardStatusForFault	1	E-3	classifier rule 2 at forward sites -> GpuAllocationFailed	case harness::GpuFaultRule::Allocation: return GpuAllocationFailed
 status	src/gpu/superslm_gpu.cpp	ForwardStatusForFault	1	E-3	classifier rule 3 at forward sites -> GpuOperationFailed	case harness::GpuFaultRule::Other: default: return GpuOperationFailed
 status	src/gpu/superslm_gpu.cpp	ForwardStatusForFault	1	E-3	classifier rules 0 and 1 -> GpuDeviceRemoved	case harness::GpuFaultRule::Stranded: case harness::GpuFaultRule::Removed: return GpuDeviceRemoved

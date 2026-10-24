@@ -4226,7 +4226,17 @@ superslm::SslmForwardStatus SubmitChunkToFullDepthForG5Bridge(
 	if (paged_kv != nullptr) paged_local = *paged_kv;
 	const GpuPagedKvBinding* paged_this = paged_kv != nullptr ? &paged_local : nullptr;
 	uint32_t submitted = 0;
+	uint32_t sub_chunk_index = 0;
 	while (submitted < chunk_len) {
+#if defined(SUPERSLM_GPU_TEST_SEAMS)
+		// S-GCHUNKFAULT (schema fast-decode G1-J): the sub-chunk is refused before it is recorded, as a failed
+		// submission is. Armed only by sslm_gpu_seq_jump_forward, for its own pass.
+		if (ChunkFaultForTest& f = ChunkFaultSlotForTest(); f.at >= 0 && static_cast<uint32_t>(f.at) == sub_chunk_index) {
+			f.at = -1;
+			return f.status;
+		}
+#endif
+		++sub_chunk_index;
 		const uint32_t remaining = chunk_len - submitted;
 		const uint32_t this_sub_chunk =
 		    remaining < kT2169TdrSafeMaxChunkTokens ? remaining : kT2169TdrSafeMaxChunkTokens;
@@ -4299,6 +4309,13 @@ superslm::SslmForwardStatus SubmitChunkToFullDepthForG5Bridge(
 	}
 	return superslm::SslmForwardStatus::Ok;  // unreachable (chunk_len > 0 always returns inside the loop)
 }
+
+#if defined(SUPERSLM_GPU_TEST_SEAMS)
+ChunkFaultForTest& ChunkFaultSlotForTest() {
+	thread_local ChunkFaultForTest slot;
+	return slot;
+}
+#endif
 
 // T-2113 (B5, design Sec4.2/Sec6.2/Sec10 B5): the FINISH half of the async split --
 // declared in gpu_port.h. Byte-for-byte the tail RunLayerLoopGpu's own synchronous body

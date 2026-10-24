@@ -730,6 +730,18 @@ void ClearT2169ChunkRecordingTailBadAllocFaultInjection();
 void ArmPrefillGuardDeviceRemovedQueryInjection();
 #endif  // SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION
 
+#if defined(SUPERSLM_GPU_TEST_SEAMS)
+// S-GCHUNKFAULT (schema fast-decode plan rev 1.4.4 §11.0, G1-J): a per-thread slot that
+// SubmitChunkToFullDepthForG5Bridge reads before each sub-chunk. When `at` equals the sub-chunk's index (0 = the
+// first), the slot is disarmed and the call returns `status` without recording that sub-chunk. Only
+// sslm_gpu_seq_jump_forward fills it, for its own pass (gpu_1p0.cpp), and empties it after.
+struct ChunkFaultForTest {
+	int32_t at = -1;
+	superslm::SslmForwardStatus status = superslm::SslmForwardStatus::Ok;
+};
+ChunkFaultForTest& ChunkFaultSlotForTest();
+#endif
+
 // T-2866's own `ArmGpuFinishDegenerateLogitRowInjection` (gpu_1p0.cpp, plan Sec3.10.1/Sec3.10.2)
 // is declared `extern "C"` at global scope, not here: it matches the test author's own
 // reservation (`tests/t2899-schema-deadend-red-suite/cell_gpu_cell2_degenerate.cpp`) and the CPU

@@ -4398,10 +4398,14 @@ struct ChunkPreScanResult {
 	                                                 // range.
 };
 
+// Schema fast-decode plan rev 1.4.4 §7.3 (G1-J): `prewalked_prefix` (0 or 1, §5.4 on the CPU) is the number of
+// leading tokens the walk already covers -- the verb's pending token, which the finish that produced it walked. They
+// are embedded and admitted but not walked: their `dfa_states_after` entry is the start state.
 ChunkPreScanResult RunChunkAdmissionPreScan(SslmGpuModelHandle* model, int64_t chunk_open_ctxlen,
                                              int64_t context_cap, const int32_t* tokens,
                                              int32_t chunk_len, const superslm::SchemaEntry* dfa_entry,
-                                             uint32_t dfa_walk_state_start, int64_t limit) {
+                                             uint32_t dfa_walk_state_start, int64_t limit,
+                                             uint32_t prewalked_prefix = 0) {
 	ChunkPreScanResult r;
 	const uint32_t n = static_cast<uint32_t>(chunk_len);
 
@@ -4448,6 +4452,10 @@ ChunkPreScanResult RunChunkAdmissionPreScan(SslmGpuModelHandle* model, int64_t c
 		r.dfa_states_after.reserve(dfa_embed_scan_limit);
 		uint32_t state = dfa_walk_state_start;
 		for (uint32_t t = 0; t < dfa_embed_scan_limit; ++t) {
+			if (t < prewalked_prefix) {
+				r.dfa_states_after.push_back(state);
+				continue;
+			}
 			uint32_t next_state = 0;
 			if (!model->schemas.Transition(*dfa_entry, state, static_cast<uint32_t>(tokens[t]),
 			                                &next_state)) {
@@ -5240,6 +5248,283 @@ SslmGpuStatus SslmGpuSeqPrefillSchemaContentForG5BridgeImpl(SslmGpuContext* ctx,
 			seq->prefill_hidden_valid = true;
 			return SSLM_OK;
 	}
+}
+
+// ---- Schema fast-decode plan rev 1.4.4 §7.3, G1-J: the jump-forward verb (canonical), the walked embed and the
+// ready getter (gpu_1p0.h states each contract).
+
+#if defined(SUPERSLM_GPU_TEST_SEAMS)
+namespace {
+// S-GCHUNKFAULT: the armed fault, moved into the chunk path's per-thread slot for one verb pass.
+std::mutex g_chunk_fault_mu;
+superslm_gpu::ChunkFaultForTest g_chunk_fault_armed{};
+}  // namespace
+SslmGpuStatus sslm_gpu_test_only_arm_chunk_fault(int32_t sub_chunk, SslmGpuStatus status) noexcept {
+	std::lock_guard<std::mutex> lock(g_chunk_fault_mu);
+	if (sub_chunk < 0) {
+		g_chunk_fault_armed = superslm_gpu::ChunkFaultForTest{};
+		return SSLM_OK;
+	}
+	if (status != SSLM_GPU_ALLOCATION_FAILED && status != SSLM_DEVICE_LOST) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	g_chunk_fault_armed.at = sub_chunk;
+	g_chunk_fault_armed.status = status == SSLM_GPU_ALLOCATION_FAILED ? superslm::SslmForwardStatus::GpuAllocationFailed
+	                                                                  : superslm::SslmForwardStatus::GpuDeviceRemoved;
+	return SSLM_OK;
+}
+#endif
+
+namespace {
+
+// The verb's entry snapshot (§7.3, rev 1.4.1 review L9, audit G-2; rev 1.4.2 strike N5): everything its pass can move.
+// The pass clears the prefill snapshot's flag before it maps pages, and writes the snapshot's bytes only on its
+// success exit, so the flag is all of the snapshot that a failure exit must restore.
+struct JumpEntrySnapshot {
+	int64_t context_length = 0;
+	uint32_t walk = 0;
+	bool prefill_valid = false;
+	uint64_t kv_saturation_count = 0;
+	superslm::SequenceLayerState live{};
+	std::vector<int8_t> hidden_codes;
+	superslm::CarriedScale hidden_scale{};
+	uint32_t layer_index = 0;
+	bool ready = false;
+	uint32_t mapped = 0;
+	// The host-mirror K and V rows the pass may write: positions [context_length, context_length + rows) of every
+	// layer and K/V head, within the dedicated mirror, or within the pages a pooled holder had mapped at entry
+	// (rows in pages mapped by the pass go back with those pages).
+	std::vector<size_t> row_offsets;
+	std::vector<int8_t> row_bytes;
+};
+
+// Byte offsets of the K and V rows at `position`, every layer and head, in the sequence's host view.
+void KvRowOffsets(SslmGpuSequenceHandle* seq, int64_t position, std::vector<size_t>* out) {
+	const SslmGpuModelHandle* model = seq->model;
+	const uint8_t* base = KvHostBase(seq);
+	for (uint32_t l = 0; l < model->num_hidden_layers; ++l) {
+		for (size_t h = 0; h < model->num_key_value_heads; ++h) {
+			const int8_t* k;
+			const int8_t* v;
+			if (seq->pool != nullptr) {
+				const superslm::KvPageView view{seq->pool->host_mirror.data(), seq->holder->table.get(),
+				                                superslm::kv_pages::HolderMapped(seq->holder),
+				                                seq->pool->geo.page_positions, seq->pool->geo.page_bytes};
+				k = superslm_gpu::KeyRowGpu(view, l, model->num_key_value_heads, model->head_dim, h, position);
+				v = superslm_gpu::ValueRowGpu(view, l, model->num_key_value_heads, model->head_dim, h, position);
+			} else {
+				k = superslm_gpu::KeyRowGpu(base, l, seq->context_cap, model->num_key_value_heads, model->head_dim, h,
+				                             position);
+				v = superslm_gpu::ValueRowGpu(base, l, seq->context_cap, model->num_key_value_heads, model->head_dim, h,
+				                               position);
+			}
+			out->push_back(static_cast<size_t>(reinterpret_cast<const uint8_t*>(k) - base));
+			out->push_back(static_cast<size_t>(reinterpret_cast<const uint8_t*>(v) - base));
+		}
+	}
+}
+
+void TakeJumpEntrySnapshot(SslmGpuSequenceHandle* seq, int64_t rows, JumpEntrySnapshot* snap) {
+	snap->context_length = seq->context_length;
+	snap->walk = seq->dfa_walk_state;
+	snap->prefill_valid = seq->prefill_hidden_valid;
+	snap->kv_saturation_count = seq->kv_saturation_count;
+	snap->live = seq->live_state;
+	snap->hidden_codes = seq->hidden_codes;
+	snap->hidden_scale = seq->hidden_scale;
+	snap->layer_index = seq->layer_index;
+	snap->ready = seq->ready_for_logits;
+	int64_t end = seq->context_length + rows;
+	if (end > seq->context_cap) end = seq->context_cap;
+	if (seq->pool != nullptr) {
+		snap->mapped = superslm::kv_pages::HolderMapped(seq->holder);
+		const int64_t covered = static_cast<int64_t>(snap->mapped) * seq->pool->geo.page_positions;
+		if (end > covered) end = covered;
+	}
+	const size_t hd = seq->model->head_dim;
+	const uint8_t* base = KvHostBase(seq);
+	for (int64_t p = seq->context_length; p < end; ++p) KvRowOffsets(seq, p, &snap->row_offsets);
+	snap->row_bytes.resize(snap->row_offsets.size() * hd);
+	for (size_t i = 0; i < snap->row_offsets.size(); ++i)
+		std::memcpy(snap->row_bytes.data() + i * hd, base + snap->row_offsets[i], hd);
+}
+
+void RestoreJumpEntrySnapshot(SslmGpuSequenceHandle* seq, const JumpEntrySnapshot& snap) {
+	const size_t hd = seq->model->head_dim;
+	uint8_t* base = KvHostBase(seq);
+	for (size_t i = 0; i < snap.row_offsets.size(); ++i)
+		std::memcpy(base + snap.row_offsets[i], snap.row_bytes.data() + i * hd, hd);
+	if (seq->pool != nullptr && superslm::kv_pages::HolderMapped(seq->holder) > snap.mapped) {
+		(void)superslm::kv_pages::HolderUnmapTail(seq->holder, snap.mapped);
+		seq->table_dirty = true;  // the device table's entries are re-marked at the next upload
+	}
+	seq->context_length = snap.context_length;
+	seq->dfa_walk_state = snap.walk;
+	seq->prefill_hidden_valid = snap.prefill_valid;
+	seq->kv_saturation_count = snap.kv_saturation_count;
+	int8_t* const alias = seq->live_state.hidden_codes;  // the live state aliases hidden_codes; keep the alias
+	seq->live_state = snap.live;
+	seq->live_state.hidden_codes = alias;
+	std::copy(snap.hidden_codes.begin(), snap.hidden_codes.end(), seq->hidden_codes.begin());
+	seq->hidden_scale = snap.hidden_scale;
+	seq->layer_index = snap.layer_index;
+	seq->ready_for_logits = snap.ready;
+}
+
+}  // namespace
+
+SslmGpuStatus sslm_gpu_seq_jump_forwardImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq, int32_t pending_token,
+                                            int32_t chunk_budget, const SslmGpuJumpOptions* opts, int32_t* out_forced,
+                                            int32_t cap, int32_t* out_forced_count) {
+	// (1) Arguments, then the options' shape.
+	if (!ctx || !seq || !seq->model || seq->ctx != ctx || !out_forced || !out_forced_count || chunk_budget < 1 ||
+	    cap < chunk_budget) {
+		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	}
+	if (opts) {
+		if (opts->struct_size != sizeof(SslmGpuJumpOptions) || (opts->mode != 0 && opts->mode != 1) ||
+		    opts->draft_count < 0 || (!opts->draft && opts->draft_count > 0) ||
+		    (opts->mode == 0 && (opts->draft || opts->draft_count != 0))) {
+			return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+		}
+		// (2) Exact mode is refused in 1.17.0 (G12.9), before the claim, with nothing changed.
+		if (opts->mode == 1) return SSLM_SEQUENCE_REJECTED;
+	}
+	SslmGpuModelHandle* model = seq->model;
+	// (3) The pending token's range.
+	if (pending_token < -1 || pending_token >= model->vocab_size) return SSLM_TOKEN_ID_OUT_OF_RANGE;
+	// (4) The table.
+	if (!model->forced.present) return SSLM_GPU_FORCED_TABLE_ABSENT;
+	// (5) The claim, held for the whole call, and Submitted.
+	const SeqDecodeClaim claim(seq);
+	if (!claim.held()) return SSLM_BUSY;
+	if (seq->state() == superslm_gpu::SslmSequenceGpuState::Submitted) return SSLM_BUSY;
+	// (6) The entry shape (§7.3's table).
+	const uint32_t L = model->num_hidden_layers;
+	const bool ready_shape = seq->ready_for_logits || seq->layer_index == L;  // ready, or the primed row (G30)
+	const bool in_hand = !ready_shape && seq->layer_index == 0 && seq->context_length > 0;
+	const bool fresh = !ready_shape && seq->layer_index == 0 && seq->context_length == 0;
+	const bool has_pending = pending_token >= 0;
+	if (!(in_hand && has_pending) && !(ready_shape && !has_pending) && !(fresh && !has_pending)) {
+		return SSLM_SEQUENCE_REJECTED;
+	}
+	// (7) The submission guard: the pass submits on the singleton.
+	if (const SslmGpuStatus g = EntrySubmitGuard(ScopeForHolder(seq), GuardDevice::kReachesSingleton); g != SSLM_OK) {
+		return g;
+	}
+	seq->bind_eligible = false;
+	*out_forced_count = 0;
+	if (seq->bound_schema_index < 0) return SSLM_OK;  // nothing is forced without a schema
+	const size_t si = static_cast<size_t>(seq->bound_schema_index);
+	const superslm::SchemaEntry* entry = model->schemas.ByIndex(si);
+	if (!entry || si >= model->forced.table.size()) return SSLM_SEQUENCE_REJECTED;
+
+	// The rows: the pending token, then the chain from the walk state (which the pending token's finish reached),
+	// up to chunk_budget rows in all.
+	const std::vector<superslm::forced_table::ForcedEntry>& table = model->forced.table[si];
+	const int32_t chain_len = superslm::forced_table::ForcedChain(model->schemas, table, static_cast<uint32_t>(si),
+	                                                              seq->dfa_walk_state, nullptr, 0);
+	if (chain_len == 0) return SSLM_OK;  // no-op: unforced; a pending token stays the caller's
+	const int32_t pend = has_pending ? 1 : 0;
+	const int32_t room = chunk_budget - pend;
+	const int32_t take = chain_len < room ? chain_len : room;
+	std::vector<int32_t> rows(static_cast<size_t>(pend + take));
+	if (has_pending) rows[0] = pending_token;
+	(void)superslm::forced_table::ForcedChain(model->schemas, table, static_cast<uint32_t>(si), seq->dfa_walk_state,
+	                                          rows.data() + pend, take);
+
+	// The headroom, on the host, before any submission (rev 1.4.1, audit G-1, review L2): the verb never reaches the
+	// schema-content bridge's kPositionCap exit.
+	const int64_t limit = seq->pool != nullptr ? seq->limit : seq->context_cap;
+	const bool budget_limited = seq->pool != nullptr && seq->limit < seq->context_cap;
+	int64_t h = limit - seq->context_length;
+	if (h < 0) h = 0;
+	const int32_t asked = static_cast<int32_t>(rows.size());
+	const int32_t admit = static_cast<int32_t>(std::min<int64_t>(asked, h));
+	const SslmGpuStatus limit_status = budget_limited ? SSLM_GPU_KV_BUDGET_EXCEEDED : SSLM_GPU_CONTEXT_CAP_EXCEEDED;
+	if (admit == 0) return limit_status;  // h = 0: nothing changes
+
+	JumpEntrySnapshot snap;
+	TakeJumpEntrySnapshot(seq, admit, &snap);
+	auto fail = [&](SslmGpuStatus st) {
+		RestoreJumpEntrySnapshot(seq, snap);
+		return st;
+	};
+
+	seq->live_state.hidden_scale = seq->hidden_scale;
+	seq->live_state.layer_index = seq->layer_index;
+	seq->live_state.kv_saturation_count = seq->kv_saturation_count;
+	seq->live_state.context_length = seq->context_length;
+	const int64_t chunk_open_ctxlen = seq->context_length;
+	// The prefill snapshot, as the schema-content bridge: invalid from here until the success exit.
+	seq->prefill_hidden_valid = false;
+	const ChunkPreScanResult scan =
+	    RunChunkAdmissionPreScan(model, chunk_open_ctxlen, seq->context_cap, rows.data(), admit, entry,
+	                             seq->dfa_walk_state, limit, /*prewalked_prefix=*/static_cast<uint32_t>(pend));
+	if (scan.cause != ChunkAdmissionCause::kNone || scan.admit_count != static_cast<uint32_t>(admit)) {
+		// Unreachable: the rows are in range, the chain is legal, and `admit` fits the headroom.
+		return fail(SSLM_SEQUENCE_REJECTED);
+	}
+	if (const SslmGpuStatus map_st = MapPooledPagesThrough(seq, chunk_open_ctxlen + admit); map_st != SSLM_OK) {
+		return fail(map_st);
+	}
+	int64_t derived_count = 0;
+	bool guard_rejected = false;
+	superslm::SslmForwardStatus chunk_fault = superslm::SslmForwardStatus::Ok;
+#if defined(SUPERSLM_GPU_TEST_SEAMS)
+	{
+		std::lock_guard<std::mutex> lock(g_chunk_fault_mu);
+		superslm_gpu::ChunkFaultSlotForTest() = g_chunk_fault_armed;
+		g_chunk_fault_armed = superslm_gpu::ChunkFaultForTest{};
+	}
+	struct SlotClear {
+		~SlotClear() { superslm_gpu::ChunkFaultSlotForTest() = superslm_gpu::ChunkFaultForTest{}; }
+	} slot_clear;
+#endif
+	SubmitAdmittedChunkForG5Bridge(model, seq, scan.chunk_embedding_bytes.data(), scan.admit_count, chunk_open_ctxlen,
+	                                &derived_count, &guard_rejected, &chunk_fault);
+	if (derived_count < static_cast<int64_t>(scan.admit_count)) {
+		// A device failure in the pass (rev 1.4.1, review L9): restore the entry state and return the failure's
+		// status. The bridge's device-derived prefix is not kept (XG19).
+		return fail(chunk_fault == superslm::SslmForwardStatus::GpuAllocationFailed ? SSLM_GPU_ALLOCATION_FAILED
+		                                                                           : SSLM_DEVICE_LOST);
+	}
+	seq->dfa_walk_state = scan.dfa_states_after[static_cast<size_t>(admit) - 1];
+	seq->ready_for_logits = true;  // layer_index is at L: the next decode bridge call finishes only
+	const int32_t forced = admit - pend;
+	for (int32_t i = 0; i < forced; ++i) out_forced[i] = rows[static_cast<size_t>(pend + i)];
+	*out_forced_count = forced;
+	if (admit < asked) return limit_status;  // a partial admission (§5.5): the snapshot stays cleared
+	seq->prefill_hidden_codes = seq->hidden_codes;
+	seq->prefill_hidden_valid = true;
+	return SSLM_OK;
+}
+
+SslmGpuStatus sslm_gpu_seq_embed_schema_tokenImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq, int32_t token) {
+	if (!ctx || !seq || !seq->model || seq->ctx != ctx) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	const SeqDecodeClaim claim(seq);
+	if (!claim.held()) return SSLM_BUSY;
+	if (seq->state() == superslm_gpu::SslmSequenceGpuState::Submitted) return SSLM_BUSY;
+	SslmGpuModelHandle* model = seq->model;
+	if (token < 0 || token >= model->vocab_size) return SSLM_TOKEN_ID_OUT_OF_RANGE;
+	if (seq->bound_schema_index < 0) return SSLM_SEQUENCE_REJECTED;
+	const superslm::SchemaEntry* entry = model->schemas.ByIndex(static_cast<size_t>(seq->bound_schema_index));
+	uint32_t next_state = 0;
+	if (!entry || !model->schemas.Transition(*entry, seq->dfa_walk_state, static_cast<uint32_t>(token), &next_state)) {
+		return SSLM_SEQUENCE_REJECTED;
+	}
+	// The embed (it clears bind eligibility as every validated call does); then the walk, and the ready flag cleared,
+	// so the next decode bridge call does not finish the discarded ready row (rev 1.4.2, strike B1, B3).
+	const SslmGpuStatus st = sslm_gpu_seq_embed_tokenImpl(ctx, seq, token);
+	if (st != SSLM_OK) return st;
+	seq->dfa_walk_state = next_state;
+	seq->ready_for_logits = false;
+	return SSLM_OK;
+}
+
+SslmGpuStatus sslm_gpu_seq_ready_for_logitsImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq, int32_t* out_ready) {
+	if (!ctx || !seq || !seq->model || seq->ctx != ctx || !out_ready) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (seq->state() == superslm_gpu::SslmSequenceGpuState::Submitted) return SSLM_BUSY;
+	*out_ready = seq->ready_for_logits ? 1 : 0;
+	return SSLM_OK;
 }
 
 // gpu_1p0.h: the model's hidden width, the element count the read below writes.
@@ -6534,6 +6819,22 @@ SslmGpuStatus sslm_gpu_seq_forced_tokens(SslmGpuContext* ctx, SslmGpuSequenceHan
                                          int32_t cap, int32_t* out_count, int32_t* out_accepting) noexcept {
 	return InvokeGpuApiBoundary(
 	    __func__, [&] { return sslm_gpu_seq_forced_tokensImpl(ctx, seq, out_ids, cap, out_count, out_accepting); });
+}
+SslmGpuStatus sslm_gpu_seq_jump_forward(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq, int32_t pending_token,
+                                        int32_t chunk_budget, const SslmGpuJumpOptions* opts, int32_t* out_forced,
+                                        int32_t cap, int32_t* out_forced_count) noexcept {
+	return InvokeGpuApiBoundary(__func__, [&] {
+		return sslm_gpu_seq_jump_forwardImpl(ctx, seq, pending_token, chunk_budget, opts, out_forced, cap,
+		                                     out_forced_count);
+	});
+}
+SslmGpuStatus sslm_gpu_seq_embed_schema_token(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq,
+                                              int32_t token) noexcept {
+	return InvokeGpuApiBoundary(__func__, [&] { return sslm_gpu_seq_embed_schema_tokenImpl(ctx, seq, token); });
+}
+SslmGpuStatus sslm_gpu_seq_ready_for_logits(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq,
+                                            int32_t* out_ready) noexcept {
+	return InvokeGpuApiBoundary(__func__, [&] { return sslm_gpu_seq_ready_for_logitsImpl(ctx, seq, out_ready); });
 }
 #if defined(SUPERSLM_GPU_TEST_SEAMS)
 SslmGpuStatus sslm_gpu_test_only_submission_count(SslmGpuContext* ctx, uint64_t* out_count) noexcept {
