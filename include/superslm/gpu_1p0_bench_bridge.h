@@ -46,6 +46,22 @@ SslmGpuStatus sslm_gpu_test_only_last_ladder_status(const SslmGpuSequenceHandle*
 SslmGpuStatus sslm_gpu_test_only_prefix_table_entry(const SslmGpuPrefixHandle* prefix, uint32_t i, uint32_t* out_page,
                                                     uint32_t* out_mapped) noexcept;
 
+// Schema fast-decode plan rev 1.4.1 §11.0: the GPU seams of slices G1-F, G1-M and G1-J. Test-only:
+// declared and defined only under SUPERSLM_GPU_TEST_SEAMS, so they are absent from the production library.
+#if defined(SUPERSLM_GPU_TEST_SEAMS)
+// S-GSUB (G1-F): the submissions made so far on `ctx`'s device and on the process's submission device
+// (when it is set up), read from the harness's fence_value_counter(). A cell reads it before and after a
+// call; the difference is the call's submissions. A null argument: SSLM_SEQUENCE_KV_BUFFER_MISMATCH.
+SslmGpuStatus sslm_gpu_test_only_submission_count(SslmGpuContext* ctx, uint64_t* out_count) noexcept;
+// The GPU model's forced-next table, read (G12.4's golden hashes, as the CPU's cell 6.6 reads its own):
+// next_forced(state) (-1 when unforced) and |F(state)| (0 when unforced) of schema `schema_index`.
+// SSLM_GPU_FORCED_TABLE_ABSENT when the model has no table; SSLM_SEQUENCE_KV_BUFFER_MISMATCH for a null
+// argument or an index out of range.
+SslmGpuStatus sslm_gpu_test_only_forced_table_entry(const SslmGpuModelHandle* model, int32_t schema_index,
+                                                    uint32_t state, int32_t* out_next_forced,
+                                                    uint32_t* out_f_len) noexcept;
+#endif  // SUPERSLM_GPU_TEST_SEAMS
+
 #if defined(SUPERSLM_ENABLE_GPU_API_FAILURE_INJECTION)
 enum class SslmGpuApiFailureInjectionPoint { BeforeHandler, AfterHandler };
 void ArmSslmGpuApiFailureInjection(const char* api_name,

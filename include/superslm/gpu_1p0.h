@@ -1084,4 +1084,24 @@ SslmGpuStatus sslm_gpu_prefix_restore(SslmGpuContext* ctx, SslmGpuModelHandle* m
                                       const void* blob, size_t blob_size, SslmGpuPrefixHandle* parent_or_null,
                                       SslmGpuPrefixHandle** out_prefix, uint32_t* out_shared_pages) noexcept;
 
+/* ============================================================================
+ * Schema skip-ahead on the GPU (1.17.0, unreleased): the forced-text query. Exported, and unreleased
+ * until 1.17.0.
+ * ============================================================================
+ *
+ * sslm_gpu_seq_forced_tokens is the GPU twin of sslm_seq_forced_tokens (sslm_abi_functions.inc): the
+ * text the bound schema forces from `seq`'s current walk state, as token ids. It is host-only: it
+ * submits nothing, waits on nothing and changes nothing, bindability included. At most `cap` ids go to
+ * `out_ids` (NULL when cap is 0); `*out_count` gets the whole chain's length, and `*out_accepting` 1
+ * iff the current state is an accepting state of the schema. An unbound sequence reports 0 and 0.
+ * Checked in this order, the first failing check decides, and each refusal writes nothing:
+ * (1) a null context, sequence, `out_count` or `out_accepting`, a sequence of another context, a
+ * negative cap, or a positive cap with a null `out_ids`: SSLM_SEQUENCE_KV_BUFFER_MISMATCH; (2) a model
+ * mapped with no forced-next table (an artifact without a tokenizer section): SSLM_GPU_FORCED_TABLE_ABSENT;
+ * (3) a Submitted sequence, or another thread holds its decode claim: SSLM_BUSY.
+ * The table is built once at sslm_gpu_model_map from the artifact's schema and tokenizer sections, by
+ * the CPU map's own builder, so the query returns the CPU's ids for the same state. */
+SslmGpuStatus sslm_gpu_seq_forced_tokens(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq, int32_t* out_ids,
+                                         int32_t cap, int32_t* out_count, int32_t* out_accepting) noexcept;
+
 #endif /* SSLM_GPU_1P0_H */
