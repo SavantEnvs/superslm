@@ -41,7 +41,7 @@ done
 [ ${#TARGETS[@]} -eq 0 ] && TARGETS=(g1f g1m g1j)
 
 # ---- the executables (keep in step with build_sfd_gpu.bat) -------------------------------------------------
-# name | slice | sources (tests/schema-fast-decode-gpu/*.cpp)
+# name | slice | sources (tests/schema-fast-decode-gpu/*.cpp; a source with a slash is repo-relative)
 TABLE='
 sfdg_cell_g0_1|G1F|sfdg_cell_g0_1
 sfdg_cell_g2_1|G1F|sfdg_cell_g2_1
@@ -56,6 +56,7 @@ sfdg_cell_g11_1|G1J|sfdg_cell_g11_1
 sfdg_cell_g12_verb|G1J|sfdg_cell_g12_verb
 sfdg_cell_g12_6|G1J|sfdg_cell_g12_6
 sfdg_cell_g12_7|G1J|sfdg_cell_g12_7
+schema_fast_decode_gpu_p2_ref|G1J|tools/schema_fast_decode_gpu_p2_ref
 '
 
 if [ "$LIST" = 1 ]; then
@@ -109,13 +110,15 @@ build_exe() {  # build_exe "name|slice|sources"
 	IFS='|' read -r name slice srcs <<<"$1"
 	local objs=() src
 	for src in $srcs; do
-		if [ ! -f "tests/schema-fast-decode-gpu/$src.cpp" ]; then
-			echo "[$slice] $name: NOT WRITTEN (tests/schema-fast-decode-gpu/$src.cpp)"; NOTWRITTEN+=("$name"); return 0
+		local path="tests/schema-fast-decode-gpu/$src.cpp"
+		case "$src" in */*) path="$src.cpp" ;; esac
+		if [ ! -f "$path" ]; then
+			echo "[$slice] $name: NOT WRITTEN ($path)"; NOTWRITTEN+=("$name"); return 0
 		fi
-		if ! compile "$OBJ/cells" "$(echo $BASEFLAGS) $SEAMDEFS $CELLWARN" "tests/schema-fast-decode-gpu/$src.cpp"; then
+		if ! compile "$OBJ/cells" "$(echo $BASEFLAGS) $SEAMDEFS $CELLWARN" "$path"; then
 			REDCOMPILE+=("$name"); return 0
 		fi
-		objs+=("$OBJ/cells/tests_schema-fast-decode-gpu_$src.o")
+		objs+=("$OBJ/cells/$(echo "${path%.cpp}" | tr / _).o")
 	done
 	local log="$OUT/$name.link.log"
 	if "$CXX" -O2 "${objs[@]}" "$OBJ"/engine-seams/*.o -o "$OUT/$name.exe" \

@@ -76,12 +76,15 @@ call :exe sfdg_cell_g11_1 G1J
 call :exe sfdg_cell_g12_verb G1J
 call :exe sfdg_cell_g12_6 G1J
 call :exe sfdg_cell_g12_7 G1J
+call :exe schema_fast_decode_gpu_p2_ref G1J "%ENG%\tools\"
 echo SFDG BUILD: %NLINKED% linked, %NRED% red by link, %NCOMPILE% red by compile
 exit /b 0
 
 :exe
 set EXE=%~1
 set SLICE=%~2
+set SRCDIR=%~3
+if "%SRCDIR%"=="" set SRCDIR=%HEREDIR%
 set WANT=0
 for %%T in (%TARGETS%) do (
     if /I "%%T"=="%EXE%" set WANT=1
@@ -91,8 +94,8 @@ for %%T in (%TARGETS%) do (
     if /I "%%T"=="g1j" if "%SLICE%"=="G1J" set WANT=1
 )
 if "%WANT%"=="0" exit /b 0
-if not exist "%HEREDIR%%EXE%.cpp" ( echo [%SLICE%] %EXE%: NOT WRITTEN & exit /b 0 )
-cl /c %CLF% /Fo"%OUT%\cells\%EXE%.obj" "%HEREDIR%%EXE%.cpp" > "%OUT%\cells\%EXE%.log" 2>&1
+if not exist "%SRCDIR%%EXE%.cpp" ( echo [%SLICE%] %EXE%: NOT WRITTEN & exit /b 0 )
+cl /c %CLF% /Fo"%OUT%\cells\%EXE%.obj" "%SRCDIR%%EXE%.cpp" > "%OUT%\cells\%EXE%.log" 2>&1
 if errorlevel 1 ( type "%OUT%\cells\%EXE%.log" & echo [%SLICE%] %EXE%: RED BY COMPILE & set /a NCOMPILE+=1 & exit /b 0 )
 link /nologo /OUT:"%OUT%\bin\%EXE%.exe" "%OUT%\cells\%EXE%.obj" "%OUT%\engine.lib" ^
     d3d12.lib dxgi.lib dxguid.lib shlwapi.lib psapi.lib > "%OUT%\cells\%EXE%.link.log" 2>&1
