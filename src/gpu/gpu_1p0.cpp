@@ -464,6 +464,15 @@ struct SslmGpuModelHandle {
 	// `head_weights.data()` when untied and flag clear, null when the head is on the device (the
 	// host logits path does not run for such a model). Lifetime: the handle's.
 	const int8_t* head_rows = nullptr;
+	// Schema fast-decode plan rev 1.4.4 §7.3 (G1-M): the masked finish. `legal_row_finish` is
+	// LegalRowFinishExact(hidden_size), computed once at map (`legal_row_finish_mapped` keeps that value for
+	// S-GBOUND, which forces the flag false). `legal_row_head` is the host head a bound finish scores its legal
+	// rows from: `head_rows` for a host-head model; `embed_weights.data()` for a tied device-head model, so its
+	// bound finish makes no device submission; null for an untied device-head model, which keeps the device
+	// logits under a bound schema (Q26 B). Lifetime: the handle's.
+	bool legal_row_finish = false;
+	bool legal_row_finish_mapped = false;
+	const int8_t* legal_row_head = nullptr;
 	// T-2851 (B): the device logits bundle, present only for a model mapped with
 	// SSLM_GPU_RESIDENCY_HEAD_ON_DEVICE. Released with the handle.
 	std::unique_ptr<DeviceLogitsBuffers> device_logits;
@@ -1708,6 +1717,14 @@ SslmGpuStatus sslm_gpu_model_mapImpl(SslmGpuContext* ctx, const SslmModelView* b
 	if (h->schemas.Count() > 0) {
 		superslm::forced_table::BuildLegalIds(h->schemas, &h->legal_ids);
 		if (base->has_tokenizer) superslm::forced_table::BuildForcedTables(h->schemas, base->tokenizer, &h->forced);
+	}
+	// G1-M: the predicate, and the host head a bound finish reads (the field's comment, above).
+	h->legal_row_finish_mapped = superslm::LegalRowFinishExact(static_cast<size_t>(H));
+	h->legal_row_finish = h->legal_row_finish_mapped;
+	if (!head_on_device) {
+		h->legal_row_head = h->head_rows;
+	} else if (base->config.tie_word_embeddings) {
+		h->legal_row_head = h->embed_weights.data();
 	}
 
 	h->ctx = ctx;
@@ -4124,6 +4141,29 @@ inline void MaybeInjectGpuFinishDegenerateLogitRow(int32_t*, int32_t) {}
 }  // namespace
 #endif  // SUPERSLM_GPU_G5_FINISH_ROW_FAULT_INJECTION
 
+#if defined(SUPERSLM_GPU_TEST_SEAMS)
+// §11.0, S-GROWS (G1-M): one entry per finish whose logits succeeded, process-wide, in call order.
+namespace {
+struct GpuRowsLog {
+	std::mutex mu;
+	std::vector<std::pair<uint64_t, int32_t>> entries;
+};
+GpuRowsLog& RowsLogSingleton() {
+	static GpuRowsLog log;
+	return log;
+}
+void LogFinishRows(uint64_t rows, bool device) {
+	GpuRowsLog& log = RowsLogSingleton();
+	std::lock_guard<std::mutex> lock(log.mu);
+	log.entries.emplace_back(rows, device ? 1 : 0);
+}
+}  // namespace
+#else
+namespace {
+inline void LogFinishRows(uint64_t, bool) {}
+}  // namespace
+#endif  // SUPERSLM_GPU_TEST_SEAMS
+
 SslmGpuStatus SslmGpuSeqFinishTokenForG5BridgeImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq,
                                                 int32_t* out_token) {
 	if (!out_token) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
@@ -4170,12 +4210,41 @@ SslmGpuStatus SslmGpuSeqFinishTokenForG5BridgeImpl(SslmGpuContext* ctx, SslmGpuS
 
 	std::vector<int64_t> wide_logits(static_cast<size_t>(model->vocab_size));
 	std::vector<int32_t> logit_row(static_cast<size_t>(model->vocab_size));
-	if (model->device_logits) {
+	// Schema fast-decode plan rev 1.4.4 §7.3 (G1-M): under a bound schema and the model's predicate, only the
+	// walk state's legal rows are scored (LogitsSiteLegalRows over its CSR ids, through the context's
+	// parallel-for hook), from the host head `legal_row_head`: the host-head branch, and a tied device-head
+	// model, whose bound finish therefore makes no device submission. The positions not scored are set to
+	// INT32_MIN by ApplyMaskAndArgmax below before anything reads them, because the mask page equals the CSR row
+	// (§4.3's argument, unchanged). An untied device-head model (Q26 B), unbound decode, and a model whose
+	// predicate is false (S-GBOUND) keep the full finish.
+	const superslm::SchemaEntry* lr_entry =
+	    seq->bound_schema_index >= 0 ? model->schemas.ByIndex(static_cast<size_t>(seq->bound_schema_index)) : nullptr;
+	const bool legal_rows = lr_entry != nullptr && model->legal_row_finish && model->legal_row_head != nullptr &&
+	                        static_cast<size_t>(seq->bound_schema_index) < model->legal_ids.size();
+	uint64_t finish_rows = static_cast<uint64_t>(model->vocab_size);
+	bool finish_on_device = false;
+	if (legal_rows) {
+		using superslm::schema_masks_detail::ReadLE32;
+		const uint32_t rb = ReadLE32(lr_entry->state_offsets_le + static_cast<size_t>(seq->dfa_walk_state) * 4);
+		const uint32_t re = ReadLE32(lr_entry->state_offsets_le + static_cast<size_t>(seq->dfa_walk_state + 1) * 4);
+		finish_rows = re - rb;
+		fst = superslm::LogitsSiteLegalRows(
+		    final_codes.data(), model->hidden_size, model->legal_row_head, static_cast<size_t>(model->vocab_size),
+		    model->legal_ids[static_cast<size_t>(seq->bound_schema_index)].data() + rb, re - rb, wide_logits.data(),
+		    logit_row.data(), &ctx->host_parallel_for);
+		if (fst == superslm::SslmForwardStatus::ParallelForIncomplete) {
+			// As the host-head branch's full finish rests, below. On a tied device-head model this exit is new
+			// with G1-M (rev 1.4.1, review L8): such a model never returned it from a finish before.
+			seq->ready_for_logits = true;
+			return SSLM_GPU_PARALLEL_FOR_INCOMPLETE;
+		}
+	} else if (model->device_logits) {
 		// T-2851 (B): the exact int64 row, computed on the device from the resident head, then the
 		// unchanged host narrowing -- the same call on the same values as the host path below.
 		const SslmGpuStatus device_status = RunDeviceLogits(ctx, *model->device_logits,
 		                                                    final_codes.data(), wide_logits.data());
 		if (device_status != SSLM_OK) return device_status;
+		finish_on_device = true;
 		fst = superslm::NarrowRowChecked(wide_logits.data(), static_cast<size_t>(model->vocab_size),
 		                                 logit_row.data());
 	} else {
@@ -4195,6 +4264,7 @@ SslmGpuStatus SslmGpuSeqFinishTokenForG5BridgeImpl(SslmGpuContext* ctx, SslmGpuS
 		}
 	}
 	if (fst != superslm::SslmForwardStatus::Ok) return MapDecodedStatusToGpuStatus(fst);
+	LogFinishRows(finish_rows, finish_on_device);  // S-GROWS
 
 	MaybeInjectGpuFinishDegenerateLogitRow(logit_row.data(), model->vocab_size);
 
@@ -6481,6 +6551,31 @@ SslmGpuStatus sslm_gpu_test_only_forced_table_entry(const SslmGpuModelHandle* mo
 	if (state >= t.size()) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	*out_next_forced = t[state].next_forced;
 	*out_f_len = t[state].f_len;
+	return SSLM_OK;
+}
+// §11.0, S-GROWS and S-GBOUND (G1-M).
+void sslm_gpu_test_only_rows_log_reset() noexcept {
+	GpuRowsLog& log = RowsLogSingleton();
+	std::lock_guard<std::mutex> lock(log.mu);
+	log.entries.clear();
+}
+size_t sslm_gpu_test_only_rows_log_count() noexcept {
+	GpuRowsLog& log = RowsLogSingleton();
+	std::lock_guard<std::mutex> lock(log.mu);
+	return log.entries.size();
+}
+SslmGpuStatus sslm_gpu_test_only_rows_log_at(size_t i, uint64_t* out_rows, int32_t* out_device_logits) noexcept {
+	if (!out_rows || !out_device_logits) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	GpuRowsLog& log = RowsLogSingleton();
+	std::lock_guard<std::mutex> lock(log.mu);
+	if (i >= log.entries.size()) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	*out_rows = log.entries[i].first;
+	*out_device_logits = log.entries[i].second;
+	return SSLM_OK;
+}
+SslmGpuStatus sslm_gpu_test_only_force_full_finish(SslmGpuModelHandle* model, int32_t force) noexcept {
+	if (!model) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	model->legal_row_finish = force ? false : model->legal_row_finish_mapped;
 	return SSLM_OK;
 }
 #endif
