@@ -33,6 +33,7 @@
 #include "submission_ledger.h"
 #include "gpu_inflight_token.h"
 #include "gpu_resource_state_tracker.h"
+#include "debug_layer_mode.h"
 
 namespace superslm_gpu {
 namespace harness {
@@ -230,6 +231,14 @@ struct Device final : public SubmissionDevice {
 	// open.
 	bool debug_layer_enabled = false;
 	ComPtr<ID3D12InfoQueue> debug_info_queue;
+	// Schema fast-decode plan rev 1.4.1 §7.3 (G1-F, cell G0.1): the value Init() read from
+	// SSLM_GPU_ENABLE_DEBUG_LAYER (0 when unset or anything but 1 or 2), whether it asked for
+	// GPU-based validation, and the banner it printed (empty when it printed none). Value 1 is the
+	// layer plus GPU-based validation, as before; value 2 is the layer only, with no
+	// SetEnableGPUBasedValidation call -- the box driver's setting for the 2080 SUPER (§10).
+	int debug_layer_mode = 0;
+	bool gpu_based_validation_requested = false;
+	std::string debug_layer_banner;
 
 	// Pops every message currently queued in the debug layer's own message buffer (oldest first)
 	// and prints each to stderr as "# D3D12 VALIDATION [severity] category: description". Returns
@@ -465,28 +474,35 @@ private:
 		// zero performance cost, matching this file's own established SSLM_GPU_ADAPTER_INDEX
 		// convention for a diagnostic-only, opt-in override.
 		{
-			char buf[8] = {0};
-			DWORD n = GetEnvironmentVariableA("SSLM_GPU_ENABLE_DEBUG_LAYER", buf, sizeof(buf));
-			if (n > 0 && buf[0] == '1') {
+			char buf[32] = {0};
+			const DWORD n = GetEnvironmentVariableA("SSLM_GPU_ENABLE_DEBUG_LAYER", buf, sizeof(buf));
+			// Schema fast-decode plan rev 1.4.1 §7.3: debug_layer_mode.h holds the values' meaning and
+			// the banners. Value 2 enables the layer only; value 1 keeps its meaning.
+			const char* raw = (n > 0 && n < sizeof(buf)) ? buf : (n > 0 ? "?" : nullptr);
+			const int mode = debug_layer::ParseMode(raw);
+			debug_layer_mode = mode;
+			bool interface_ok = false;
+			bool gbv_available = false;
+			if (mode != 0) {
 				ComPtr<ID3D12Debug> debug0;
 				if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug0)))) {
+					interface_ok = true;
 					debug0->EnableDebugLayer();
-					ComPtr<ID3D12Debug1> debug1;
-					if (SUCCEEDED(debug0.As(&debug1))) {
-						debug1->SetEnableGPUBasedValidation(TRUE);
+					if (debug_layer::RequestsGpuBasedValidation(mode)) {
+						ComPtr<ID3D12Debug1> debug1;
+						if (SUCCEEDED(debug0.As(&debug1))) {
+							debug1->SetEnableGPUBasedValidation(TRUE);
+							gbv_available = true;
+							gpu_based_validation_requested = true;
+						}
 					}
-					std::fprintf(stderr, "# SSLM_GPU_ENABLE_DEBUG_LAYER=1: D3D12 debug layer%s enabled\n",
-					             debug1 ? " + GPU-based validation" : " enabled (GPU-based validation unavailable)");
 					// T-2192 O2: remembered so the info-queue query below (which needs `dev`, not
 					// created yet at this point in Init()) knows whether to run at all.
 					debug_layer_enabled = true;
-				} else {
-					std::fprintf(stderr,
-					              "# SSLM_GPU_ENABLE_DEBUG_LAYER=1 requested but D3D12GetDebugInterface "
-					              "failed -- the Windows 'Graphics Tools' optional feature is likely not "
-					              "installed on this machine; proceeding WITHOUT the debug layer\n");
 				}
 			}
+			debug_layer_banner = debug_layer::Banner(raw, mode, interface_ok, gbv_available);
+			if (!debug_layer_banner.empty()) std::fputs(debug_layer_banner.c_str(), stderr);
 		}
 		ComPtr<IDXGIFactory6> factory;
 		if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
@@ -590,7 +606,7 @@ private:
 		if (debug_layer_enabled) {
 			if (FAILED(dev.As(&debug_info_queue))) {
 				std::fprintf(stderr,
-				              "# SSLM_GPU_ENABLE_DEBUG_LAYER=1: ID3D12InfoQueue unavailable on this "
+				              "# SSLM_GPU_ENABLE_DEBUG_LAYER: ID3D12InfoQueue unavailable on this "
 				              "device -- validation messages will not be drainable through "
 				              "DrainDebugLayerMessages()\n");
 			}
@@ -1105,6 +1121,33 @@ inline const SubmissionLedger* SingletonLedgerIfConstructed() noexcept {
 }
 
 inline bool Device::IsProcessSingleton() const noexcept { return this == &g_device_holder.device; }
+
+// Schema fast-decode plan rev 1.4.2 §7.3 (G1-F, cell G0.1; strike N3): the test-only read of what
+// the process device's Init() did with SSLM_GPU_ENABLE_DEBUG_LAYER. Sets the device up (GetDevice)
+// and copies the mode, whether GPU-based validation was asked for, whether the layer is on, whether
+// `debug_info_queue` exists, and the banner. Compiled only into the test-seam configuration.
+#if defined(SUPERSLM_GPU_TEST_SEAMS)
+struct DebugLayerReportForTest {
+	bool device_available = false;
+	int mode = 0;
+	bool gpu_based_validation_requested = false;
+	bool layer_enabled = false;
+	bool info_queue_present = false;
+	std::string banner;
+};
+inline DebugLayerReportForTest ReadDebugLayerReportForTest() {
+	Device& d = GetDevice();
+	DebugLayerReportForTest r;
+	r.device_available = d.available.load(std::memory_order_acquire);
+	if (!r.device_available) return r;
+	r.mode = d.debug_layer_mode;
+	r.gpu_based_validation_requested = d.gpu_based_validation_requested;
+	r.layer_enabled = d.debug_layer_enabled;
+	r.info_queue_present = d.debug_info_queue != nullptr;
+	r.banner = d.debug_layer_banner;
+	return r;
+}
+#endif
 
 #if defined(SUPERSLM_GPU_ALLOC_FAULT_INJECTION) || defined(SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION)
 #define SUPERSLM_GPU_QUEUE_GATE_SEAM 1
