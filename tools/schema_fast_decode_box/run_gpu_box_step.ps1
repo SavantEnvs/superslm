@@ -334,11 +334,12 @@ $CellTable = [ordered]@{
     'G12.9' = @('sfdg_cell_g12_verb', @($FxArg, '--only=G12.9'))
     'G12.6' = @('sfdg_cell_g12_6', @($FxArg))
     'G12.7' = @('sfdg_cell_g12_7', @($FxArg))
+    'G12.10' = @('sfdg_cell_g12_10', @($FxArg))
 }
 $SliceCells = @{
     F = @('G2.1', 'G12.4', 'G12.5')
     M = @('G5.1', 'G6', 'G8.1')
-    J = @('G7.1', 'G9.1', 'G11.1', 'G12.1', 'G12.2', 'G12.3', 'G12.8', 'G12.9', 'G12.6', 'G12.7')
+    J = @('G7.1', 'G9.1', 'G11.1', 'G12.1', 'G12.2', 'G12.3', 'G12.8', 'G12.9', 'G12.6', 'G12.7', 'G12.10')
 }
 # Sec. 12's engine GPU mutants and the cell that kills each; two per step.
 $Mutants = [ordered]@{

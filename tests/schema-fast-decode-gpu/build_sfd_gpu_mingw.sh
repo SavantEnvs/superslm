@@ -57,6 +57,7 @@ sfdg_cell_g11_1|G1J|sfdg_cell_g11_1
 sfdg_cell_g12_verb|G1J|sfdg_cell_g12_verb
 sfdg_cell_g12_6|G1J|sfdg_cell_g12_6
 sfdg_cell_g12_7|G1J|sfdg_cell_g12_7
+sfdg_cell_g12_10|G1J|sfdg_cell_g12_10
 schema_fast_decode_gpu_p2_ref|G1J|tools/schema_fast_decode_gpu_p2_ref
 sslm_schema_fast_decode_gpu_jf_bench|G1J|tools/schema_fast_decode_gpu_jf_bench
 '

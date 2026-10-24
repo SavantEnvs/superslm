@@ -77,6 +77,7 @@ call :exe sfdg_cell_g11_1 G1J
 call :exe sfdg_cell_g12_verb G1J
 call :exe sfdg_cell_g12_6 G1J
 call :exe sfdg_cell_g12_7 G1J
+call :exe sfdg_cell_g12_10 G1J
 call :exe schema_fast_decode_gpu_p2_ref G1J "%ENG%\tools\"
 echo SFDG BUILD: %NLINKED% linked, %NRED% red by link, %NCOMPILE% red by compile
 exit /b 0

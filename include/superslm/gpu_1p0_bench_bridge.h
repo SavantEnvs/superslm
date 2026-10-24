@@ -77,6 +77,12 @@ SslmGpuStatus sslm_gpu_test_only_force_full_finish(SslmGpuModelHandle* model, in
 // failure exit then restores its entry state. A negative `sub_chunk` disarms. Any other status:
 // SSLM_SEQUENCE_KV_BUFFER_MISMATCH. Only the verb consumes it; the bridges never do.
 SslmGpuStatus sslm_gpu_test_only_arm_chunk_fault(int32_t sub_chunk, SslmGpuStatus status) noexcept;
+// S-GJUMPALLOC (G1-J, engine code review B1): arms a single-shot host std::bad_alloc in the next
+// sslm_gpu_seq_jump_forward call's pass, after its entry snapshot is taken: site 0 before the chunk pre-scan (the
+// prefill snapshot's flag already cleared), 1 after a pooled holder's pages are mapped, 2 after the pass's
+// sub-chunks committed, before the walk and the ready flag move. A negative `site` disarms; any other value,
+// SSLM_SEQUENCE_KV_BUFFER_MISMATCH. Only the verb consumes it.
+SslmGpuStatus sslm_gpu_test_only_arm_jump_host_bad_alloc(int32_t site) noexcept;
 #endif  // SUPERSLM_GPU_TEST_SEAMS
 
 #if defined(SUPERSLM_ENABLE_GPU_API_FAILURE_INJECTION)
