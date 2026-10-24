@@ -8,7 +8,7 @@ rem   --out    default <repo>\build\sfdg (executables in <out>\bin, shaders copi
 rem   --shaders default <repo>\out\shaders (build.bat's), else <repo>\build\Release\shaders (CMake's)
 rem
 rem Engine: build.bat's source list restricted to src\, compiled once with the test seams
-rem (/DSUPERSLM_GPU_TEST_SEAMS /DSUPERSLM_GPU_ALLOC_FAULT_INJECTION /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION).
+rem (/DSUPERSLM_GPU_TEST_SEAMS /DSUPERSLM_GPU_ALLOC_FAULT_INJECTION /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_GPU_G5_FINISH_ROW_FAULT_INJECTION).
 rem Each executable is reported LINKED, RED BY LINK or RED BY COMPILE. Exit 0 unless the engine failed to build.
 rem The box driver (tools\schema_fast_decode_box\run_box_step.ps1, steps GB-F, GB-M, GB-J, GB1) runs them with
 rem SSLM_GPU_ENABLE_DEBUG_LAYER=2; the cells never set it (G0.1's children excepted).
@@ -37,7 +37,7 @@ for %%D in (engine cells bin) do if not exist "%OUT%\%%D" mkdir "%OUT%\%%D"
 set T2791=%ENG%\tests\t2791-gpu-prefill-read-red-suite
 set CLF=/nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /I"%ENG%\include" /I"%ENG%\src" /I"%ENG%\src\gpu" /I"%ENG%\tests" ^
  /I"%ENG%\tests\paged-kv" /I"%ENG%\tests\paged-kv-gpu" /I"%T2791%" /I"%HEREDIR%." ^
- /DSUPERSLM_GPU_TEST_SEAMS /DSUPERSLM_GPU_ALLOC_FAULT_INJECTION /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION
+ /DSUPERSLM_GPU_TEST_SEAMS /DSUPERSLM_GPU_ALLOC_FAULT_INJECTION /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_GPU_G5_FINISH_ROW_FAULT_INJECTION
 set NLINKED=0
 set NRED=0
 set NCOMPILE=0

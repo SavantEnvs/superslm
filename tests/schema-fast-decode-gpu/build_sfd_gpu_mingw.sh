@@ -13,7 +13,8 @@
 #
 # Engine: wine_gpu.sh's SRCS (build.bat's list) restricted to src/, compiled in two configurations:
 #   plain  no definitions: the production library. Compiled only, to show the seams compile out of it.
-#   seams  SUPERSLM_GPU_TEST_SEAMS SUPERSLM_GPU_ALLOC_FAULT_INJECTION SUPERSLM_ENABLE_BAD_ALLOC_INJECTION: every
+#   seams  SUPERSLM_GPU_TEST_SEAMS SUPERSLM_GPU_ALLOC_FAULT_INJECTION SUPERSLM_ENABLE_BAD_ALLOC_INJECTION
+#          SUPERSLM_GPU_G5_FINISH_ROW_FAULT_INJECTION (G8.1): every
 #          cell links against this one (S-GSUB, S-GROWS, S-GBOUND, S-GCHUNKFAULT, the table-build bad-alloc).
 # Shaders are not built here (dxc is optional in the cloud; no cell runs here). Exit 0 unless something
 # failed to COMPILE.
@@ -67,7 +68,7 @@ BASEFLAGS="-std=c++20 -O2 -Iinclude -Isrc -Isrc/gpu -Itests -Itests/paged-kv -It
 -include d3d12.h -include d3d12sdklayers.h -DD3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE=D3D12_RESOURCE_STATES(0x400000)"
 # mingw-w64 13's d3d12.h lacks D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE (0x400000 in the Windows SDK),
 # which d3d12_harness.h names; the definition above stands in for it in this cloud build only.
-SEAMDEFS="-DSUPERSLM_GPU_TEST_SEAMS -DSUPERSLM_GPU_ALLOC_FAULT_INJECTION -DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION"
+SEAMDEFS="-DSUPERSLM_GPU_TEST_SEAMS -DSUPERSLM_GPU_ALLOC_FAULT_INJECTION -DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION -DSUPERSLM_GPU_G5_FINISH_ROW_FAULT_INJECTION"
 CELLWARN="-Wall -Wextra -Wno-unused-parameter"
 OBJ="$CACHE/sfdg-obj-$(echo "$REPO" | tr / _)"
 mkdir -p "$OBJ" "$OUT"

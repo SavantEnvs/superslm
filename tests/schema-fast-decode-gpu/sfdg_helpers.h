@@ -13,8 +13,8 @@
 // shipped C ABI here, restating the CPU suite's rig (tests/test_schema_fast_decode.cpp, Rig) over this
 // harness.
 //
-// RED FIRST. The new statuses are compared through test-side constants (ordinals 31 and 32, §7.3), so a cell
-// compiles before the enumerators exist; the static_asserts below hold once they do (G0.2 checks the mirrors).
+// The new statuses are compared through test-side constants (ordinals 31 and 32, §7.3), as they were before the
+// enumerators landed (G1-F's red round); the static_asserts below pin them to the enum (G0.2 checks the mirrors).
 #ifndef SSLM_SFDG_HELPERS_H
 #define SSLM_SFDG_HELPERS_H
 
@@ -39,10 +39,8 @@ using namespace g1e;
 // ---- the statuses §7.3 appends (G0.2 pins the mirrors) -------------------------------------------------
 constexpr SslmGpuStatus kForcedTableAbsent = static_cast<SslmGpuStatus>(31);
 constexpr SslmGpuStatus kContextCapExceeded = static_cast<SslmGpuStatus>(32);
-#if defined(SFDG_ENUM_LANDED)
 static_assert(kForcedTableAbsent == SslmGpuStatus::SSLM_GPU_FORCED_TABLE_ABSENT, "§7.3: ordinal 31");
 static_assert(kContextCapExceeded == SslmGpuStatus::SSLM_GPU_CONTEXT_CAP_EXCEEDED, "§7.3: ordinal 32");
-#endif
 inline const char* Name(GS s) {
 	if (s == kForcedTableAbsent) return "SSLM_GPU_FORCED_TABLE_ABSENT";
 	if (s == kContextCapExceeded) return "SSLM_GPU_CONTEXT_CAP_EXCEEDED";
@@ -185,8 +183,10 @@ struct GRig {
 		CHECK_MSG(ok, "fsfd_ref.txt: %zu schemas, expected 4", ref.size());
 		return ok;
 	}
-	~GRig() {
+	~GRig() { ReleaseSeqs(); }
+	void ReleaseSeqs() {
 		for (SslmGpuSequenceHandle* s : seqs) sslm_gpu_seq_release(env.ctx, s);
+		seqs.clear();
 	}
 	SslmGpuContext* ctx() const { return env.ctx; }
 	SslmGpuModelHandle* model() const { return env.model(); }
@@ -231,6 +231,35 @@ struct GRig {
 	}
 };
 
+// A second mapping of a fixture file (another residency, or the --untied variant), owned by the cell.
+struct Mapped {
+	SslmGpuModelHandle* m = nullptr;
+	superslm::SslmModelView view{};
+	std::vector<uint8_t> bytes;
+};
+
+inline bool MapVariant(GRig& rig, const std::string& path, uint32_t flags, Mapped* out) {
+	if (!ReadFileBytes(path, &out->bytes)) {
+		CHECK_MSG(false, "[G6] cannot read %s", path.c_str());
+		return false;
+	}
+	std::string err;
+	if (superslm::SslmModel::Load(out->bytes.data(), out->bytes.size(), out->view, &err) != superslm::SslmModelStatus::Ok) {
+		CHECK_MSG(false, "[G6] %s: %s", path.c_str(), err.c_str());
+		return false;
+	}
+	GpuResidencyConfig cfg{};
+	cfg.flags = flags;
+	const GS st = sslm_gpu_model_map(rig.ctx(), &out->view, cfg, &out->m);
+	CHECK_MSG(st == GS::SSLM_OK && out->m, "[G6] map %s (flags %u): %s", path.c_str(), flags, Name(st));
+	return st == GS::SSLM_OK && out->m;
+}
+
+inline void Unmap(GRig& rig, Mapped* m) {
+	if (m->m) sslm_gpu_model_unmap(rig.ctx(), m->m);
+	m->m = nullptr;
+}
+
 struct GQuery {
 	GS st = GS::SSLM_OK;
 	std::vector<int32_t> ids;
@@ -252,6 +281,67 @@ inline uint64_t Submissions(SslmGpuContext* ctx) {
 	return n;
 }
 #endif
+
+// One finish at the state `path` reaches after `prompt`: reset, prompt, SCHEMA_CONTENT `path` (which leaves the
+// ready flag set), then the decode bridge, which finishes the ready row. Returns the token (or -2) and the walk
+// state after; -1 with the status on a failure.
+struct FinishResult {
+	GS st = GS::SSLM_OK;
+	int32_t token = -1;
+	uint32_t walk = 0;
+};
+inline FinishResult FinishAt(GRig& rig, GSeq& s, const std::vector<int32_t>& prompt, const std::vector<int32_t>& path) {
+	FinishResult r;
+	r.st = sslm_gpu_seq_reset(rig.ctx(), s.h);
+	s = GSeq{s.h};
+	if (r.st == GS::SSLM_OK) r.st = rig.Prompt(s, prompt);
+	if (r.st == GS::SSLM_OK) r.st = rig.Content(s, path);
+	if (r.st == GS::SSLM_OK) r.token = Token(rig.env, s, &r.st);
+	r.walk = SslmGpuSeqWalkStateForG5Bridge(s.h);
+	return r;
+}
+
+#if defined(SUPERSLM_GPU_TEST_SEAMS)
+struct RowsEntry {
+	uint64_t rows = 0;
+	int32_t device = -1;
+};
+inline std::vector<RowsEntry> RowsLog() {
+	std::vector<RowsEntry> v(sslm_gpu_test_only_rows_log_count());
+	for (size_t i = 0; i < v.size(); ++i) sslm_gpu_test_only_rows_log_at(i, &v[i].rows, &v[i].device);
+	return v;
+}
+#endif
+
+// The number of legal ids at `state` of `schema` (its CSR row length), from the parsed SCM1 of the fixture.
+inline uint32_t LegalCount(const superslm::SslmModelView& view, const char* schema, uint32_t state) {
+	superslm::SchemaMasksTable t;
+	const superslm::SslmSectionView* sec = view.Section(superslm::SslmSectionType::SchemaMasks);
+	std::string err;
+	if (!sec || !superslm::SchemaMasksTable::Parse(sec->data, sec->byte_size, view.config.vocab_size, t, &err)) return 0;
+	for (size_t i = 0; i < t.Count(); ++i) {
+		const superslm::SchemaEntry* e = t.ByIndex(i);
+		if (!e || e->name != schema) continue;
+		using superslm::schema_masks_detail::ReadLE32;
+		return ReadLE32(e->state_offsets_le + size_t{state + 1} * 4) - ReadLE32(e->state_offsets_le + size_t{state} * 4);
+	}
+	return 0;
+}
+
+// Whether `id` is legal at `state` of `schema` (its mask page bit), from the parsed SCM1 of the fixture.
+inline bool LegalAt(const superslm::SslmModelView& view, const char* schema, uint32_t state, int32_t id) {
+	superslm::SchemaMasksTable t;
+	const superslm::SslmSectionView* sec = view.Section(superslm::SslmSectionType::SchemaMasks);
+	std::string err;
+	if (!sec || !superslm::SchemaMasksTable::Parse(sec->data, sec->byte_size, view.config.vocab_size, t, &err)) return false;
+	for (size_t i = 0; i < t.Count(); ++i) {
+		const superslm::SchemaEntry* e = t.ByIndex(i);
+		if (!e || e->name != schema) continue;
+		const uint8_t* page = e->mask_pages + size_t{state} * t.MaskPageBytes();
+		return ((page[id >> 3] >> (id & 7)) & 1u) != 0;
+	}
+	return false;
+}
 
 // ---- the CPU side (the reference) ------------------------------------------------------------------------
 struct CRig {

@@ -60,6 +60,17 @@ SslmGpuStatus sslm_gpu_test_only_submission_count(SslmGpuContext* ctx, uint64_t*
 SslmGpuStatus sslm_gpu_test_only_forced_table_entry(const SslmGpuModelHandle* model, int32_t schema_index,
                                                     uint32_t state, int32_t* out_next_forced,
                                                     uint32_t* out_f_len) noexcept;
+// S-GROWS (G1-M): one entry per token finish (SslmGpuSeqFinishTokenForG5Bridge, directly or through the decode
+// bridge), in call order, process-wide: the head rows the finish scored (V for the full finish, n for the
+// legal-row finish) and whether the device logits ran (1) or the host computed the row (0). Reset clears it.
+// An index at or past the count, or a null output: SSLM_SEQUENCE_KV_BUFFER_MISMATCH.
+void sslm_gpu_test_only_rows_log_reset() noexcept;
+size_t sslm_gpu_test_only_rows_log_count() noexcept;
+SslmGpuStatus sslm_gpu_test_only_rows_log_at(size_t i, uint64_t* out_rows, int32_t* out_device_logits) noexcept;
+// S-GBOUND (G1-M): forces the model's LegalRowFinishExact predicate false (force 1) or back to its mapped value
+// (force 0), the GPU twin of S-BOUND. A forced model finishes every bound token with the full finish. Must not
+// race a finish on the model. A null model: SSLM_SEQUENCE_KV_BUFFER_MISMATCH.
+SslmGpuStatus sslm_gpu_test_only_force_full_finish(SslmGpuModelHandle* model, int32_t force) noexcept;
 #endif  // SUPERSLM_GPU_TEST_SEAMS
 
 #if defined(SUPERSLM_ENABLE_GPU_API_FAILURE_INJECTION)
