@@ -302,7 +302,15 @@ enum class SslmGpuStatus : uint32_t {
     /* sslm_gpu_prefix_restore (1.16.0, unreleased): the 'SPX1' blob was written by another engine version or on
      * another adapter (its VendorId or DeviceId differs from this context's). Appended LAST, as every
      * GPU status before it; nothing changes and nothing is drawn. Exported, and unreleased until 1.16.0. */
-    SSLM_RESTORE_PRODUCER_MISMATCH
+    SSLM_RESTORE_PRODUCER_MISMATCH,
+    /* Schema skip-ahead (1.17.0, unreleased), ordinal 31: sslm_gpu_seq_forced_tokens or sslm_gpu_seq_jump_forward
+     * on a model mapped without a forced-next table (its artifact carries no tokenizer section). Nothing
+     * changes. The GPU twin of the CPU verbs' SSLM_ARTIFACT_REJECTED, which this enum lacks. */
+    SSLM_GPU_FORCED_TABLE_ABSENT,
+    /* Schema skip-ahead (1.17.0, unreleased), ordinal 32: sslm_gpu_seq_jump_forward asked for more rows than a
+     * dedicated sequence has before its context cap. The rows that fit are committed (h of them, h = 0
+     * included, when nothing changes); the call's comment gives the resting state. */
+    SSLM_GPU_CONTEXT_CAP_EXCEEDED
 };
 
 /* Output handles: sslm_gpu_context_create, sslm_gpu_model_map, sslm_gpu_adapter_map,

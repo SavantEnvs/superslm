@@ -17,6 +17,9 @@ static_assert(static_cast<uint32_t>(SslmGpuStatus::SSLM_GPU_PREFIX_REJECTED) == 
 static_assert(static_cast<uint32_t>(SslmGpuStatus::SSLM_GPU_PREFIX_SCHEMA_MISMATCH) == 29);
 // Precached prefixes (1.16.0, unreleased): the producer refusal, appended last.
 static_assert(static_cast<uint32_t>(SslmGpuStatus::SSLM_RESTORE_PRODUCER_MISMATCH) == 30);
+// Schema skip-ahead on the GPU (1.17.0, unreleased): the two statuses appended after it.
+static_assert(static_cast<uint32_t>(SslmGpuStatus::SSLM_GPU_FORCED_TABLE_ABSENT) == 31);
+static_assert(static_cast<uint32_t>(SslmGpuStatus::SSLM_GPU_CONTEXT_CAP_EXCEEDED) == 32);
 static_assert(static_cast<uint32_t>(SslmGpuStatus::SSLM_GPU_SHADER_DIR_INVALID) == 19);
 static_assert(static_cast<uint32_t>(SslmGpuStatus::SSLM_GPU_SHADER_DIR_CONFLICT) == 20);
 
@@ -54,9 +57,11 @@ constexpr bool AllNamed(SslmGpuStatus status) {
         case SslmGpuStatus::SSLM_GPU_PREFIX_REJECTED:
         case SslmGpuStatus::SSLM_GPU_PREFIX_SCHEMA_MISMATCH:
         case SslmGpuStatus::SSLM_RESTORE_PRODUCER_MISMATCH:
+        case SslmGpuStatus::SSLM_GPU_FORCED_TABLE_ABSENT:
+        case SslmGpuStatus::SSLM_GPU_CONTEXT_CAP_EXCEEDED:
             return true;
     }
     return false;
 }
-static_assert(AllNamed(SslmGpuStatus::SSLM_RESTORE_PRODUCER_MISMATCH));
+static_assert(AllNamed(SslmGpuStatus::SSLM_GPU_CONTEXT_CAP_EXCEEDED));
 int main() { return 0; }

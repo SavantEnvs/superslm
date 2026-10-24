@@ -11,7 +11,8 @@ names. For each such file:
     written after it, in an enum, an X-macro, a name table or a switch);
   - when the file states ordinal 30 beside SSLM_RESTORE_PRODUCER_MISMATCH, it states 31 and 32 beside the new
     names the same way.
-Records, release notes and the changelog are history, not mirrors, and are not read.
+Records, release notes and the changelog are history, not mirrors, and are not read; nor are the engine's .cpp
+sources under src/, which return the statuses rather than spell the enum.
 
 Host-only: it runs in the cloud and in CI. Usage: python tests/schema-fast-decode-gpu/check_gpu_status_mirrors.py
 """
@@ -76,6 +77,9 @@ def main() -> int:
         except (UnicodeDecodeError, OSError):
             continue
         if LAST not in text and not any(n in text for n in NEW):
+            continue
+        # An engine source that returns the statuses is not a mirror (src/**/*.cpp); its headers are read.
+        if rel.startswith("src/") and path.suffix == ".cpp":
             continue
         spelled = sum(1 for n in set(names) if re.search(rf"\b{n}\b", text))
         if spelled < 15 and not states_ordinal(text, LAST, 30) and rel not in NAMED:

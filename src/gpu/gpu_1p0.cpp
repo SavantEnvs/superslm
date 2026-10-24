@@ -68,6 +68,7 @@ static_assert(sizeof(GpuResidencyConfig) == 4 && offsetof(GpuResidencyConfig, fl
 #include "superslm/layer_marshal.h"  // T-2113 B2: MarshalLayer/LayerBacking (relocated, tools/sslm_marshal.h)
 #include "superslm/model.h"          // T-2113 B2: the REAL superslm::SslmModelView this TU needs by value
 #include "../spx1_format.h"          // precached prefixes: the SPX1 writer and reader both backends use
+#include "../forced_table.h"         // schema skip-ahead (G1-F): the forced-next table builder the CPU map uses
 #include "superslm/schema_masks.h"   // G5-5 (T-2132): SchemaMasksTable -- the SAME SCM1 reader the CPU
                                       // ABI (sslm_abi.cpp) already uses, reused here, not re-derived.
 
@@ -440,6 +441,12 @@ struct SslmGpuModelHandle {
 	// with (schema_masks.h) -- reused, not re-derived, so a schema's mask pages/CSR transitions
 	// mean the identical bits on both paths. Count()==0 when this model carries no schema.
 	superslm::SchemaMasksTable schemas;
+	// Schema fast-decode plan rev 1.4.4 §7.3 (G1-F): the forced-next table, the draftable flags and the
+	// per-schema CSR legal-id lists, built once at map by the CPU map's own builder (src/forced_table.h) from
+	// `schemas` and the base view's TOK1. `forced.present` is false for an artifact without TOK1 or schemas,
+	// and the query then refuses with SSLM_GPU_FORCED_TABLE_ABSENT. Immutable after map.
+	superslm::forced_table::ForcedTables forced;
+	std::vector<std::vector<uint32_t>> legal_ids;
 	// G5-5's own final_norm+logits capture (design's "no new arithmetic" claim: the GPU-1.0
 	// substrate's job is the layer loop only, design Sec4/Sec12's own established scope -- the
 	// finish-token bridge below needs these three host-resident facts to run the SAME
@@ -1693,6 +1700,14 @@ SslmGpuStatus sslm_gpu_model_mapImpl(SslmGpuContext* ctx, const SslmModelView* b
 		                                        &schema_err)) {
 			return SSLM_DEVICE_LOST;
 		}
+	}
+	// Schema fast-decode plan rev 1.4.4 §7.3 (G1-F): the forced-next table and the legal-id lists, from the
+	// parsed schemas and the base view's TOK1, before the handle is published. An allocation failure (the
+	// table-build bad-alloc seam included) propagates to the boundary, which returns
+	// SSLM_GPU_ALLOCATION_FAILED with no handle; an artifact without TOK1 maps with no table.
+	if (h->schemas.Count() > 0) {
+		superslm::forced_table::BuildLegalIds(h->schemas, &h->legal_ids);
+		if (base->has_tokenizer) superslm::forced_table::BuildForcedTables(h->schemas, base->tokenizer, &h->forced);
 	}
 
 	h->ctx = ctx;
@@ -4018,6 +4033,54 @@ uint32_t SslmGpuSeqWalkStateForG5Bridge(SslmGpuSequenceHandle* seq) {
 	superslm_gpu::inflight::GpuApiCallScope scope(__func__);  // G3 (§4.4): every C ABI entry point
 	return seq ? seq->dfa_walk_state : kSslmGpuDfaWalkStateUnused;
 }
+
+// Schema fast-decode plan rev 1.4.4 §7.3 (G1-F): the forced-text query, the GPU twin of sslm_seq_forced_tokens
+// (§5.3). Host-only: it submits nothing and changes nothing, bindability included. The order is the CPU's
+// (arguments, table, then the sequence's lock), with the GPU's handle statuses: a malformed handle or argument
+// SSLM_SEQUENCE_KV_BUFFER_MISMATCH, no table SSLM_GPU_FORCED_TABLE_ABSENT, then SSLM_BUSY while another
+// thread's decode holds the claim or the sequence is Submitted. Each refusal writes nothing.
+SslmGpuStatus sslm_gpu_seq_forced_tokensImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq, int32_t* out_ids,
+                                             int32_t cap, int32_t* out_count, int32_t* out_accepting) {
+	if (!ctx || !seq || !seq->model || seq->ctx != ctx || !out_count || !out_accepting || cap < 0 ||
+	    (cap > 0 && !out_ids)) {
+		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	}
+	const SslmGpuModelHandle* model = seq->model;
+	if (!model->forced.present) return SSLM_GPU_FORCED_TABLE_ABSENT;
+	SeqDecodeClaim claim(seq);
+	if (!claim.held()) return SSLM_BUSY;
+	if (seq->state() == superslm_gpu::SslmSequenceGpuState::Submitted) return SSLM_BUSY;
+	if (seq->bound_schema_index < 0) {
+		*out_count = 0;
+		*out_accepting = 0;
+		return SSLM_OK;
+	}
+	const size_t si = static_cast<size_t>(seq->bound_schema_index);
+	const superslm::SchemaEntry* entry = model->schemas.ByIndex(si);
+	if (!entry || si >= model->forced.table.size()) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	// The walk state is read once into `state`: the source mutants of §3.10.8
+	// (tests/t2130-g5-red-suite/make_t2922_gpu_schema_accepting_mutants.py) anchor on the accepting read of
+	// the schema-accepting bridge above, which must stay the one occurrence of that text in this file.
+	const uint32_t state = seq->dfa_walk_state;
+	*out_count = superslm::forced_table::ForcedChain(model->schemas, model->forced.table[si], static_cast<uint32_t>(si),
+	                                                 state, out_ids, cap);
+	*out_accepting = IsAcceptingState(*entry, state) ? 1 : 0;
+	return SSLM_OK;
+}
+
+#if defined(SUPERSLM_GPU_TEST_SEAMS)
+// §11.0, S-GSUB (G1-F): the submissions on the context's device and the process's submission device.
+SslmGpuStatus sslm_gpu_test_only_submission_countImpl(SslmGpuContext* ctx, uint64_t* out_count) {
+	if (!ctx || !out_count) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	uint64_t n = ctx->device.submission_counter();
+	// The process's submission device, only when it is already set up (never set up here).
+	if (superslm_gpu::harness::SingletonLedgerIfConstructed() != nullptr) {
+		n += superslm_gpu::harness::GetDevice().submission_counter();
+	}
+	*out_count = n;
+	return SSLM_OK;
+}
+#endif
 
 // T-2866 (correcting TE-338 Sec8's finding that this cell had no seam on the real GPU path).
 // Mirrors `SUPERSLM_T2169_CHUNK_RECORDING_FAULT_INJECTION`'s own single-shot armed-flag idiom
@@ -6397,6 +6460,30 @@ SslmGpuStatus SslmGpuSeqSchemaAcceptingForG5Bridge(
 		return SslmGpuSeqSchemaAcceptingForG5BridgeImpl(ctx, seq, out_schema_accepting);
 	});
 }
+SslmGpuStatus sslm_gpu_seq_forced_tokens(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq, int32_t* out_ids,
+                                         int32_t cap, int32_t* out_count, int32_t* out_accepting) noexcept {
+	return InvokeGpuApiBoundary(
+	    __func__, [&] { return sslm_gpu_seq_forced_tokensImpl(ctx, seq, out_ids, cap, out_count, out_accepting); });
+}
+#if defined(SUPERSLM_GPU_TEST_SEAMS)
+SslmGpuStatus sslm_gpu_test_only_submission_count(SslmGpuContext* ctx, uint64_t* out_count) noexcept {
+	return InvokeGpuInternalBoundary(__func__, [&] { return sslm_gpu_test_only_submission_countImpl(ctx, out_count); });
+}
+SslmGpuStatus sslm_gpu_test_only_forced_table_entry(const SslmGpuModelHandle* model, int32_t schema_index,
+                                                    uint32_t state, int32_t* out_next_forced,
+                                                    uint32_t* out_f_len) noexcept {
+	if (!model || !out_next_forced || !out_f_len) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	if (!model->forced.present) return SSLM_GPU_FORCED_TABLE_ABSENT;
+	if (schema_index < 0 || static_cast<size_t>(schema_index) >= model->forced.table.size()) {
+		return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	}
+	const auto& t = model->forced.table[static_cast<size_t>(schema_index)];
+	if (state >= t.size()) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	*out_next_forced = t[state].next_forced;
+	*out_f_len = t[state].f_len;
+	return SSLM_OK;
+}
+#endif
 SslmGpuStatus SslmGpuSeqSchemaBoundForG5Bridge(
     SslmGpuContext* ctx, SslmGpuSequenceHandle* seq, int32_t* out_schema_bound) noexcept {
 	return InvokeGpuApiBoundary(__func__, [&] {

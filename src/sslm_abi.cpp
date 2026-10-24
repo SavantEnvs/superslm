@@ -110,6 +110,7 @@
                               // test can force a genuine bad_alloc through this file's own new
                               // catch-and-return path without needing an actual OOM condition.
 #include "tokenizer_tables.h"  // schema fast-decode §5.1: the forced-next table builder's byte tables
+#include "forced_table.h"     // G1-F: the forced-next table builder, shared with the GPU map
 #if defined(SUPERSLM_ENABLE_SCHEMA_FAST_DECODE_TEST_SEAMS)
 #include "schema_fast_decode/sfd_api.h"  // the §11.0 seams' declarations (test libraries only)
 #endif
@@ -219,10 +220,7 @@ struct sslm_model_s {
 	// unforced) and |F(s)| (0 when unforced). Built once at map from SCM1 and TOK1 when both are
 	// present; `forced_table_present` false means the model has no table and the J1 verbs refuse with
 	// SSLM_ARTIFACT_REJECTED. Immutable after map (the test-only corruption seam excepted).
-	struct ForcedEntry {
-		int32_t next_forced = -1;
-		uint32_t f_len = 0;
-	};
+	using ForcedEntry = superslm::forced_table::ForcedEntry;  // src/forced_table.h (G1-F's lift)
 	bool forced_table_present = false;
 	std::vector<std::vector<ForcedEntry>> forced_table;
 	// Plan rev 1.3.3 §5.10.3, slice J1-X: per token id, 1 when an exact-mode draft may carry it (not
@@ -2009,167 +2007,17 @@ sslm_status LoadModelView(const void* data, size_t size, superslm::SslmModelView
 
 namespace {
 
-// Schema fast-decode plan (rev 1.2.1) §4.1, slice M1: schema i's CSR token ids, contiguous, in CSR
-// order. Throws only std::bad_alloc (the caller's CatchAllocationFailure maps it).
-void BuildLegalIds(sslm_model_s* h) {
-	using superslm::schema_masks_detail::ReadLE32;
-	h->legal_ids.resize(h->schemas.Count());
-	for (size_t i = 0; i < h->schemas.Count(); ++i) {
-		const superslm::SchemaEntry* e = h->schemas.ByIndex(i);
-		std::vector<uint32_t>& ids = h->legal_ids[i];
-		ids.resize(e->transition_count);
-		for (uint32_t t = 0; t < e->transition_count; ++t) {
-			ids[t] = ReadLE32(e->transitions_le + static_cast<size_t>(t) * 8);
-		}
-	}
-}
+// Schema fast-decode plan rev 1.4.4 §7.3 (G1-F): M1's legal-id lists and J1's forced-next table (§4.1,
+// §5.1) are built by the shared builder (src/forced_table.cpp), which the GPU map also calls. The output is
+// unchanged (cell 6.6's golden hashes pin it).
+void BuildLegalIds(sslm_model_s* h) { superslm::forced_table::BuildLegalIds(h->schemas, &h->legal_ids); }
 
-// A token's bytes in TOK1; false for an id with none (at or past TOK1's vocab count, or empty).
-bool TokenBytes(const superslm::internal::TokenizerTables& tt, uint32_t id, const uint8_t** p, size_t* len) {
-	using superslm::schema_masks_detail::ReadLE32;
-	if (id >= tt.vocab_count) return false;
-	const uint32_t b = ReadLE32(tt.vocab_offsets_le + static_cast<size_t>(id) * 4);
-	const uint32_t e = ReadLE32(tt.vocab_offsets_le + static_cast<size_t>(id + 1) * 4);
-	if (e <= b) return false;
-	*p = tt.vocab_blob + b;
-	*len = e - b;
-	return true;
-}
-
-// §5.1, slice J1: the forced-next table of one schema, from its token DFA and TOK1 alone.
-// - Forced test, per state: non-accepting; a non-empty row whose every token has bytes and is not a
-//   special id; one first byte b shared by the whole row; the single-byte token of b legal there.
-//   step[s] = b and succ[s] = the state that byte token leads to.
-// - Forced cycles: a state whose step chain returns to itself is on a cycle; every such state is
-//   unforced (step cleared) before F is computed, so a state that leads into a cycle keeps the text
-//   up to the cycle and every chain ends within the state count.
-// - F(s) = step[s] + F(succ[s]); next_forced(s) = Encode(F)[0] when that token is legal at s and a
-//   byte prefix of F, otherwise the longest legal token that is a byte prefix of F (the byte token
-//   always qualifies). Encode works on F's bytes as they are (a non-UTF-8 F encodes U+FFFD first,
-//   which is never a byte prefix of F, so the fallback carries that state).
-// Throws only std::bad_alloc.
-void BuildForcedTableForSchema(const sslm_model_s* h, const superslm::SchemaEntry& e,
-                               const superslm::internal::TokenizerTables& tt,
-                               const std::vector<uint8_t>& is_special,
-                               std::vector<sslm_model_s::ForcedEntry>* out) {
-	using superslm::schema_masks_detail::ReadLE32;
-	const uint32_t n = e.state_count;
-	out->assign(n, sslm_model_s::ForcedEntry{});
-	std::vector<int16_t> step(n, -1);
-	std::vector<uint32_t> succ(n, 0);
-	for (uint32_t s = 0; s < n; ++s) {
-		const uint32_t rb = ReadLE32(e.state_offsets_le + static_cast<size_t>(s) * 4);
-		const uint32_t re = ReadLE32(e.state_offsets_le + static_cast<size_t>(s + 1) * 4);
-		if (rb == re || IsAcceptingState(e, s)) continue;
-		int first = -1;
-		bool ok = true;
-		for (uint32_t t = rb; t < re && ok; ++t) {
-			const uint32_t id = ReadLE32(e.transitions_le + static_cast<size_t>(t) * 8);
-			const uint8_t* p = nullptr;
-			size_t len = 0;
-			if (id < is_special.size() && is_special[id]) ok = false;
-			else if (!TokenBytes(tt, id, &p, &len)) ok = false;
-			else if (first < 0) first = p[0];
-			else if (first != p[0]) ok = false;
-		}
-		if (!ok || first < 0) continue;
-		uint32_t nx = 0;
-		if (!h->schemas.Transition(e, s, tt.byte_to_id[first], &nx)) continue;
-		step[s] = static_cast<int16_t>(first);
-		succ[s] = nx;
-	}
-	// Forced cycles (the step graph is functional): walk each unvisited chain, marking the states on
-	// the current walk; reaching one of them again closes a cycle from it to the walk's end.
-	{
-		std::vector<uint8_t> color(n, 0);  // 0 unvisited, 1 on the current walk, 2 done
-		std::vector<uint32_t> pos(n, 0);
-		std::vector<uint32_t> walk;
-		for (uint32_t s0 = 0; s0 < n; ++s0) {
-			if (color[s0] != 0 || step[s0] < 0) continue;
-			walk.clear();
-			uint32_t w = s0;
-			while (step[w] >= 0 && color[w] == 0) {
-				color[w] = 1;
-				pos[w] = static_cast<uint32_t>(walk.size());
-				walk.push_back(w);
-				w = succ[w];
-			}
-			if (step[w] >= 0 && color[w] == 1) {
-				for (size_t k = pos[w]; k < walk.size(); ++k) step[walk[k]] = -1;
-			}
-			for (uint32_t v : walk) color[v] = 2;
-		}
-	}
-	// |F| per state, memoized along each chain (no cycles remain).
-	std::vector<uint32_t> flen(n, UINT32_MAX);
-	{
-		std::vector<uint32_t> walk;
-		for (uint32_t s0 = 0; s0 < n; ++s0) {
-			walk.clear();
-			uint32_t w = s0;
-			while (flen[w] == UINT32_MAX && step[w] >= 0) {
-				walk.push_back(w);
-				w = succ[w];
-			}
-			uint32_t len = flen[w] == UINT32_MAX ? 0u : flen[w];
-			if (step[w] < 0) flen[w] = 0;
-			for (size_t k = walk.size(); k-- > 0;) flen[walk[k]] = ++len;
-		}
-	}
-	std::string f;
-	for (uint32_t s = 0; s < n; ++s) {
-		if (step[s] < 0) continue;
-		f.clear();
-		for (uint32_t w = s; step[w] >= 0; w = succ[w]) f.push_back(static_cast<char>(step[w]));
-		const std::vector<int32_t> ids = h->view.tokenizer.Encode(std::string_view(f));
-		int32_t chosen = -1;
-		const uint8_t* p = nullptr;
-		size_t len = 0;
-		if (!ids.empty() && ids[0] >= 0 && h->schemas.Transition(e, s, static_cast<uint32_t>(ids[0]), nullptr) &&
-		    TokenBytes(tt, static_cast<uint32_t>(ids[0]), &p, &len) && len <= f.size() &&
-		    std::memcmp(p, f.data(), len) == 0) {
-			chosen = ids[0];
-		} else {
-			const uint32_t rb = ReadLE32(e.state_offsets_le + static_cast<size_t>(s) * 4);
-			const uint32_t re = ReadLE32(e.state_offsets_le + static_cast<size_t>(s + 1) * 4);
-			size_t best = 0;
-			for (uint32_t t = rb; t < re; ++t) {
-				const uint32_t id = ReadLE32(e.transitions_le + static_cast<size_t>(t) * 8);
-				if (TokenBytes(tt, id, &p, &len) && len > best && len <= f.size() &&
-				    std::memcmp(p, f.data(), len) == 0) {
-					best = len;
-					chosen = static_cast<int32_t>(id);
-				}
-			}
-		}
-		(*out)[s].next_forced = chosen;
-		(*out)[s].f_len = flen[s];
-	}
-}
-
-// §5.1: every schema's table, built once at map when SCM1 and TOK1 are both present. An allocation
-// failure fails the map with SSLM_ALLOCATION_FAILED (the caller's CatchAllocationFailure), so a model
-// never silently lacks the table.
 void BuildForcedTables(sslm_model_s* h) {
-	superslm::internal::MaybeThrowInjectedForcedTableBuildAllocFault();
-	superslm::internal::TokenizerTables tt;
-	if (!superslm::internal::ReadTokenizerTables(h->view.tokenizer, &tt)) return;
-	std::vector<uint8_t> is_special(tt.vocab_count, 0);
-	for (const auto& sp : *tt.specials) {
-		if (sp.second >= 0 && static_cast<uint32_t>(sp.second) < tt.vocab_count) {
-			is_special[static_cast<size_t>(sp.second)] = 1;
-		}
-	}
-	h->draftable.assign(tt.vocab_count, 0);
-	for (uint32_t id = 0; id < tt.vocab_count; ++id) {
-		const uint8_t* p = nullptr;
-		size_t len = 0;
-		h->draftable[id] = !is_special[id] && TokenBytes(tt, id, &p, &len) ? 1 : 0;
-	}
-	h->forced_table.resize(h->schemas.Count());
-	for (size_t i = 0; i < h->schemas.Count(); ++i) {
-		BuildForcedTableForSchema(h, *h->schemas.ByIndex(i), tt, is_special, &h->forced_table[i]);
-	}
+	superslm::forced_table::ForcedTables t;
+	superslm::forced_table::BuildForcedTables(h->schemas, h->view.tokenizer, &t);
+	if (!t.present) return;
+	h->draftable = std::move(t.draftable);
+	h->forced_table = std::move(t.table);
 	h->forced_table_present = true;
 }
 
@@ -4757,20 +4605,8 @@ namespace {
 // rejects it (SSLM_SCHEMA_SPAN_UNREACHABLE), exactly as an illegal explicit span is rejected.
 int32_t ForcedChain(const sslm_model_s* model, uint32_t schema_index, uint32_t state, int32_t* out,
                     int32_t cap) {
-	const std::vector<sslm_model_s::ForcedEntry>& table = model->forced_table[schema_index];
-	const superslm::SchemaEntry* e = model->schemas.ByIndex(schema_index);
-	int32_t count = 0;
-	uint32_t w = state;
-	for (size_t guard = 0; guard < table.size() && w < table.size(); ++guard) {
-		const int32_t tok = table[w].next_forced;
-		if (tok < 0) break;
-		if (count < cap) out[count] = tok;
-		++count;
-		uint32_t nx = 0;
-		if (!model->schemas.Transition(*e, w, static_cast<uint32_t>(tok), &nx)) break;
-		w = nx;
-	}
-	return count;
+	return superslm::forced_table::ForcedChain(model->schemas, model->forced_table[schema_index], schema_index, state,
+	                                           out, cap);
 }
 
 // §5.3 (review N5): decode's posture -- liveness proved under g_seq_registry_mutex (a lookup, never a

@@ -2567,7 +2567,9 @@ void Cell_X_9_1() {
 
 // 9.X2 [J1-X] The ABI inventory carries sslm_jump_options and sslm_jump_mode; sslm_seq_jump_forward keeps its
 // ordinal in the verb list; the status list's entry count equals the base this
-// line builds on: main's 30 plus the merged precached-prefixes line's SSLM_RESTORE_PRODUCER_MISMATCH, 31 (as 9.2).
+// line builds on: main's 30 plus the merged precached-prefixes line's SSLM_RESTORE_PRODUCER_MISMATCH, 31, plus the
+// two GPU names rev 1.4 §7.3 appends, SSLM_GPU_FORCED_TABLE_ABSENT at 31 and
+// SSLM_GPU_CONTEXT_CAP_EXCEEDED at 32: 33 entries (as 9.2).
 // J1 and J1-X ship together as 1.15.0, so this cell checks no version; 9.2's receipt reads it at the release commit
 // (plan rev 1.3.7, section 17.13).
 void Cell_X_9_2() {
@@ -2592,7 +2594,8 @@ void Cell_X_9_2() {
 #define SFD_X_COUNT_STATUS(name) ++n;
 	SSLM_STATUS_ENUM_LIST(SFD_X_COUNT_STATUS)
 #undef SFD_X_COUNT_STATUS
-	CHECK_MSG(n == 31, "[9.X2] the status list has %d entries; main plus precached prefixes has 31", n);
+	CHECK_MSG(n == 33, "[9.X2] the status list has %d entries; main plus precached prefixes plus the two GPU "
+	          "skip-ahead names has 33", n);
 }
 
 // ==========================================================================================================

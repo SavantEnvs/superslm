@@ -3750,16 +3750,20 @@ void Cell_9_2() {
 	}
 	// No new status (§5.3; rev 1.2.2, audit M-2): the status list's entry count equals the base this line
 	// builds on, and the existing ordinals are unchanged. That base is main's 30 plus the one status the
-	// merged precached-prefixes line appends (SSLM_RESTORE_PRODUCER_MISMATCH, ordinal 30): 31. Schema
-	// fast-decode itself still adds none.
+	// merged precached-prefixes line appends (SSLM_RESTORE_PRODUCER_MISMATCH, ordinal 30): 31. The CPU's
+	// schema fast-decode still adds none. Rev 1.4 §7.3 (G1-F) appends the two GPU statuses to the same list
+	// (SSLM_GPU_FORCED_TABLE_ABSENT 31, SSLM_GPU_CONTEXT_CAP_EXCEEDED 32), names no CPU call returns: 33.
 	{
 		int n = 0;
 #define SFD_COUNT_STATUS(name) ++n;
 		SSLM_STATUS_ENUM_LIST(SFD_COUNT_STATUS)
 #undef SFD_COUNT_STATUS
-		CHECK_MSG(n == 31, "[9.2] the status list has %d entries; main plus precached prefixes has 31", n);
+		CHECK_MSG(n == 33, "[9.2] the status list has %d entries; main plus precached prefixes plus the two GPU "
+		          "skip-ahead names has 33", n);
 	}
 	CHECK_MSG(static_cast<int>(SSLM_RESTORE_PRODUCER_MISMATCH) == 30, "[9.2] the precache status ordinal moved");
+	CHECK_MSG(static_cast<int>(SSLM_GPU_FORCED_TABLE_ABSENT) == 31 && static_cast<int>(SSLM_GPU_CONTEXT_CAP_EXCEEDED) == 32,
+	          "[9.2] the GPU skip-ahead names are not appended at 31 and 32");
 	CHECK_MSG(static_cast<int>(SSLM_KV_BUDGET_EXCEEDED) == 29 && static_cast<int>(SSLM_ALLOCATION_FAILED) == 25 &&
 	              static_cast<int>(SSLM_SCHEMA_SPAN_UNREACHABLE) == 23 && static_cast<int>(SSLM_ARTIFACT_REJECTED) == 4,
 	          "[9.2] a status ordinal moved");

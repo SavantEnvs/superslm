@@ -533,6 +533,16 @@ written on another adapter (its vendor or device ID differs from the
 context's). Nothing is drawn. The status is exported, and unreleased until
 1.16.0, with the GPU twins.
 
+Two cover schema skip-ahead on the GPU (1.17.0, unreleased; see
+[Schema skip-ahead on the GPU](#schema-skip-ahead-on-the-gpu-1170)).
+`SSLM_GPU_FORCED_TABLE_ABSENT` (ordinal 31): `sslm_gpu_seq_forced_tokens` or
+`sslm_gpu_seq_jump_forward` on a model mapped without a forced-next table (its
+artifact carries no tokenizer section); nothing changes.
+`SSLM_GPU_CONTEXT_CAP_EXCEEDED` (ordinal 32): a `sslm_gpu_seq_jump_forward` call that asked a
+dedicated sequence for more rows than fit before its context cap; the rows that fit are
+committed. Both names are also appended to the CPU's `SSLM_STATUS_ENUM_LIST`, so the two
+enums keep one ordinal space; no CPU call returns either.
+
 `SslmGpuSeqPrefillPromptForG5Bridge` and `SslmGpuSeqPrefillSchemaContentForG5Bridge`
 diverge on one refusal: when a device-side domain guard refuses one of the admitted
 tokens and the device is not reported removed, the prompt entry point returns
@@ -1388,3 +1398,19 @@ always safe. A dead-ended sequence is `sslm_gpu_seq_reset`- and
 `sslm_gpu_seq_bind_adapter`-eligible (see the CHANGELOG), and is proven
 bit-identical between the CPU and GPU paths at real scale (see
 [Certified platforms](#certified-platforms)).
+
+## Schema skip-ahead on the GPU (1.17.0)
+
+*Unreleased.* The GPU twins of the CPU's schema fast-decode verbs (1.15.0). Every name below is an addition; no
+save format (`SLM5`, `SLM6`, `SPX1`) changes. Tested on the NVIDIA RTX 2080 SUPER and the AMD Radeon RX 7900 XTX
+only. Known issue: the RTX 50-series (Blackwell) currently fails parts of the GPU suite, and no GPU support is
+claimed for it.
+
+**The forced-text query.** `sslm_gpu_seq_forced_tokens(ctx, seq, out_ids, cap, out_count, out_accepting)` returns
+the text the bound schema forces from the sequence's current walk state, as token ids: the CPU's
+`sslm_seq_forced_tokens` for the same state, id for id. It is host-only and changes nothing, bindability included.
+`sslm_gpu_model_map` builds the forced-next table once, with the CPU map's own builder, from the artifact's schema
+and tokenizer sections. Refusals, in order, each writing nothing: a malformed handle or argument,
+`SSLM_SEQUENCE_KV_BUFFER_MISMATCH`; a model with no table (an artifact without a tokenizer section),
+`SSLM_GPU_FORCED_TABLE_ABSENT`; a Submitted sequence, or another thread's decode of it, `SSLM_BUSY`. An allocation
+failure while the table is built fails the map with `SSLM_GPU_ALLOCATION_FAILED`.
