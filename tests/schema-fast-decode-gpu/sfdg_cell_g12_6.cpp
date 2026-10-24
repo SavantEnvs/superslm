@@ -153,6 +153,9 @@ int main(int argc, char** argv) {
 						CHECK_MSG(g.next == off.next && g.next_st == off.next_st,
 						          "[G12.6 %s h=0] the next decode %s %d; GPU off %s %d", arm, Name(g.next_st), g.next,
 						          Name(off.next_st), off.next);
+						// The saved state at h = 0 is GPU off's at the same state, byte for byte (engine code review N4).
+						CHECK_MSG(!g.blob.empty() && g.blob == off.blob, "[G12.6 %s h=0] the blob (%zu bytes) differs from GPU "
+						          "off's (%zu bytes)", arm, g.blob.size(), off.blob.size());
 					}
 					if (!pooled) {
 						const CpuOutcome cpu = RunCpu(c, base, limit, h, pending);

@@ -5275,6 +5275,10 @@ SslmGpuStatus sslm_gpu_test_only_arm_chunk_fault(int32_t sub_chunk, SslmGpuStatu
 namespace {
 std::atomic<int32_t> g_jump_host_bad_alloc_site{-1};
 }  // namespace
+void* sslm_gpu_test_only_context_device(SslmGpuContext* ctx) noexcept {
+	if (!ctx || ctx->destroyed) return nullptr;
+	return &ctx->device;
+}
 SslmGpuStatus sslm_gpu_test_only_arm_jump_host_bad_alloc(int32_t site) noexcept {
 	if (site > 2) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
 	g_jump_host_bad_alloc_site.store(site < 0 ? -1 : site);
@@ -5542,6 +5546,8 @@ SslmGpuStatus sslm_gpu_seq_embed_schema_tokenImpl(SslmGpuContext* ctx, SslmGpuSe
 	SslmGpuModelHandle* model = seq->model;
 	if (token < 0 || token >= model->vocab_size) return SSLM_TOKEN_ID_OUT_OF_RANGE;
 	if (seq->bound_schema_index < 0) return SSLM_SEQUENCE_REJECTED;
+	// A mid-token sequence (layers partly run) is refused, as the jump verb refuses it (engine code review N6).
+	if (seq->layer_index > 0 && seq->layer_index < model->num_hidden_layers) return SSLM_SEQUENCE_REJECTED;
 	const superslm::SchemaEntry* entry = model->schemas.ByIndex(static_cast<size_t>(seq->bound_schema_index));
 	uint32_t next_state = 0;
 	if (!entry || !model->schemas.Transition(*entry, seq->dfa_walk_state, static_cast<uint32_t>(token), &next_state)) {
@@ -5558,6 +5564,9 @@ SslmGpuStatus sslm_gpu_seq_embed_schema_tokenImpl(SslmGpuContext* ctx, SslmGpuSe
 
 SslmGpuStatus sslm_gpu_seq_ready_for_logitsImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq, int32_t* out_ready) {
 	if (!ctx || !seq || !seq->model || seq->ctx != ctx || !out_ready) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	// The decode claim, so the read cannot race a finish on another thread (engine code review N5).
+	const SeqDecodeClaim claim(seq);
+	if (!claim.held()) return SSLM_BUSY;
 	if (seq->state() == superslm_gpu::SslmSequenceGpuState::Submitted) return SSLM_BUSY;
 	*out_ready = seq->ready_for_logits ? 1 : 0;
 	return SSLM_OK;

@@ -1402,8 +1402,8 @@ bit-identical between the CPU and GPU paths at real scale (see
 ## Schema skip-ahead on the GPU (1.17.0)
 
 *Unreleased.* The GPU twins of the CPU's schema fast-decode verbs (1.15.0). Every name below is an addition; no
-save format (`SLM5`, `SLM6`, `SPX1`) changes. Tested on the NVIDIA RTX 2080 SUPER and the AMD Radeon RX 7900 XTX
-only. Known issue: the RTX 50-series (Blackwell) currently fails parts of the GPU suite (59 of 326,323 checks on an
+save format (`SLM5`, `SLM6`, `SPX1`) changes. To be certified on the NVIDIA RTX 2080 SUPER and the AMD Radeon RX 7900 XTX
+only; no GPU run has certified it yet. Known issue: the RTX 50-series (Blackwell) currently fails parts of the GPU suite (59 of 326,323 checks on an
 RTX 5060, mostly at `softmax_site.hlsl:150`), and no GPU support is claimed for it.
 
 **The forced-text query.** `sslm_gpu_seq_forced_tokens(ctx, seq, out_ids, cap, out_count, out_accepting)` returns
@@ -1448,9 +1448,10 @@ ABI change.
   schema-content bridge's `SSLM_DEVICE_LOST` for a full context.
 - **The prefill snapshot** (`sslm_gpu_seq_read_prefill_final_hidden`) is cleared as the pass starts and set when every
   row asked for is admitted, as the schema-content bridge does.
-- **A device failure** in the pass restores the entry state (context length, walk, the per-sequence counters, the
+- **A failure** in the pass (`SSLM_GPU_ALLOCATION_FAILED` for an allocation failure on the device or the host,
+  `SSLM_DEVICE_LOST` for every other fault) restores the entry state (context length, walk, the per-sequence counters, the
   hidden state and scale, the layer index, the ready flag, the prefill snapshot's flag, the dedicated host-mirror rows
-  and a pooled holder's mapped pages) and returns the failure's status. An off decode can follow.
+  and a pooled holder's mapped pages) and returns that status. An off decode can follow.
 - **Refusals,** in order, each changing nothing, bindability included: a malformed handle, output, budget, `cap` or
   `opts`, `SSLM_SEQUENCE_KV_BUFFER_MISMATCH`; exact mode, `SSLM_SEQUENCE_REJECTED`; `pending_token` below -1 or past
   the vocabulary, `SSLM_TOKEN_ID_OUT_OF_RANGE`; no table, `SSLM_GPU_FORCED_TABLE_ABSENT`; a held decode claim or a
@@ -1460,13 +1461,13 @@ ABI change.
 **The walked embed.** `sslm_gpu_seq_embed_schema_token(ctx, seq, token)` is `sslm_gpu_seq_embed_token` with the walk:
 it checks the token against the walk state, embeds it, advances the walk and clears the ready flag, which discards a
 ready row. The caller then drives the layers with `sslm_decode_step_gpu` and, for a forced row, does not finish it;
-row for row, a chain fed this way equals the verb's. No schema bound, or an illegal token, is
-`SSLM_SEQUENCE_REJECTED` with nothing changed.
+row for row, a chain fed this way equals the verb's. No schema bound, an illegal token, or a mid-token sequence (its
+layers partly run) is `SSLM_SEQUENCE_REJECTED` with nothing changed.
 
 **The ready getter.** `sslm_gpu_seq_ready_for_logits(ctx, seq, out_ready)` writes 1 when the next decode bridge call
 finishes the held row without an embed, else 0. It is host-only. SLM5 and SLM6 restore the flag, so a host reads a
-restored sequence's resting shape from it. A malformed handle, `SSLM_SEQUENCE_KV_BUFFER_MISMATCH`; a Submitted
-sequence, `SSLM_BUSY`.
+restored sequence's resting shape from it. It takes the decode claim for the read. A malformed handle,
+`SSLM_SEQUENCE_KV_BUFFER_MISMATCH`; a Submitted sequence, or another thread's decode of it, `SSLM_BUSY`.
 
 **Determinism.** Stream equality per mode is claimed only on the GPUs where the box's exactness rules ran (the RTX
 2080 SUPER and the Radeon RX 7900 XTX). It is a separate claim from the plugin's, whose README does not claim GPU

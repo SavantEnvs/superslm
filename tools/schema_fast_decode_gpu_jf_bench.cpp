@@ -338,7 +338,9 @@ int main(int argc, char** argv) {
 				const int32_t pend = pending >= 0 ? 1 : 0;
 				const int32_t room = max_new - static_cast<int32_t>(r.stream.size()) + pend;
 				const int32_t b = std::min(budget, room);
-				if (count == 0 || b - pend < 1) break;
+				// At b = 1 with a pending token the call admits the pending row alone, as the CPU's RunOn does at budget 1
+				// (§5.6; engine code review N1); the chain's rows then follow one per call.
+				if (count == 0 || b < 1) break;
 				int32_t got = 0;
 				Ok(sslm_gpu_seq_jump_forward(ctx, seq, pending, b, nullptr, forced.data(), budget, &got), "fused verb");
 				r.submits += (pend + got + 3) / 4 - 1;  // sub-chunks beyond the one timing() counts

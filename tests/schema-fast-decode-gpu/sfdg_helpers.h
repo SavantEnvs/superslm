@@ -169,6 +169,11 @@ inline std::map<std::string, RefSchema> ParseRef(const std::string& path) {
 }
 
 // ---- the GPU side -----------------------------------------------------------------------------------------
+// The context Finish reads beside the singleton (set by GRig::Open, cleared by ~GRig).
+inline SslmGpuContext*& FinishContext() {
+	static SslmGpuContext* ctx = nullptr;
+	return ctx;
+}
 struct GRig {
 	Env env;
 	std::vector<uint8_t> raw;
@@ -178,14 +183,19 @@ struct GRig {
 	bool Open(int argc, char** argv, bool load_ref = true) {
 		const std::string dir = FixtureDir(argc, argv);
 		if (dir.empty()) return false;
-		if (!env.Open(dir + "/fsfd.sslm", false)) return false;
+		const bool opened = env.Open(dir + "/fsfd.sslm", false);
+		FinishContext() = env.ctx;  // Finish reads this context's device too (engine code review N3)
+		if (!opened) return false;
 		raw = env.fx.bytes;
 		if (load_ref) ref = ParseRef(dir + "/fsfd_ref.txt");
 		ok = !load_ref || ref.size() == 4;
 		CHECK_MSG(ok, "fsfd_ref.txt: %zu schemas, expected 4", ref.size());
 		return ok;
 	}
-	~GRig() { ReleaseSeqs(); }
+	~GRig() {
+		ReleaseSeqs();
+		if (FinishContext() == env.ctx) FinishContext() = nullptr;
+	}
 	void ReleaseSeqs() {
 		for (SslmGpuSequenceHandle* s : seqs) sslm_gpu_seq_release(env.ctx, s);
 		seqs.clear();
@@ -568,24 +578,36 @@ inline CQuery QueryCpu(sslm_model m, sslm_seq s, int32_t cap = 512) {
 // "# SFDG DEBUG LAYER MESSAGE id=<ID> severity=<0..4> category=<n>", then "# SFDG DEBUG LAYER: mode=<m> messages=<n>".
 // The harness's own drain then prints the descriptions to stderr and empties the queue. A quiet drain is not proof
 // that the recording was correct (d3d12_harness.h's caveat).
+// Both devices are read (engine code review N3): the process singleton, which the layer passes submit on, and the
+// open GRig's context device, which the map uploads and the device logits run on. Each message line names its
+// device ("device=singleton" or "device=context"); the box driver reads the IDs from both.
+inline size_t ReportDebugLayer(superslm_gpu::harness::Device& d, const char* which) {
+	size_t n = 0;
+	if (!d.debug_info_queue) return 0;
+	const UINT64 stored = d.debug_info_queue->GetNumStoredMessages();
+	for (UINT64 i = 0; i < stored; ++i) {
+		SIZE_T len = 0;
+		if (FAILED(d.debug_info_queue->GetMessage(i, nullptr, &len)) || len == 0) continue;
+		std::vector<char> buf(len);
+		D3D12_MESSAGE* m = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+		if (FAILED(d.debug_info_queue->GetMessage(i, m, &len))) continue;
+		std::printf("# SFDG DEBUG LAYER MESSAGE id=%d severity=%d category=%d device=%s\n", static_cast<int>(m->ID),
+		            static_cast<int>(m->Severity), static_cast<int>(m->Category), which);
+		++n;
+	}
+	(void)d.DrainDebugLayerMessages();
+	return n;
+}
 inline int Finish(const char* name) {
 	superslm_gpu::harness::Device& d = superslm_gpu::harness::GetDevice();
-	size_t n = 0;
-	if (d.debug_info_queue) {
-		const UINT64 stored = d.debug_info_queue->GetNumStoredMessages();
-		for (UINT64 i = 0; i < stored; ++i) {
-			SIZE_T len = 0;
-			if (FAILED(d.debug_info_queue->GetMessage(i, nullptr, &len)) || len == 0) continue;
-			std::vector<char> buf(len);
-			D3D12_MESSAGE* m = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
-			if (FAILED(d.debug_info_queue->GetMessage(i, m, &len))) continue;
-			std::printf("# SFDG DEBUG LAYER MESSAGE id=%d severity=%d category=%d\n", static_cast<int>(m->ID),
-			            static_cast<int>(m->Severity), static_cast<int>(m->Category));
-			++n;
+	size_t n = ReportDebugLayer(d, "singleton");
+	size_t nc = 0;
+	if (SslmGpuContext* ctx = FinishContext()) {
+		if (void* cd = sslm_gpu_test_only_context_device(ctx)) {
+			nc = ReportDebugLayer(*static_cast<superslm_gpu::harness::Device*>(cd), "context");
 		}
 	}
-	std::printf("# SFDG DEBUG LAYER: mode=%d messages=%zu\n", d.debug_layer_mode, n);
-	(void)d.DrainDebugLayerMessages();
+	std::printf("# SFDG DEBUG LAYER: mode=%d messages=%zu context_messages=%zu\n", d.debug_layer_mode, n + nc, nc);
 	return FinishSuite(name);
 }
 

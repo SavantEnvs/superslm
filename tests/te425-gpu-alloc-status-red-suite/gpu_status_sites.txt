@@ -19,6 +19,8 @@
 # it wrote, phase A and phase B in one try), authored with --emit and dispositioned from plan §4 items 8 and 10.
 # Re-listed by the schema fast-decode G1-J builder (1.17.0): the GPU jump verb's short-count mapping and the S-GCHUNKFAULT
 # test seam's arm, authored with --emit and dispositioned from plan rev 1.4.4 §6.1 and §11.2 (G12.7).
+# Re-listed by the G1-J builder at the engine code review's B1 fix: the jump verb's four host-exception clauses,
+# each restoring the entry snapshot (plan rev 1.4.4 §7.3's failure promise; cell G12.10).
 # A site the fix adds, removes or rewrites is re-listed here with its disposition in the same change.
 # Tab-separated: kind file function count block disposition token
 catch	src/gpu/d3d12_harness.h	ClassifyInFlightException	1	E-2	classifier input: kind Other, every other type standard or not; rule 3 unless rule 0 or 1	...
@@ -110,3 +112,7 @@ catch	src/gpu/superslm_gpu.cpp	PublishCallTimingNoThrow	1	G3	the timing snapshot
 catch	src/gpu/superslm_gpu.cpp	PublishEmptyCallTimingNoThrow	1	G3	the empty publish at a chunk open, which allocates nothing (LastCallTimingSnapshot::PublishEmpty swaps in no block), so no allocation failure reaches this clause	...
 catch	src/gpu/superslm_gpu.cpp	RunLayerLoopGpuSubmit	1	G3	the internal layer's channel (plan §4.4): BeginRecording refused the reset on a stranded ledger before the list opened, so it is rethrown (rule 0, nothing reset); a list the call opened is classified as the runtime_error clause (ClassifyForwardFault)	harness::GpuSubmissionStrandedError
 catch	src/gpu/superslm_gpu.cpp	SubmitOneSubChunkToFullDepthForG5Bridge	1	G3	the internal layer's channel (plan §4.4): BeginRecording refused the reset on a stranded ledger before the list opened, so it is rethrown (rule 0, nothing reset); a list the call opened is classified as the runtime_error clause (ClassifyForwardFault)	harness::GpuSubmissionStrandedError
+catch	src/gpu/gpu_1p0.cpp	sslm_gpu_seq_jump_forwardImpl	1	B1 (1.17.0 review)	jump verb: restores the entry snapshot (RestoreJumpEntrySnapshot via fail()) after the snapshot is taken; any other type restores and rethrows to ContainGpuApiCall (SSLM_DEVICE_LOST)	...
+catch	src/gpu/gpu_1p0.cpp	sslm_gpu_seq_jump_forwardImpl	1	B1 (1.17.0 review)	jump verb: restores the entry snapshot (RestoreJumpEntrySnapshot via fail()) after the snapshot is taken; SSLM_GPU_ALLOCATION_FAILED	std::bad_alloc
+catch	src/gpu/gpu_1p0.cpp	sslm_gpu_seq_jump_forwardImpl	1	B1 (1.17.0 review)	jump verb: restores the entry snapshot (RestoreJumpEntrySnapshot via fail()) after the snapshot is taken; SSLM_GPU_ALLOCATION_FAILED	std::length_error
+catch	src/gpu/gpu_1p0.cpp	sslm_gpu_seq_jump_forwardImpl	1	B1 (1.17.0 review)	jump verb: restores the entry snapshot (RestoreJumpEntrySnapshot via fail()) after the snapshot is taken; SSLM_GPU_ALLOCATION_FAILED	superslm_gpu::harness::GpuAllocationError

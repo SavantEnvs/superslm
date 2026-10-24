@@ -2008,7 +2008,7 @@ sslm_status LoadModelView(const void* data, size_t size, superslm::SslmModelView
 namespace {
 
 // Schema fast-decode plan rev 1.4.4 §7.3 (G1-F): M1's legal-id lists and J1's forced-next table (§4.1,
-// §5.1) are built by the shared builder (src/forced_table.cpp), which the GPU map also calls. The output is
+// §5.1) are built by the shared builder (the header src/forced_table.h), which the GPU map also calls. The output is
 // unchanged (cell 6.6's golden hashes pin it).
 void BuildLegalIds(sslm_model_s* h) { superslm::forced_table::BuildLegalIds(h->schemas, &h->legal_ids); }
 

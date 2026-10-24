@@ -10,7 +10,7 @@
 #   GB-J-r/g  the same for G1-J (G7.1, G9.1, G11.1, G12.1-G12.3, G12.6-G12.9); g also runs P2.16's reference loop
 #             (tools/schema_fast_decode_gpu_p2_ref.cpp) and files P2_16_expected.json with its sha256
 #   GB1       the release candidate at -Tip: every G cell, each binary alone
-#   GB-XG-1..6  the engine GPU source mutants (tests/schema-fast-decode-gpu/make_sfdg_mutants.py), two per step:
+#   GB-XG-1..7  the engine GPU source mutants (tests/schema-fast-decode-gpu/make_sfdg_mutants.py), two per step:
 #             each mutant is applied to a mutant worktree at -Tip, built, and must be killed by its cell
 #   GBK       pack the work machine's kit from GB1's build, with a sha256 manifest (not a GPU step)
 #   GB2c      CPU off and canonical streams on B7b's 41 prompts at -Tip (CPU only; not a GPU step)
@@ -74,7 +74,7 @@ if ($PSVersionTable.PSEdition -ne 'Core') {
 }
 
 $GpuSteps = @('GB0', 'GB-F-r', 'GB-F-g', 'GB-M-r', 'GB-M-g', 'GB-J-r', 'GB-J-g', 'GB1', 'GB2', 'GB3',
-    'GB-XG-1', 'GB-XG-2', 'GB-XG-3', 'GB-XG-4', 'GB-XG-5', 'GB-XG-6', 'GK0', 'GK1', 'GK2')
+    'GB-XG-1', 'GB-XG-2', 'GB-XG-3', 'GB-XG-4', 'GB-XG-5', 'GB-XG-6', 'GB-XG-7', 'GK0', 'GK1', 'GK2')
 $OtherSteps = @('GBK', 'GB2c')
 if (($GpuSteps + $OtherSteps) -notcontains $Step) {
     throw "unknown or ranged step '$Step': one of $(($GpuSteps + $OtherSteps) -join ', '), one per invocation (Sec. 10: no ranges)"
@@ -129,6 +129,14 @@ function Update-Ledger([double]$SinceBefore) {
 
 # ---- the step file (resumable) ----------------------------------------------------------------------------------
 $State = [ordered]@{ step = $Step; started = (Get-Utc); cells = [ordered]@{}; complete = $false }
+# The adapter (engine code review N10): a stale SSLM_GPU_ADAPTER_INDEX would silently pick another adapter, so it
+# is recorded and cleared, and every step records the machine's display adapters and drivers. The harness then
+# picks the high-performance hardware adapter.
+$State.adapter_index_env_cleared = $(if ($env:SSLM_GPU_ADAPTER_INDEX) { "$env:SSLM_GPU_ADAPTER_INDEX" } else { '' })
+Remove-Item Env:\SSLM_GPU_ADAPTER_INDEX -ErrorAction SilentlyContinue
+try {
+    $State.adapters = @(Get-CimInstance Win32_VideoController | ForEach-Object { [ordered]@{ name = $_.Name; driver = $_.DriverVersion } })
+} catch { $State.adapters = @("(not read: $($_.Exception.Message))") }
 if (Test-Path -LiteralPath $StepPath) {
     $prev = Read-Utf8 $StepPath | ConvertFrom-Json
     if ($prev.complete -and -not $Force) { Write-Host "$Step is complete ($StepPath): skipped"; exit 0 }
@@ -260,8 +268,10 @@ function Initialize-Fixtures([string]$Wt) {
 }
 
 # ---- running one cell ---------------------------------------------------------------------------------------------
+# The debug-layer baseline: GB0's on the box, GK0's on the kit (engine code review N2), so GK1 compares against
+# the kit card's own smoke run and never against nothing.
 function Read-Baseline {
-    $p = Join-Path $Out 'GB0.json'
+    $p = Join-Path $Out $(if ($Step -like 'GK*') { 'GK0.json' } else { 'GB0.json' })
     if (-not (Test-Path -LiteralPath $p)) { return $null }
     $g = Read-Utf8 $p | ConvertFrom-Json
     if (-not $g.complete) { return $null }
@@ -345,6 +355,7 @@ $SliceCells = @{
 $Mutants = [ordered]@{
     'XG1' = 'G6'; 'XG9' = 'G6'; 'XG2' = 'G11.1'; 'XG8' = 'G11.1'; 'XG3' = 'G7.1'; 'XG15' = 'G12.6'
     'XG19' = 'G12.7'; 'XG30' = 'G12.7'; 'XG22' = 'G0.1'; 'XG26' = 'G0.1'; 'XG31' = 'G12.2'; 'XG37' = 'G12.9'
+    'XGB1' = 'G12.10'
 }
 
 function Invoke-CellList([string[]]$Ids, [string]$Bin, [string]$Expect, [int]$Layer) {
@@ -410,7 +421,7 @@ function Invoke-GB1 {
     Assert-Cells 'GB1'
 }
 function Invoke-GBXG([int]$Group) {
-    $names = @($Mutants.Keys)[(2 * ($Group - 1))..(2 * $Group - 1)]
+    $names = @(@($Mutants.Keys)[(2 * ($Group - 1))..(2 * $Group - 1)] | Where-Object { $_ })
     $wt = Join-Path $WorktreeRoot "$Name-mut"
     $State.commit = Initialize-Worktree $wt $Tip
     $State.fixtures = Initialize-Fixtures $wt
@@ -619,7 +630,10 @@ function Invoke-GK([string]$S) {
     $State.kit_manifest_sha256 = Get-Sha256 (Join-Path $Kit 'manifest.txt')
     switch ($S) {
         'GK0' { Invoke-CellList @('smoke') $bin 'green' 2; $State.baseline_ids = @($State.cells['smoke'].debug_ids) }
-        'GK1' { Invoke-CellList (@('G0.1') + $SliceCells.F + $SliceCells.M + $SliceCells.J) $bin 'green' 2 }
+        'GK1' {
+            if ($null -eq (Read-Baseline)) { throw 'GK0 is not complete: its debug-layer baseline is needed first' }
+            Invoke-CellList (@('G0.1') + $SliceCells.F + $SliceCells.M + $SliceCells.J) $bin 'green' 2
+        }
         'GK2' {
             $script:Model = (Get-ChildItem (Join-Path $Kit 'artifacts\*.sslm') | Select-Object -First 1).FullName
             $script:BoxDir = Join-Path $Kit 'driver'

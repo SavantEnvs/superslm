@@ -83,6 +83,9 @@ SslmGpuStatus sslm_gpu_test_only_arm_chunk_fault(int32_t sub_chunk, SslmGpuStatu
 // sub-chunks committed, before the walk and the ready flag move. A negative `site` disarms; any other value,
 // SSLM_SEQUENCE_KV_BUFFER_MISMATCH. Only the verb consumes it.
 SslmGpuStatus sslm_gpu_test_only_arm_jump_host_bad_alloc(int32_t site) noexcept;
+// The context's own harness device (a superslm_gpu::harness::Device*, as void* so this header needs no harness),
+// for the cells' debug-layer report at exit (engine code review N3). Null for a null or destroyed context.
+void* sslm_gpu_test_only_context_device(SslmGpuContext* ctx) noexcept;
 #endif  // SUPERSLM_GPU_TEST_SEAMS
 
 #if defined(SUPERSLM_ENABLE_GPU_API_FAILURE_INJECTION)

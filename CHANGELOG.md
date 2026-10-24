@@ -6,7 +6,8 @@ All notable changes to SuperSLM (Layer 1) are recorded here.
 
 Schema skip-ahead on the GPU (schema fast-decode plan rev 1.4.4, slices G1-F, G1-M and G1-J). Three GPU verbs, the
 ready getter, one struct and two appended GPU statuses are added; no save format (`SLM5`, `SLM6`, `SPX1`) changes, and
-the GPU masked finish changes no GPU token. Tested on the NVIDIA RTX 2080 SUPER and the AMD Radeon RX 7900 XTX only.
+the GPU masked finish changes no GPU token. To be certified on the NVIDIA RTX 2080 SUPER and the AMD Radeon RX 7900 XTX
+only; no GPU run has certified it yet.
 The release waits for the box's exactness rules on both cards and for 1.16.0.
 
 - **Forced-text query.** `sslm_gpu_model_map` builds the forced-next table with the CPU map's builder, and
@@ -21,7 +22,9 @@ The release waits for the box's exactness rules on both cards and for 1.16.0.
 - **Jump-forward, canonical.** `sslm_gpu_seq_jump_forward` admits the pending token and the forced chain in one pass,
   `sslm_gpu_seq_embed_schema_token` embeds a token with the walk, and `sslm_gpu_seq_ready_for_logits` reads the ready
   flag. A call that would pass the context cap admits the rows that fit and returns the appended
-  `SSLM_GPU_CONTEXT_CAP_EXCEEDED` (ordinal 32). **The GPU verb refuses `SSLM_JUMP_EXACT` in 1.17.0 with
+  `SSLM_GPU_CONTEXT_CAP_EXCEEDED` (ordinal 32). A failure in the pass restores the entry state and returns
+  `SSLM_GPU_ALLOCATION_FAILED` for an allocation failure (device or host) and `SSLM_DEVICE_LOST` for any other
+  fault. The walked embed refuses a mid-token sequence. **The GPU verb refuses `SSLM_JUMP_EXACT` in 1.17.0 with
   `SSLM_SEQUENCE_REJECTED`.**
 - **CPU C ABI:** the two status names are appended to `SSLM_STATUS_ENUM_LIST`, so the CPU and GPU enums keep one
   ordinal space. No CPU call returns either.

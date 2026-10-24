@@ -1114,7 +1114,7 @@ SslmGpuStatus sslm_gpu_seq_forced_tokens(SslmGpuContext* ctx, SslmGpuSequenceHan
 
 /* ============================================================================
  * Schema skip-ahead on the GPU (1.17.0, unreleased): the jump-forward verb, the walked embed and the ready
- * getter. Exported, and unreleased until 1.17.0. Tested on the RTX 2080 SUPER and the Radeon RX 7900 XTX
+ * getter. Exported, and unreleased until 1.17.0. To be certified on the RTX 2080 SUPER and the Radeon RX 7900 XTX
  * only; the RTX 50-series currently fails parts of the GPU suite, and no support is claimed for it.
  * ============================================================================
  *
@@ -1154,8 +1154,8 @@ typedef struct SslmGpuJumpOptions {
  * SSLM_GPU_CONTEXT_CAP_EXCEEDED, or SSLM_GPU_KV_BUDGET_EXCEEDED for a pooled sequence whose limit is below the cap;
  * at h = 0 nothing changes. The prefill snapshot (sslm_gpu_seq_read_prefill_final_hidden) is cleared at the
  * pass's start and set when every row asked for is admitted, as the schema-content bridge does.
- * A device failure in the pass (SSLM_GPU_ALLOCATION_FAILED, SSLM_DEVICE_LOST, or another status) restores the
- * entry state -- context length, walk, the saturation counters, the hidden state and scale, the layer index,
+ * A failure in the pass -- SSLM_GPU_ALLOCATION_FAILED for an allocation failure on the device or the host, and
+ * SSLM_DEVICE_LOST for every other fault -- restores the entry state -- context length, walk, the saturation counters, the hidden state and scale, the layer index,
  * the ready flag, the prefill snapshot's flag, the dedicated host-mirror rows and a pooled holder's mapped pages
  * -- and returns that status, so the sequence can be decoded as if the call had not been made.
  * Checked in this order; each refusal changes nothing, bindability included: (1) a null context, sequence,
@@ -1176,15 +1176,17 @@ SslmGpuStatus sslm_gpu_seq_jump_forward(SslmGpuContext* ctx, SslmGpuSequenceHand
  * drives the layers with sslm_decode_step_gpu; for a forced row it does not finish the row. Row for row, a chain
  * fed this way equals the verb's. Refusals, each changing nothing: a malformed handle,
  * SSLM_SEQUENCE_KV_BUFFER_MISMATCH; Submitted or claimed, SSLM_BUSY; an id out of range, SSLM_TOKEN_ID_OUT_OF_RANGE;
- * no schema bound, or `token` illegal at the walk state, SSLM_SEQUENCE_REJECTED. Once validated it clears the
+ * no schema bound, `token` illegal at the walk state, or a mid-token sequence (its layers partly run),
+ * SSLM_SEQUENCE_REJECTED. Once validated it clears the
  * sequence's bind eligibility. */
 SslmGpuStatus sslm_gpu_seq_embed_schema_token(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq,
                                               int32_t token) noexcept;
 
 /* sslm_gpu_seq_ready_for_logits reads the ready flag: 1 when the next decode bridge call finishes the held row
  * without an embed (after a prefill bridge, an admitting verb call, a dead end, or an SLM5/SLM6 restore of such a
- * state), 0 otherwise. Host-only; it submits nothing and changes nothing. A malformed handle or null output,
- * SSLM_SEQUENCE_KV_BUFFER_MISMATCH; a Submitted sequence, SSLM_BUSY. */
+ * state), 0 otherwise. Host-only; it submits nothing and changes nothing. It takes the sequence's decode claim for
+ * the read. A malformed handle or null output, SSLM_SEQUENCE_KV_BUFFER_MISMATCH; a Submitted sequence, or another
+ * thread holds its decode claim, SSLM_BUSY. */
 SslmGpuStatus sslm_gpu_seq_ready_for_logits(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq,
                                             int32_t* out_ready) noexcept;
 

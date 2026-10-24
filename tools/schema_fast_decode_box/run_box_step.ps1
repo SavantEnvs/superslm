@@ -30,7 +30,7 @@
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File tools\schema_fast_decode_box\run_box_step.ps1 -Step B0
 #
-# GPU steps (plan rev 1.4.4 Sec. 10: GB0-GB3, GB-F/M/J r and g, GBK, GB-XG-1..6, GK0-GK2) go to
+# GPU steps (plan rev 1.4.4 Sec. 10: GB0-GB3, GB-F/M/J r and g, GBK, GB-XG-1..7, GK0-GK2) go to
 # run_gpu_box_step.ps1, with the parameters both scripts declare; it has its own cap, load ledger and step list.
 param(
     [Parameter(Mandatory = $true)][string]$Step,
