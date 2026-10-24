@@ -75,5 +75,5 @@ int main(int argc, char** argv) {
 		}
 		rig.ReleaseSeqs();
 	}
-	return FinishSuite("sfdg_cell_g11_1");
+	return Finish("sfdg_cell_g11_1");
 }

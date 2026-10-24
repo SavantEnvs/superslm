@@ -43,6 +43,7 @@ done
 # ---- the executables (keep in step with build_sfd_gpu.bat) -------------------------------------------------
 # name | slice | sources (tests/schema-fast-decode-gpu/*.cpp; a source with a slash is repo-relative)
 TABLE='
+sfdg_smoke|G1F|sfdg_smoke
 sfdg_cell_g0_1|G1F|sfdg_cell_g0_1
 sfdg_cell_g2_1|G1F|sfdg_cell_g2_1
 sfdg_cell_g12_4|G1F|sfdg_cell_g12_4
@@ -57,6 +58,7 @@ sfdg_cell_g12_verb|G1J|sfdg_cell_g12_verb
 sfdg_cell_g12_6|G1J|sfdg_cell_g12_6
 sfdg_cell_g12_7|G1J|sfdg_cell_g12_7
 schema_fast_decode_gpu_p2_ref|G1J|tools/schema_fast_decode_gpu_p2_ref
+sslm_schema_fast_decode_gpu_jf_bench|G1J|tools/schema_fast_decode_gpu_jf_bench
 '
 
 if [ "$LIST" = 1 ]; then

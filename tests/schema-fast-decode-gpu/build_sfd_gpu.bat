@@ -63,6 +63,7 @@ if exist "%SHADERS%\*.cso" (
 )
 
 rem ---- the executables (keep in step with build_sfd_gpu_mingw.sh's TABLE) ---------------------------------------
+call :exe sfdg_smoke G1F
 call :exe sfdg_cell_g0_1 G1F
 call :exe sfdg_cell_g2_1 G1F
 call :exe sfdg_cell_g12_4 G1F

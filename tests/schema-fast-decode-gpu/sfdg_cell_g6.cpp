@@ -165,5 +165,5 @@ int main(int argc, char** argv) {
 		rig.ReleaseSeqs();  // the sequences first, then the extra models
 		for (Mapped* m : {&host_fast, &host_full, &dev_fast, &dev_full, &un_dev, &un_host}) Unmap(rig, m);
 	}
-	return FinishSuite("sfdg_cell_g6");
+	return Finish("sfdg_cell_g6");
 }

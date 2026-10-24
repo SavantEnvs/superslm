@@ -69,5 +69,5 @@ int main(int argc, char** argv) {
 			CHECK_MSG(sslm_gpu_model_unmap(rig.ctx(), m) == GS::SSLM_OK, "[G2.1] unmap");
 		}
 	}
-	return FinishSuite("sfdg_cell_g2_1");
+	return Finish("sfdg_cell_g2_1");
 }

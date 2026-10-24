@@ -241,7 +241,7 @@ int main(int argc, char** argv) {
 	GRig rig;
 	if (a.model.empty() || !rig.env.Open(a.model, false)) {
 		CHECK_MSG(false, "the model did not open: %s", a.model.c_str());
-		return FinishSuite("schema_fast_decode_gpu_p2_ref");
+		return Finish("schema_fast_decode_gpu_p2_ref");
 	}
 	rig.raw = rig.env.fx.bytes;
 	CHECK_MSG(rig.Index(a.schema.c_str()) >= 0, "schema %s not in the model", a.schema.c_str());
@@ -323,5 +323,5 @@ int main(int argc, char** argv) {
 	f << json;
 	CHECK_MSG(f.good(), "could not write %s", a.out.c_str());
 	std::printf("wrote %s: %zu cases, cases_sha256 %s\n", a.out.c_str(), cases.size(), HexSha(arr).c_str());
-	return FinishSuite("schema_fast_decode_gpu_p2_ref");
+	return Finish("schema_fast_decode_gpu_p2_ref");
 }

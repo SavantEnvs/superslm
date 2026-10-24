@@ -39,5 +39,5 @@ int main(int argc, char** argv) {
 		CRig c(rig.raw);
 		CHECK_MSG(c.ok, "[G12.5] the CPU map after the GPU's injected failure");
 	}
-	return FinishSuite("sfdg_cell_g12_5");
+	return Finish("sfdg_cell_g12_5");
 }

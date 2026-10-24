@@ -19,6 +19,7 @@
 #define SSLM_SFDG_HELPERS_H
 
 #include "g1e_cpu_twin.h"  // tests/paged-kv-gpu: g1e_helpers.h, fixture_common.h, the CPU ABI
+#include "d3d12_harness.h"  // the debug layer's info queue, read at exit (Finish, below)
 #include "superslm/gpu_1p0_bench_bridge.h"
 #include "superslm/sha256.h"
 
@@ -560,6 +561,32 @@ inline CQuery QueryCpu(sslm_model m, sslm_seq s, int32_t cap = 512) {
 	q.st = sslm_seq_forced_tokens(m, s, cap > 0 ? q.ids.data() : nullptr, cap, &q.count, &q.accepting);
 	if (q.st == SSLM_OK && q.count >= 0 && q.count < cap) q.ids.resize(static_cast<size_t>(q.count));
 	return q;
+}
+
+// Plan §10 (rev 1.4.2, strike N3; rev 1.4.3, re-check note 4): every G binary reports the debug layer's queued
+// messages at exit, each with its ID, so the box driver can compare them with GB0's baseline. One line per message,
+// "# SFDG DEBUG LAYER MESSAGE id=<ID> severity=<0..4> category=<n>", then "# SFDG DEBUG LAYER: mode=<m> messages=<n>".
+// The harness's own drain then prints the descriptions to stderr and empties the queue. A quiet drain is not proof
+// that the recording was correct (d3d12_harness.h's caveat).
+inline int Finish(const char* name) {
+	superslm_gpu::harness::Device& d = superslm_gpu::harness::GetDevice();
+	size_t n = 0;
+	if (d.debug_info_queue) {
+		const UINT64 stored = d.debug_info_queue->GetNumStoredMessages();
+		for (UINT64 i = 0; i < stored; ++i) {
+			SIZE_T len = 0;
+			if (FAILED(d.debug_info_queue->GetMessage(i, nullptr, &len)) || len == 0) continue;
+			std::vector<char> buf(len);
+			D3D12_MESSAGE* m = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+			if (FAILED(d.debug_info_queue->GetMessage(i, m, &len))) continue;
+			std::printf("# SFDG DEBUG LAYER MESSAGE id=%d severity=%d category=%d\n", static_cast<int>(m->ID),
+			            static_cast<int>(m->Severity), static_cast<int>(m->Category));
+			++n;
+		}
+	}
+	std::printf("# SFDG DEBUG LAYER: mode=%d messages=%zu\n", d.debug_layer_mode, n);
+	(void)d.DrainDebugLayerMessages();
+	return FinishSuite(name);
 }
 
 }  // namespace sfdg

@@ -124,5 +124,5 @@ int main(int argc, char** argv) {
 			CHECK_MSG(rig.Bindable(g.h, kLongKey), "[G12.4] the query cleared bind eligibility");
 		}
 	}
-	return FinishSuite("sfdg_cell_g12_4");
+	return Finish("sfdg_cell_g12_4");
 }

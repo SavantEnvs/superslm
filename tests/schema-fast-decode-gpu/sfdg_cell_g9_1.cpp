@@ -102,5 +102,5 @@ int main(int argc, char** argv) {
 		rig.ReleaseSeqs();
 		if (g_pool) sslm_gpu_kv_pool_destroy(rig.ctx(), g_pool);
 	}
-	return FinishSuite("sfdg_cell_g9_1");
+	return Finish("sfdg_cell_g9_1");
 }

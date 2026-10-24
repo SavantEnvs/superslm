@@ -70,5 +70,5 @@ int main(int argc, char** argv) {
 		Unmap(rig, &host);
 		Unmap(rig, &dev);
 	}
-	return FinishSuite("sfdg_cell_g8_1");
+	return Finish("sfdg_cell_g8_1");
 }
