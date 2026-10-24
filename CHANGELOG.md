@@ -2,6 +2,34 @@
 
 All notable changes to SuperSLM (Layer 1) are recorded here.
 
+## [1.17.0] - unreleased
+
+Schema skip-ahead on the GPU (schema fast-decode plan rev 1.4.4, slices G1-F, G1-M and G1-J). Three GPU verbs, the
+ready getter, one struct and two appended GPU statuses are added; no save format (`SLM5`, `SLM6`, `SPX1`) changes, and
+the GPU masked finish changes no GPU token. Tested on the NVIDIA RTX 2080 SUPER and the AMD Radeon RX 7900 XTX only.
+The release waits for the box's exactness rules on both cards and for 1.16.0.
+
+- **Forced-text query.** `sslm_gpu_model_map` builds the forced-next table with the CPU map's builder, and
+  `sslm_gpu_seq_forced_tokens` returns the CPU's ids for the same walk state. A model without a table returns the
+  appended `SSLM_GPU_FORCED_TABLE_ABSENT` (ordinal 31).
+- **GPU masked finish.** Under a bound schema the decode bridge's finish scores only the legal rows, for a host head
+  or a device head tied to the embedding. **Untied device-head models get no GPU masked finish in 1.17.0**: they keep
+  the device logits.
+- **New exit on tied device-head models:** a parallel-for hook that does not run every task now makes the bound
+  finish return `SSLM_GPU_PARALLEL_FOR_INCOMPLETE` (token -1, walk unchanged, ready flag set, so a retry finishes the
+  same row). The host-head finish already had this exit.
+- **Jump-forward, canonical.** `sslm_gpu_seq_jump_forward` admits the pending token and the forced chain in one pass,
+  `sslm_gpu_seq_embed_schema_token` embeds a token with the walk, and `sslm_gpu_seq_ready_for_logits` reads the ready
+  flag. A call that would pass the context cap admits the rows that fit and returns the appended
+  `SSLM_GPU_CONTEXT_CAP_EXCEEDED` (ordinal 32). **The GPU verb refuses `SSLM_JUMP_EXACT` in 1.17.0 with
+  `SSLM_SEQUENCE_REJECTED`.**
+- **CPU C ABI:** the two status names are appended to `SSLM_STATUS_ENUM_LIST`, so the CPU and GPU enums keep one
+  ordinal space. No CPU call returns either.
+- **Two claims, kept apart.** Stream equality per mode is claimed on the GPUs where the box's exactness rules ran. The
+  plugin README's "GPU determinism is not claimed" stays as it is.
+- **Known issue:** the RTX 50-series (Blackwell) currently fails parts of the GPU suite (59 of 326,323 checks on an
+  RTX 5060, mostly at `softmax_site.hlsl:150`). No GPU support is claimed for 50-series cards.
+
 ## [1.15.0] - 2026-10-23
 
 Faster schema-bound decode on the CPU (schema fast-decode plan rev 1.3.6, slices M1, J1, TF and J1-X).

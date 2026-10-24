@@ -1403,8 +1403,8 @@ bit-identical between the CPU and GPU paths at real scale (see
 
 *Unreleased.* The GPU twins of the CPU's schema fast-decode verbs (1.15.0). Every name below is an addition; no
 save format (`SLM5`, `SLM6`, `SPX1`) changes. Tested on the NVIDIA RTX 2080 SUPER and the AMD Radeon RX 7900 XTX
-only. Known issue: the RTX 50-series (Blackwell) currently fails parts of the GPU suite, and no GPU support is
-claimed for it.
+only. Known issue: the RTX 50-series (Blackwell) currently fails parts of the GPU suite (59 of 326,323 checks on an
+RTX 5060, mostly at `softmax_site.hlsl:150`), and no GPU support is claimed for it.
 
 **The forced-text query.** `sslm_gpu_seq_forced_tokens(ctx, seq, out_ids, cap, out_count, out_accepting)` returns
 the text the bound schema forces from the sequence's current walk state, as token ids: the CPU's
@@ -1414,3 +1414,60 @@ and tokenizer sections. Refusals, in order, each writing nothing: a malformed ha
 `SSLM_SEQUENCE_KV_BUFFER_MISMATCH`; a model with no table (an artifact without a tokenizer section),
 `SSLM_GPU_FORCED_TABLE_ABSENT`; a Submitted sequence, or another thread's decode of it, `SSLM_BUSY`. An allocation
 failure while the table is built fails the map with `SSLM_GPU_ALLOCATION_FAILED`.
+
+**The masked finish.** Under a bound schema, the decode bridge's finish scores only the rows the schema allows at the
+walk state, with the CPU masked finish's own function, when the model's hidden size passes the CPU's exactness test
+(computed once at `sslm_gpu_model_map`) and the head rows are on the host or tied to the embedding. Tokens, walks,
+saves and counters equal the full finish's. Unbound decode is unchanged. A model whose device head is untied from
+the embedding keeps the device logits under a bound schema: it gets no GPU masked finish in 1.17.0. One exit is new
+on a tied device-head model: a host parallel-for hook that does not run every task makes the finish return
+`SSLM_GPU_PARALLEL_FOR_INCOMPLETE` with token -1, the walk unchanged and the ready flag set, so a retry finishes the
+same row, as the host-head finish already did.
+
+**The jump-forward verb.** `sslm_gpu_seq_jump_forward(ctx, seq, pending_token, chunk_budget, opts, out_forced, cap,
+out_forced_count)` is the GPU twin of `sslm_seq_jump_forward` in canonical mode. It admits, in one pass through the
+schema-content chunk path, the pending token (when one is given) and then the chain the schema forces from the walk
+state, at most `chunk_budget` rows in all; R rows make ceil(R / 4) layer submissions. `out_forced` receives the
+forced ids admitted (`cap` must be at least `chunk_budget`), and `*out_forced_count` their number, the pending row
+not counted. The GPU keeps no forced-token counter, and no save format changes. `SslmGpuJumpOptions` is
+`{struct_size, mode, draft, draft_count}`; `opts` may be NULL (canonical). **1.17.0 refuses `SSLM_JUMP_EXACT` with
+`SSLM_SEQUENCE_REJECTED`**, with or without a draft; the fields stay so that a later release can accept it with no
+ABI change.
+
+- **Entry shapes.** A token in hand (layer 0, ready flag clear, context > 0) takes `pending_token` >= 0: the token the
+  last finish produced and walked, embedded without a second walk. A ready sequence (the ready flag set, or the
+  primed row at full depth) and a fresh bound sequence (no context) take -1. Any other shape is
+  `SSLM_SEQUENCE_REJECTED`. With no chain at the walk state the call is a no-op (OK, count 0), and a pending token
+  stays the caller's.
+- **After an admission** the ready flag is set at full depth, so the next decode bridge call finishes the last admitted
+  row only.
+- **The limit.** Before any submission the verb computes the rows left before the limit, h: the context cap, or a
+  pooled sequence's limit. A call that asks for more than h admits h, walks over them, sets the ready flag, and
+  returns `SSLM_GPU_CONTEXT_CAP_EXCEEDED` (ordinal 32), or `SSLM_GPU_KV_BUDGET_EXCEEDED` for a pooled sequence whose
+  limit is below the cap. At h = 0 nothing changes and the status is the same. The verb never returns the
+  schema-content bridge's `SSLM_DEVICE_LOST` for a full context.
+- **The prefill snapshot** (`sslm_gpu_seq_read_prefill_final_hidden`) is cleared as the pass starts and set when every
+  row asked for is admitted, as the schema-content bridge does.
+- **A device failure** in the pass restores the entry state (context length, walk, the per-sequence counters, the
+  hidden state and scale, the layer index, the ready flag, the prefill snapshot's flag, the dedicated host-mirror rows
+  and a pooled holder's mapped pages) and returns the failure's status. An off decode can follow.
+- **Refusals,** in order, each changing nothing, bindability included: a malformed handle, output, budget, `cap` or
+  `opts`, `SSLM_SEQUENCE_KV_BUFFER_MISMATCH`; exact mode, `SSLM_SEQUENCE_REJECTED`; `pending_token` below -1 or past
+  the vocabulary, `SSLM_TOKEN_ID_OUT_OF_RANGE`; no table, `SSLM_GPU_FORCED_TABLE_ABSENT`; a held decode claim or a
+  Submitted sequence, `SSLM_BUSY`; the shape, `SSLM_SEQUENCE_REJECTED`; then the submission guard's statuses. A call
+  that passes them clears bind eligibility; an unbound sequence is then a no-op.
+
+**The walked embed.** `sslm_gpu_seq_embed_schema_token(ctx, seq, token)` is `sslm_gpu_seq_embed_token` with the walk:
+it checks the token against the walk state, embeds it, advances the walk and clears the ready flag, which discards a
+ready row. The caller then drives the layers with `sslm_decode_step_gpu` and, for a forced row, does not finish it;
+row for row, a chain fed this way equals the verb's. No schema bound, or an illegal token, is
+`SSLM_SEQUENCE_REJECTED` with nothing changed.
+
+**The ready getter.** `sslm_gpu_seq_ready_for_logits(ctx, seq, out_ready)` writes 1 when the next decode bridge call
+finishes the held row without an embed, else 0. It is host-only. SLM5 and SLM6 restore the flag, so a host reads a
+restored sequence's resting shape from it. A malformed handle, `SSLM_SEQUENCE_KV_BUFFER_MISMATCH`; a Submitted
+sequence, `SSLM_BUSY`.
+
+**Determinism.** Stream equality per mode is claimed only on the GPUs where the box's exactness rules ran (the RTX
+2080 SUPER and the Radeon RX 7900 XTX). It is a separate claim from the plugin's, whose README does not claim GPU
+determinism.
