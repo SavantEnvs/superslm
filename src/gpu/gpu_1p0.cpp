@@ -5271,6 +5271,15 @@ SslmGpuStatus sslm_gpu_test_only_arm_chunk_fault(int32_t sub_chunk, SslmGpuStatu
 	                                                                  : superslm::SslmForwardStatus::GpuDeviceRemoved;
 	return SSLM_OK;
 }
+// S-GJUMPALLOC (engine code review B1): the armed site of a host std::bad_alloc in the verb's pass, -1 when disarmed.
+namespace {
+std::atomic<int32_t> g_jump_host_bad_alloc_site{-1};
+}  // namespace
+SslmGpuStatus sslm_gpu_test_only_arm_jump_host_bad_alloc(int32_t site) noexcept {
+	if (site > 2) return SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+	g_jump_host_bad_alloc_site.store(site < 0 ? -1 : site);
+	return SSLM_OK;
+}
 #endif
 
 namespace {
@@ -5448,7 +5457,21 @@ SslmGpuStatus sslm_gpu_seq_jump_forwardImpl(SslmGpuContext* ctx, SslmGpuSequence
 		RestoreJumpEntrySnapshot(seq, snap);
 		return st;
 	};
-
+#if defined(SUPERSLM_GPU_TEST_SEAMS)
+	// S-GJUMPALLOC: consumed by this call whether or not its site is reached.
+	const int32_t host_bad_alloc_site = g_jump_host_bad_alloc_site.exchange(-1);
+	auto host_bad_alloc_at = [&](int32_t site) {
+		if (host_bad_alloc_site == site) throw std::bad_alloc();
+	};
+#else
+	auto host_bad_alloc_at = [](int32_t) {};
+#endif
+	// Every exit after the snapshot restores it (engine code review B1). A status goes through fail(); a host
+	// exception -- the pre-scan's and the mapping's allocations, or the bridge's rethrow -- is caught here and goes
+	// through fail() too, so it can never reach the API boundary with the entry state changed. An allocation failure
+	// returns SSLM_GPU_ALLOCATION_FAILED, as the boundary would; any other exception restores and rethrows, and the
+	// boundary returns SSLM_DEVICE_LOST for it.
+	try {
 	seq->live_state.hidden_scale = seq->hidden_scale;
 	seq->live_state.layer_index = seq->layer_index;
 	seq->live_state.kv_saturation_count = seq->kv_saturation_count;
@@ -5456,6 +5479,7 @@ SslmGpuStatus sslm_gpu_seq_jump_forwardImpl(SslmGpuContext* ctx, SslmGpuSequence
 	const int64_t chunk_open_ctxlen = seq->context_length;
 	// The prefill snapshot, as the schema-content bridge: invalid from here until the success exit.
 	seq->prefill_hidden_valid = false;
+	host_bad_alloc_at(0);
 	const ChunkPreScanResult scan =
 	    RunChunkAdmissionPreScan(model, chunk_open_ctxlen, seq->context_cap, rows.data(), admit, entry,
 	                             seq->dfa_walk_state, limit, /*prewalked_prefix=*/static_cast<uint32_t>(pend));
@@ -5466,6 +5490,7 @@ SslmGpuStatus sslm_gpu_seq_jump_forwardImpl(SslmGpuContext* ctx, SslmGpuSequence
 	if (const SslmGpuStatus map_st = MapPooledPagesThrough(seq, chunk_open_ctxlen + admit); map_st != SSLM_OK) {
 		return fail(map_st);
 	}
+	host_bad_alloc_at(1);
 	int64_t derived_count = 0;
 	bool guard_rejected = false;
 	superslm::SslmForwardStatus chunk_fault = superslm::SslmForwardStatus::Ok;
@@ -5487,6 +5512,7 @@ SslmGpuStatus sslm_gpu_seq_jump_forwardImpl(SslmGpuContext* ctx, SslmGpuSequence
 		return fail(chunk_fault == superslm::SslmForwardStatus::GpuAllocationFailed ? SSLM_GPU_ALLOCATION_FAILED
 		                                                                           : SSLM_DEVICE_LOST);
 	}
+	host_bad_alloc_at(2);
 	seq->dfa_walk_state = scan.dfa_states_after[static_cast<size_t>(admit) - 1];
 	seq->ready_for_logits = true;  // layer_index is at L: the next decode bridge call finishes only
 	const int32_t forced = admit - pend;
@@ -5496,6 +5522,16 @@ SslmGpuStatus sslm_gpu_seq_jump_forwardImpl(SslmGpuContext* ctx, SslmGpuSequence
 	seq->prefill_hidden_codes = seq->hidden_codes;
 	seq->prefill_hidden_valid = true;
 	return SSLM_OK;
+	} catch (const std::bad_alloc&) {
+		return fail(SSLM_GPU_ALLOCATION_FAILED);
+	} catch (const std::length_error&) {
+		return fail(SSLM_GPU_ALLOCATION_FAILED);
+	} catch (const superslm_gpu::harness::GpuAllocationError&) {
+		return fail(SSLM_GPU_ALLOCATION_FAILED);
+	} catch (...) {
+		RestoreJumpEntrySnapshot(seq, snap);
+		throw;
+	}
 }
 
 SslmGpuStatus sslm_gpu_seq_embed_schema_tokenImpl(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq, int32_t token) {

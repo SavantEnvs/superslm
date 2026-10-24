@@ -75,6 +75,10 @@ MUTANTS = {
         (GPU, "if (opts->mode == 1) return SSLM_SEQUENCE_REJECTED;",
               "if (false && opts->mode == 1) return SSLM_SEQUENCE_REJECTED;"),
     ]),
+    "XGB1": ("A host bad_alloc in the verb's pass skips the entry restore (engine code review B1)", "G12.10", [
+        (GPU, "\t} catch (const std::bad_alloc&) {\n\t\treturn fail(SSLM_GPU_ALLOCATION_FAILED);",
+              "\t} catch (const std::bad_alloc&) {\n\t\tthrow;"),
+    ]),
 }
 
 
