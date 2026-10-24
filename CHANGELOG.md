@@ -2,6 +2,29 @@
 
 All notable changes to SuperSLM (Layer 1) are recorded here.
 
+## [1.16.0] - @RELEASE_DATE@
+
+Frozen-prefix save and restore on the GPU. `docs/releases/1.16.0.md` is the release note, and
+`docs/releases/1.16.0-verification.md` summarizes the test results. The two GPU verbs have been declared and
+exported since 1.14.0, labelled unreleased; 1.16.0 releases them with no change to their code, declarations or
+`SslmGpuStatus` ordinals. No CPU verb, struct layout, status ordinal or sequence save format changes, and no model
+artifact needs reconversion.
+
+- **Precached prefixes on the GPU: save and restore.** `sslm_gpu_prefix_save` writes a frozen GPU prefix as an
+  `SPX1` blob, the CPU's layout with backend 1 and the adapter's PCI vendor and device IDs as producer, read from
+  the pool's host mirror; it submits nothing and is never refused Busy. `sslm_gpu_prefix_restore` validates the
+  whole blob before it draws or shares any page (arguments, Busy, size and magic, digest, backend, producer, model,
+  KV precision, schema and field domains, in that order), draws `ceil(L/B) - s` pages, shares a frozen parent's `s`
+  leading pages when the parent holds exactly the blob's origin with equal rows, and uploads only the drawn pages.
+  Every refusal changes nothing and returns every drawn page.
+- **`SSLM_RESTORE_PRODUCER_MISMATCH` on the GPU.** A GPU blob restores only on the engine version and the adapter
+  (vendor and device) that wrote it; any other is refused with this status, appended last in `SslmGpuStatus`.
+- **A blob is bound to the engine version that wrote it**, so `SPX1` blobs written by 1.14.0 or 1.15.0 are refused
+  by 1.16.0 with `SSLM_RESTORE_PRODUCER_MISMATCH`, on the CPU as on the GPU. Rebuild cached prefixes after upgrading.
+- **Tested GPUs.** The GPU twins were tested on the NVIDIA GeForce RTX 2080 SUPER and the AMD Radeon RX 7900 XTX
+  only.
+- **Known issue.** RTX 50-series (Blackwell) GPUs fail parts of the GPU test suite; under investigation; use the CPU backend there.
+
 ## [1.15.0] - 2026-10-23
 
 Faster schema-bound decode on the CPU (schema fast-decode plan rev 1.3.6, slices M1, J1, TF and J1-X).
