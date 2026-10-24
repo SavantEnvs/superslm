@@ -71,6 +71,12 @@ SslmGpuStatus sslm_gpu_test_only_rows_log_at(size_t i, uint64_t* out_rows, int32
 // (force 0), the GPU twin of S-BOUND. A forced model finishes every bound token with the full finish. Must not
 // race a finish on the model. A null model: SSLM_SEQUENCE_KV_BUFFER_MISMATCH.
 SslmGpuStatus sslm_gpu_test_only_force_full_finish(SslmGpuModelHandle* model, int32_t force) noexcept;
+// S-GCHUNKFAULT (G1-J): arms a single-shot fault for the next sslm_gpu_seq_jump_forward call's pass. Its sub-chunk
+// `sub_chunk` (0 = the first; sub-chunks of 4 rows) is refused before it is recorded, as a failed submission is,
+// with `status`: SSLM_GPU_ALLOCATION_FAILED or SSLM_DEVICE_LOST. Earlier sub-chunks run and commit; the verb's
+// failure exit then restores its entry state. A negative `sub_chunk` disarms. Any other status:
+// SSLM_SEQUENCE_KV_BUFFER_MISMATCH. Only the verb consumes it; the bridges never do.
+SslmGpuStatus sslm_gpu_test_only_arm_chunk_fault(int32_t sub_chunk, SslmGpuStatus status) noexcept;
 #endif  // SUPERSLM_GPU_TEST_SEAMS
 
 #if defined(SUPERSLM_ENABLE_GPU_API_FAILURE_INJECTION)

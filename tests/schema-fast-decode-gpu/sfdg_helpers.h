@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <sstream>
 #include <string>
@@ -341,6 +342,146 @@ inline bool LegalAt(const superslm::SslmModelView& view, const char* schema, uin
 		return ((page[id >> 3] >> (id & 7)) & 1u) != 0;
 	}
 	return false;
+}
+
+// ---- G1-J: the verb, the walked embed, the ready getter ----------------------------------------------------
+struct JumpOut {
+	GS st = GS::SSLM_OK;
+	int32_t count = -9;
+	std::vector<int32_t> forced;
+};
+// One verb call. `cap` 0 means max(budget, 64). On a call that admitted rows the GSeq is marked ready, so the
+// decode bridge (Token) takes the shortcut.
+inline JumpOut Jump(GRig& rig, GSeq& s, int32_t pending, int32_t budget, const SslmGpuJumpOptions* opts = nullptr,
+                    int32_t cap = 0) {
+	JumpOut j;
+	if (cap == 0) cap = budget > 64 ? budget : 64;
+	j.forced.assign(static_cast<size_t>(cap), -7);
+	j.st = sslm_gpu_seq_jump_forward(rig.ctx(), s.h, pending, budget, opts, j.forced.data(), cap, &j.count);
+	j.forced.resize(j.count >= 0 && j.count <= cap ? static_cast<size_t>(j.count) : 0);
+	int32_t ready = 0;
+	if (sslm_gpu_seq_ready_for_logits(rig.ctx(), s.h, &ready) == GS::SSLM_OK && ready) {
+		s.ready = s.primed = true;
+		s.mid = false;
+	}
+	return j;
+}
+inline int32_t ReadyFlag(SslmGpuContext* ctx, SslmGpuSequenceHandle* h) {
+	int32_t r = -1;
+	const GS st = sslm_gpu_seq_ready_for_logits(ctx, h, &r);
+	return st == GS::SSLM_OK ? r : -100 - static_cast<int32_t>(st);
+}
+inline int64_t CtxLen(SslmGpuSequenceHandle* h) { return *SslmGpuSeqHandleContextLengthForBench(h); }
+inline uint32_t LayerIdx(SslmGpuSequenceHandle* h) { return *SslmGpuSeqHandleLayerIndexForBench(h); }
+inline SslmGpuJumpOptions Opts(int32_t mode, const int32_t* draft = nullptr, int32_t n = 0) {
+	SslmGpuJumpOptions o{};
+	o.struct_size = sizeof(SslmGpuJumpOptions);
+	o.mode = mode;
+	o.draft = draft;
+	o.draft_count = n;
+	return o;
+}
+// Everything a refusal must leave as it was: the blob (context, walk, counters, hidden state, layer, ready flag,
+// mirror rows), the walk and ready flag read directly, the layer and context, and a pooled holder's mapped count.
+struct SeqObs {
+	std::vector<uint8_t> blob;
+	uint32_t walk = 0;
+	int32_t ready = -1;
+	uint32_t layer = 0;
+	int64_t ctx = -1;
+	uint32_t mapped = 0;
+	bool operator==(const SeqObs& o) const {
+		return blob == o.blob && walk == o.walk && ready == o.ready && layer == o.layer && ctx == o.ctx &&
+		       mapped == o.mapped;
+	}
+	bool operator!=(const SeqObs& o) const { return !(*this == o); }
+};
+inline SeqObs Observe(GRig& rig, SslmGpuSequenceHandle* h) {
+	SeqObs o;
+	o.blob = rig.Blob(h);
+	o.walk = SslmGpuSeqWalkStateForG5Bridge(h);
+	o.ready = ReadyFlag(rig.ctx(), h);
+	o.layer = LayerIdx(h);
+	o.ctx = CtxLen(h);
+	uint32_t page = 0;
+	(void)sslm_gpu_test_only_seq_table_entry(h, 0, &page, &o.mapped);
+	return o;
+}
+// The prefill snapshot's read: its status and bytes.
+struct SnapRead {
+	GS st = GS::SSLM_OK;
+	std::vector<int8_t> codes;
+	int64_t m = 0, e = 0;
+	bool operator==(const SnapRead& o) const { return st == o.st && codes == o.codes && m == o.m && e == o.e; }
+};
+inline SnapRead ReadSnapshot(SslmGpuContext* ctx, SslmGpuSequenceHandle* h) {
+	SnapRead r;
+	r.codes.assign(4096, 0);
+	size_t req = 0;
+	r.st = sslm_gpu_seq_read_prefill_final_hidden(ctx, h, r.codes.data(), r.codes.size(), &req, &r.m, &r.e);
+	r.codes.resize(r.st == GS::SSLM_OK ? req : 0);
+	return r;
+}
+// The probe's composition, the reference for the fused verb (G12.1): the prompt bridge for the pending token (which
+// does not walk it), then the schema-content bridge for `chain`.
+inline GS Compose(GRig& rig, GSeq& s, int32_t pending, const std::vector<int32_t>& chain) {
+	GS st = GS::SSLM_OK;
+	if (pending >= 0) st = rig.Prompt(s, {pending});
+	if (st == GS::SSLM_OK && !chain.empty()) st = rig.Content(s, chain);
+	return st;
+}
+// A run of the canonical loop (the §5.6 host contract): the verb until the query reports no chain, then one decode;
+// until a dead end. `pending` is the decoded token while it is the caller's.
+struct GJfRun {
+	std::vector<int32_t> stream;
+	bool dead_end = false;
+	GS end = GS::SSLM_OK;
+	int verb_calls = 0, decodes = 0;
+};
+inline GJfRun RunGpuJf(GRig& rig, GSeq& s, int32_t budget, int max_decodes = 400,
+                       const std::function<void(GSeq&, int)>& between = nullptr) {
+	GJfRun r;
+	int32_t pending = -1;
+	for (int d = 0; d < max_decodes; ++d) {
+		for (int guard = 0; guard < 1000; ++guard) {
+			const JumpOut j = Jump(rig, s, pending, budget);
+			++r.verb_calls;
+			r.stream.insert(r.stream.end(), j.forced.begin(), j.forced.end());
+			if (j.st != GS::SSLM_OK) {
+				r.end = j.st;
+				return r;
+			}
+			if (ReadyFlag(rig.ctx(), s.h) == 1) pending = -1;  // admitted: the pending row is in
+			if (between) between(s, r.verb_calls);
+			const GQuery q = QueryGpu(rig.ctx(), s.h, 0);
+			if (q.st != GS::SSLM_OK) {
+				r.end = q.st;
+				return r;
+			}
+			if (q.count == 0) break;
+		}
+		GS st = GS::SSLM_OK;
+		if (pending >= 0) s.last = pending;
+		const int32_t t = Token(rig.env, s, &st);
+		++r.decodes;
+		if (st != GS::SSLM_OK) {
+			r.end = st;
+			return r;
+		}
+		if (t == -2) {
+			r.dead_end = true;
+			return r;
+		}
+		r.stream.push_back(t);
+		pending = t;
+	}
+	return r;
+}
+// A prompt of exactly `n` tokens: `base` repeated.
+inline std::vector<int32_t> PromptOfLength(const std::vector<int32_t>& base, size_t n) {
+	std::vector<int32_t> v;
+	for (size_t i = 0; i < n && !base.empty(); ++i) v.push_back(base[i % base.size()]);
+	return v;
 }
 
 // ---- the CPU side (the reference) ------------------------------------------------------------------------

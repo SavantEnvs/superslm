@@ -1112,4 +1112,80 @@ SslmGpuStatus sslm_gpu_prefix_restore(SslmGpuContext* ctx, SslmGpuModelHandle* m
 SslmGpuStatus sslm_gpu_seq_forced_tokens(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq, int32_t* out_ids,
                                          int32_t cap, int32_t* out_count, int32_t* out_accepting) noexcept;
 
+/* ============================================================================
+ * Schema skip-ahead on the GPU (1.17.0, unreleased): the jump-forward verb, the walked embed and the ready
+ * getter. Exported, and unreleased until 1.17.0. Tested on the RTX 2080 SUPER and the Radeon RX 7900 XTX
+ * only; the RTX 50-series currently fails parts of the GPU suite, and no support is claimed for it.
+ * ============================================================================
+ *
+ * SslmGpuJumpOptions is the GPU twin of sslm_jump_options. `mode` takes the CPU enum's values:
+ * SSLM_JUMP_CANONICAL (0) or SSLM_JUMP_EXACT (1). 1.17.0 refuses EXACT (below); the mode and draft fields stay so
+ * a later release can accept it with no ABI change. `struct_size` must be sizeof(SslmGpuJumpOptions); canonical
+ * mode takes no draft (NULL, count 0). */
+typedef struct SslmGpuJumpOptions {
+    uint32_t       struct_size;
+    int32_t        mode;
+    const int32_t* draft;
+    int32_t        draft_count;
+} SslmGpuJumpOptions;
+
+/* sslm_gpu_seq_jump_forward admits, in one pass, the pending token (when one is given) and then the chain the bound
+ * schema forces from the walk state: the GPU twin of sslm_seq_jump_forward in canonical mode. The GPU is greedy
+ * only, so there are no decode parameters. Rows go through the schema-content chunk path in sub-chunks of 4, so an
+ * R-row call makes ceil(R/4) layer submissions; at most `chunk_budget` rows are admitted, the pending row included.
+ * `out_forced` receives the forced ids admitted (at most `cap`, which must be >= chunk_budget) and
+ * `*out_forced_count` their number; the pending row is not counted. The GPU keeps no forced-token counter.
+ *
+ * `pending_token` is the caller's: the token the last finish produced, which that finish already walked, or -1 for
+ * none. The verb cannot check it is that token (the decode bridge's `token_to_embed_if_needed` has the same
+ * contract); a valid but different id is embedded as given. Entry shapes:
+ *   - a produced token in hand (layer 0, ready flag clear, context > 0): `pending_token` >= 0. It is embedded
+ *     without a walk, then the chain from the current walk state. Also the shape after sslm_gpu_seq_embed_token
+ *     with no layers run; the pending token re-embeds over it;
+ *   - ready, no pending (the ready flag set, or the primed row: full depth, flag clear): -1. The chain is admitted
+ *     and the ready row is never finished;
+ *   - fresh and bound, no context: -1. The start span from the start state.
+ * Any other shape -- mid-token, a token given in the second or third shape, -1 in the first -- is
+ * SSLM_SEQUENCE_REJECTED. With no chain at the walk state the call is a no-op (OK, count 0): a pending token stays
+ * the caller's, for the decode bridge.
+ * After an admission the ready flag is set at full depth, so the next decode bridge call finishes the last admitted
+ * row only. A call that asks for more rows than fit before the limit (h rows left: the context cap, or a pooled
+ * sequence's limit) admits the h that fit, walks over them, sets the ready flag (h > 0) and returns
+ * SSLM_GPU_CONTEXT_CAP_EXCEEDED, or SSLM_GPU_KV_BUDGET_EXCEEDED for a pooled sequence whose limit is below the cap;
+ * at h = 0 nothing changes. The prefill snapshot (sslm_gpu_seq_read_prefill_final_hidden) is cleared at the
+ * pass's start and set when every row asked for is admitted, as the schema-content bridge does.
+ * A device failure in the pass (SSLM_GPU_ALLOCATION_FAILED, SSLM_DEVICE_LOST, or another status) restores the
+ * entry state -- context length, walk, the saturation counters, the hidden state and scale, the layer index,
+ * the ready flag, the prefill snapshot's flag, the dedicated host-mirror rows and a pooled holder's mapped pages
+ * -- and returns that status, so the sequence can be decoded as if the call had not been made.
+ * Checked in this order; each refusal changes nothing, bindability included: (1) a null context, sequence,
+ * `out_forced` or `out_forced_count`, a sequence of another context, `chunk_budget` < 1, `cap` < chunk_budget,
+ * or a malformed `opts` (struct_size, an unknown mode, a draft in canonical mode, a negative draft_count, a
+ * positive draft_count with a null draft): SSLM_SEQUENCE_KV_BUFFER_MISMATCH; (2) mode SSLM_JUMP_EXACT, with a draft
+ * or without: SSLM_SEQUENCE_REJECTED; (3) `pending_token` < -1 or >= the vocabulary: SSLM_TOKEN_ID_OUT_OF_RANGE;
+ * (4) no forced-next table: SSLM_GPU_FORCED_TABLE_ABSENT; (5) another thread holds the decode claim, or the
+ * sequence is Submitted: SSLM_BUSY; (6) the shape: SSLM_SEQUENCE_REJECTED; (7) the submission guard's statuses.
+ * A call that passes them clears the sequence's bind eligibility. An unbound sequence is then a no-op. */
+SslmGpuStatus sslm_gpu_seq_jump_forward(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq, int32_t pending_token,
+                                        int32_t chunk_budget, const SslmGpuJumpOptions* opts, int32_t* out_forced,
+                                        int32_t cap, int32_t* out_forced_count) noexcept;
+
+/* sslm_gpu_seq_embed_schema_token is sslm_gpu_seq_embed_token with the walk: it embeds `token` (host-only, no
+ * submission) and advances the walk over it. It accepts the ready shape and clears the ready flag as it embeds,
+ * discarding the ready row, so the next decode bridge call embeds and finishes the new row. The caller then
+ * drives the layers with sslm_decode_step_gpu; for a forced row it does not finish the row. Row for row, a chain
+ * fed this way equals the verb's. Refusals, each changing nothing: a malformed handle,
+ * SSLM_SEQUENCE_KV_BUFFER_MISMATCH; Submitted or claimed, SSLM_BUSY; an id out of range, SSLM_TOKEN_ID_OUT_OF_RANGE;
+ * no schema bound, or `token` illegal at the walk state, SSLM_SEQUENCE_REJECTED. Once validated it clears the
+ * sequence's bind eligibility. */
+SslmGpuStatus sslm_gpu_seq_embed_schema_token(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq,
+                                              int32_t token) noexcept;
+
+/* sslm_gpu_seq_ready_for_logits reads the ready flag: 1 when the next decode bridge call finishes the held row
+ * without an embed (after a prefill bridge, an admitting verb call, a dead end, or an SLM5/SLM6 restore of such a
+ * state), 0 otherwise. Host-only; it submits nothing and changes nothing. A malformed handle or null output,
+ * SSLM_SEQUENCE_KV_BUFFER_MISMATCH; a Submitted sequence, SSLM_BUSY. */
+SslmGpuStatus sslm_gpu_seq_ready_for_logits(SslmGpuContext* ctx, SslmGpuSequenceHandle* seq,
+                                            int32_t* out_ready) noexcept;
+
 #endif /* SSLM_GPU_1P0_H */

@@ -1,7 +1,7 @@
 // Schema fast-decode plan rev 1.4.4 §11.2, cell G2.1 (slice G1-F; rev 1.4.1, review L6): a base view without a
 // tokenizer maps on the GPU with no forced-next table. The query returns SSLM_GPU_FORCED_TABLE_ABSENT (the GPU
-// enum has no artifact refusal), and schema-bound decode still works. G1-J adds the verb's arm (the same status)
-// to this cell.
+// enum has no artifact refusal), and schema-bound decode still works. G1-J's arm: the verb returns the same status,
+// from the fresh shape and from the ready shape, with nothing changed and the count unwritten.
 //
 // The construction: F-SFD's own view with has_tokenizer cleared, which is what the GPU map reads to decide
 // (an artifact without TOK1 loads with has_tokenizer false). Box only. Run: sfdg_cell_g2_1.exe [--fixture-dir=DIR]
@@ -31,8 +31,24 @@ int main(int argc, char** argv) {
 				// Decode works: the prompt, then greedy tokens, all legal under the schema.
 				CRig c(rig.raw);
 				const std::vector<int32_t> prompt = c.Tokenize(kPromptPotionText);
-				const GS ps = rig.Prompt(s, prompt);
-				CHECK_MSG(ps == GS::SSLM_OK, "[G2.1] prompt prefill on the table-less model: %s", Name(ps));
+				// G1-J: the verb, fresh and then ready.
+				for (int shape = 0; shape < 2; ++shape) {
+					if (shape == 1) {
+						const GS ps = rig.Prompt(s, prompt);
+						CHECK_MSG(ps == GS::SSLM_OK, "[G2.1] prompt prefill on the table-less model: %s", Name(ps));
+					}
+					const SeqObs before = Observe(rig, s.h);
+					int32_t out_ids[8], n = -9;
+					const GS js = sslm_gpu_seq_jump_forward(rig.ctx(), s.h, -1, 8, nullptr, out_ids, 8, &n);
+					CHECK_MSG(js == kForcedTableAbsent && Observe(rig, s.h) == before,
+					          "[G2.1] the verb without a table (%s shape): %s, sequence %s (want SSLM_GPU_FORCED_TABLE_ABSENT, "
+					          "nothing changed)", shape ? "ready" : "fresh", Name(js),
+					          Observe(rig, s.h) == before ? "unchanged" : "changed");
+					if (shape == 0) {
+						const GS b = SslmGpuSeqSetSchemaForG5Bridge(rig.ctx(), s.h, SslmGpuSchemaLookupForG5Bridge(m, kPotion));
+						CHECK_MSG(b == GS::SSLM_OK, "[G2.1] the refused fresh sequence is no longer bindable: %s", Name(b));
+					}
+				}
 				GS last = GS::SSLM_OK;
 				const std::vector<int32_t> out = DecodeN(rig.env, s, 8, &last);
 				CHECK_MSG(last == GS::SSLM_OK && !out.empty(), "[G2.1] decode on the table-less model: %s, %zu tokens",
