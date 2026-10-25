@@ -28,7 +28,7 @@ import re
 import subprocess
 import sys
 
-STALE = re.compile(r"\bunreleased\b", re.I)
+STALE = re.compile(r"\bunreleased\b|\bnot (?:yet )?released\b|\buntil 1\.16\.0\b", re.I)
 RELEASE = "1.16.0"
 VERBS = re.compile(r"\bsslm_gpu_prefix_(?:save|restore)\b")
 PRECACHED = re.compile(r"precached[ -]prefix", re.I)
