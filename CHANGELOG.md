@@ -21,8 +21,10 @@ artifact needs reconversion.
   (vendor and device) that wrote it; any other is refused with this status, appended last in `SslmGpuStatus`.
 - **A blob is bound to the engine version that wrote it**, so `SPX1` blobs written by 1.14.0 or 1.15.0 are refused
   by 1.16.0 with `SSLM_RESTORE_PRODUCER_MISMATCH`, on the CPU as on the GPU. Rebuild cached prefixes after upgrading.
-- **Tested GPUs.** The GPU twins were tested on the NVIDIA GeForce RTX 2080 SUPER and the AMD Radeon RX 7900 XTX
-  only.
+- **Tested GPUs.** The GPU twins were tested on the NVIDIA GeForce RTX 2080 SUPER, the AMD Radeon RX 7900 XTX and the
+  AMD Radeon RX 7900 XT only (the XT and XTX share a PCI device ID). On the RTX 2080 SUPER and the RX 7900 XT, a
+  prefix restore took 2.3–3.0 ms against 1,046–1,866 ms of prefill at 128 tokens, and 6.4–15.7 ms against
+  10,530–20,321 ms at 1,000 tokens.
 - **Known issue.** RTX 50-series (Blackwell) GPUs fail parts of the GPU test suite; under investigation; use the CPU backend there.
 
 ## [1.15.0] - 2026-10-23
