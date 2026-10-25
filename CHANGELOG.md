@@ -2,7 +2,7 @@
 
 All notable changes to SuperSLM (Layer 1) are recorded here.
 
-## [1.16.0] - @RELEASE_DATE@
+## [1.16.0] - 2026-10-25
 
 Frozen-prefix save and restore on the GPU. `docs/releases/1.16.0.md` is the release note, and
 `docs/releases/1.16.0-verification.md` summarizes the test results. The two GPU verbs have been declared and
