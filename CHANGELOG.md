@@ -2,6 +2,17 @@
 
 All notable changes to SuperSLM (Layer 1) are recorded here.
 
+## [Unreleased]
+
+- **Fixed: wrong GPU results on NVIDIA RTX 50-series (Blackwell).** On Blackwell, the driver's shader backend drops
+  the carry from the low 32 bits into the high 32 bits of a native 64-bit integer add in some kernels. The same DXIL
+  is correct on the RTX 2080 SUPER. It hit `SaturatingAdd64Gpu_`, which derives the softmax site's i-exp scale
+  constants, so every GPU forward diverged from the CPU at the first attention layer. The open-time witness refused
+  the device, and 59 checks of the GPU suite failed. `SaturatingAdd64Gpu_` now forms the sum from two 32-bit halves
+  with an explicit carry. It is bit-identical to the native add wherever that add is computed correctly. On an
+  RTX 5060 (drivers 32.0.16.1088 and 32.0.16.2101) the full suite passes (326,326 checks, 0 failures) and the
+  witness accepts the device. Results on the RTX 2080 SUPER are unchanged.
+
 ## [1.16.0] - 2026-10-25
 
 Frozen-prefix save and restore on the GPU. `docs/releases/1.16.0.md` is the release note, and
