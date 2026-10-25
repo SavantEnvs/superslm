@@ -219,7 +219,8 @@ function Build-Cells([string]$Wt, [string[]]$Targets) {
     $outDir = Join-Path $Wt 'build\sfdg'
     $log = Join-Path $Logs "$Step-build.log"
     $bat = Join-Path $Wt 'tests\schema-fast-decode-gpu\build_sfd_gpu.bat'
-    $code = Invoke-Capped 'cmd.exe' (@('/c', $bat, "--out=$outDir", "--shaders=$shaders") + $Targets) $log $Wt
+    # cmd splits a batch argument at '=', so the bat sees --out=/--shaders= only when they arrive quoted (its usage line).
+    $code = Invoke-Capped 'cmd.exe' (@('/c', $bat, "`"--out=$outDir`"", "`"--shaders=$shaders`"") + $Targets) $log $Wt
     if ($code -eq 'timeout') { return $null }
     $r = [ordered]@{}
     foreach ($line in Get-Content -LiteralPath $log) {
