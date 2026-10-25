@@ -623,7 +623,8 @@ echo T-2141 t2138-suite-side must-reject construction correctly failed to compil
 
 rem Count declarations with the same comment-aware reader as the API-slot inventory. The
 rem previous text match also counted two status names mentioned in comments.
-rem 1.12.0 declares 51 C verbs: 38 before paged KV and 13 added by this release.
+rem 1.12.0 declared 51 C verbs: 38 before paged KV and 13 added by that release. 1.14.0 and 1.15.0
+rem added 4 more (55), matching tests\t2807-api-slot\c_abi_verbs.txt.
 rem Use native PowerShell so this gate does not depend on WSL or Git Bash.
 rem T2139_VERB_COUNT is read and compared OUTSIDE any parenthesized if-block on purpose: %VAR%
 rem inside a `( ... )` block expands at PARSE time (before the block's own `set /p` line has
@@ -635,11 +636,11 @@ if errorlevel 1 (
 	goto :hard_fail
 )
 set /p T2139_VERB_COUNT=<out\t2139\verb_count.txt
-if "%T2139_VERB_COUNT%"=="51" goto :t2139_verb_count_ok
-echo C ABI inventory reports %T2139_VERB_COUNT%, expected 51 -- verb count drifted; see tests\t2807-api-slot\c_abi_verbs.txt
+if "%T2139_VERB_COUNT%"=="55" goto :t2139_verb_count_ok
+echo C ABI inventory reports %T2139_VERB_COUNT%, expected 55 -- verb count drifted; see tests\t2807-api-slot\c_abi_verbs.txt
 goto :hard_fail
 :t2139_verb_count_ok
-echo C ABI inventory: 51 declared verbs, matching the 1.12.0 API-slot population
+echo C ABI inventory: 55 declared verbs, matching the API-slot population in c_abi_verbs.txt
 goto :t2139_verb_count_done
 :t2139_verb_count_done
 
