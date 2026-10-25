@@ -137,7 +137,7 @@ typedef enum SslmGpuStatus {
     SSLM_GPU_HOLDER_MODE_MISMATCH,
     SSLM_GPU_PREFIX_REJECTED,
     SSLM_GPU_PREFIX_SCHEMA_MISMATCH,
-    /* Precached prefixes (1.16.0, unreleased), appended LAST: 30. */
+    /* Precached prefixes (1.16.0), appended LAST: 30. */
     SSLM_RESTORE_PRODUCER_MISMATCH,
     /* Schema skip-ahead on the GPU (1.17.0, unreleased), appended LAST: 31, 32. */
     SSLM_GPU_FORCED_TABLE_ABSENT,
