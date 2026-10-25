@@ -1,5 +1,5 @@
 # Schema fast-decode plan rev 1.4.4 Sec. 10, the GPU steps on the box (the RTX 2080 SUPER), and the kit's steps on the work
-# machine (the Radeon RX 7900 XTX). run_box_step.ps1 hands every GB, GK and GB-XG step to this script.
+# machine (now workhorse's Radeon RX 7900 XT, the same device id as the XTX). run_box_step.ps1 hands every GB, GK and GB-XG step to this script.
 #
 #   GB0       fixtures (F-SFD and its --untied variant, generated and hashed), the build at -Tip (the G cells, the
 #             smoke, the GPU jump-forward bench), G0.1, and the F-SFD smoke at value 2, whose debug-layer message IDs
