@@ -530,7 +530,7 @@ written on another adapter (its vendor or device ID differs from the
 context's). Nothing is drawn. The status was released in 1.16.0, with the
 GPU twins.
 
-Two cover schema skip-ahead on the GPU (1.17.0, unreleased; see
+Two cover schema skip-ahead on the GPU (1.17.0; see
 [Schema skip-ahead on the GPU](#schema-skip-ahead-on-the-gpu-1170)).
 `SSLM_GPU_FORCED_TABLE_ABSENT` (ordinal 31): `sslm_gpu_seq_forced_tokens` or
 `sslm_gpu_seq_jump_forward` on a model mapped without a forced-next table (its
@@ -1398,10 +1398,16 @@ bit-identical between the CPU and GPU paths at real scale (see
 
 ## Schema skip-ahead on the GPU (1.17.0)
 
-*Unreleased.* The GPU twins of the CPU's schema fast-decode verbs (1.15.0). Every name below is an addition; no
-save format (`SLM5`, `SLM6`, `SPX1`) changes. To be certified on the NVIDIA RTX 2080 SUPER and the AMD Radeon RX 7900 XTX
-only; no GPU run has certified it yet. Known issue: the RTX 50-series (Blackwell) currently fails parts of the GPU suite (59 of 326,323 checks on an
-RTX 5060, mostly at `softmax_site.hlsl:150`), and no GPU support is claimed for it.
+The GPU twins of the CPU's schema fast-decode verbs (1.15.0), released in 1.17.0. Every name below is an addition;
+no save format (`SLM5`, `SLM6`, `SPX1`) changes. Stream equality with the CPU, per mode, is certified on the NVIDIA
+RTX 5060 and the AMD Radeon RX 7900 XT only. 1.17.0 also fixes the RTX 50-series (Blackwell) GPU results that 1.16.0
+listed as a known issue.
+
+**Canonical mode changes answers, and is deprecated.** It writes the forced text with the tokenizer's split, so the
+model continues from tokens it would not have chosen. On a schema-heavy workload it changed 8 of 44 answers and
+lowered accuracy, where exact mode kept every answer and was nearly as fast, and on array schemas it closes an array
+after its first item. 1.18.0 removes it on the CPU and the GPU. Use exact mode (CPU) where answers matter; on the GPU,
+1.17.0 offers canonical only, and exact runs as off until 1.18.0.
 
 **The forced-text query.** `sslm_gpu_seq_forced_tokens(ctx, seq, out_ids, cap, out_count, out_accepting)` returns
 the text the bound schema forces from the sequence's current walk state, as token ids: the CPU's

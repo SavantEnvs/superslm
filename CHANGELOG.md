@@ -2,12 +2,12 @@
 
 All notable changes to SuperSLM (Layer 1) are recorded here.
 
-## [1.17.0] - unreleased
+## [1.17.0] - @RELEASE_DATE@
 
-Schema skip-ahead on the GPU (schema fast-decode plan rev 1.4.4, slices G1-F, G1-M and G1-J). Three GPU verbs, the
-ready getter, one struct and two appended GPU statuses are added; no save format (`SLM5`, `SLM6`, `SPX1`) changes, and
-the GPU masked finish changes no GPU token. To be certified on the NVIDIA RTX 2080 SUPER, the NVIDIA RTX 5060 and
-the AMD Radeon RX 7900 XT only. The release waits for the box's exactness rules on all three cards.
+Schema skip-ahead on the GPU, and the RTX 50-series fix. `docs/releases/1.17.0.md` is the release note. Three GPU
+verbs, the ready getter, one struct and two appended GPU statuses are added; no save format (`SLM5`, `SLM6`, `SPX1`)
+changes, and the GPU masked finish changes no GPU token. Stream equality with the CPU, per mode, is certified on the
+NVIDIA RTX 5060 and the AMD Radeon RX 7900 XT only.
 
 - **Forced-text query.** `sslm_gpu_model_map` builds the forced-next table with the CPU map's builder, and
   `sslm_gpu_seq_forced_tokens` returns the CPU's ids for the same walk state. A model without a table returns the
@@ -43,8 +43,8 @@ the AMD Radeon RX 7900 XT only. The release waits for the box's exactness rules 
   constants, so every GPU forward diverged from the CPU at the first attention layer. The open-time witness refused
   the device, and 59 checks of the GPU suite failed. `SaturatingAdd64Gpu_` now forms the sum from two 32-bit halves
   with an explicit carry. It is bit-identical to the native add wherever that add is computed correctly. On an
-  RTX 5060 (drivers 32.0.16.1088 and 32.0.16.2101) the full suite passes (326,326 checks, 0 failures) and the
-  witness accepts the device. Results on the RTX 2080 SUPER are unchanged.
+  RTX 5060 (drivers 32.0.16.1088 and 32.0.16.2101) the full suite passes (326,326 checks with the fix on 1.15.0;
+  326,327 on 1.17.0, 0 failures) and the witness accepts the device. Results on the RTX 2080 SUPER are unchanged.
 
 ## [1.16.0] - 2026-10-25
 

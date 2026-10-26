@@ -303,11 +303,11 @@ enum class SslmGpuStatus : uint32_t {
      * another adapter (its VendorId or DeviceId differs from this context's). Appended LAST, as every
      * GPU status before it; nothing changes and nothing is drawn. Released in 1.16.0. */
     SSLM_RESTORE_PRODUCER_MISMATCH,
-    /* Schema skip-ahead (1.17.0, unreleased), ordinal 31: sslm_gpu_seq_forced_tokens or sslm_gpu_seq_jump_forward
+    /* Schema skip-ahead (1.17.0), ordinal 31: sslm_gpu_seq_forced_tokens or sslm_gpu_seq_jump_forward
      * on a model mapped without a forced-next table (its artifact carries no tokenizer section). Nothing
      * changes. The GPU twin of the CPU verbs' SSLM_ARTIFACT_REJECTED, which this enum lacks. */
     SSLM_GPU_FORCED_TABLE_ABSENT,
-    /* Schema skip-ahead (1.17.0, unreleased), ordinal 32: sslm_gpu_seq_jump_forward asked for more rows than a
+    /* Schema skip-ahead (1.17.0), ordinal 32: sslm_gpu_seq_jump_forward asked for more rows than a
      * dedicated sequence has before its context cap. The rows that fit are committed (h of them, h = 0
      * included, when nothing changes); the call's comment gives the resting state. */
     SSLM_GPU_CONTEXT_CAP_EXCEEDED
@@ -1093,8 +1093,7 @@ SslmGpuStatus sslm_gpu_prefix_restore(SslmGpuContext* ctx, SslmGpuModelHandle* m
                                       SslmGpuPrefixHandle** out_prefix, uint32_t* out_shared_pages) noexcept;
 
 /* ============================================================================
- * Schema skip-ahead on the GPU (1.17.0, unreleased): the forced-text query. Exported, and unreleased
- * until 1.17.0.
+ * Schema skip-ahead on the GPU (1.17.0): the forced-text query. Released in 1.17.0.
  * ============================================================================
  *
  * sslm_gpu_seq_forced_tokens is the GPU twin of sslm_seq_forced_tokens (sslm_abi_functions.inc): the
@@ -1113,9 +1112,9 @@ SslmGpuStatus sslm_gpu_seq_forced_tokens(SslmGpuContext* ctx, SslmGpuSequenceHan
                                          int32_t cap, int32_t* out_count, int32_t* out_accepting) noexcept;
 
 /* ============================================================================
- * Schema skip-ahead on the GPU (1.17.0, unreleased): the jump-forward verb, the walked embed and the ready
- * getter. Exported, and unreleased until 1.17.0. To be certified on the RTX 2080 SUPER and the Radeon RX 7900 XTX
- * only; the RTX 50-series currently fails parts of the GPU suite, and no support is claimed for it.
+ * Schema skip-ahead on the GPU (1.17.0): the jump-forward verb, the walked embed and the ready getter.
+ * Released in 1.17.0. Stream equality with the CPU, per mode, is certified on the NVIDIA RTX 5060 and the AMD
+ * Radeon RX 7900 XT only. Canonical mode is deprecated and is removed in 1.18.0.
  * ============================================================================
  *
  * SslmGpuJumpOptions is the GPU twin of sslm_jump_options. `mode` takes the CPU enum's values:

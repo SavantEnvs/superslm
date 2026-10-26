@@ -64,7 +64,7 @@ PIN(SSLM_GPU_PREFIX_SCHEMA_MISMATCH, 29);
 // Precached prefixes (1.16.0): the producer refusal, appended last.
 PIN(SSLM_RESTORE_PRODUCER_MISMATCH, 30);
 
-// Schema skip-ahead on the GPU (1.17.0, unreleased): the forced-table and context-cap statuses, appended last.
+// Schema skip-ahead on the GPU (1.17.0): the forced-table and context-cap statuses, appended last.
 PIN(SSLM_GPU_FORCED_TABLE_ABSENT, 31);
 PIN(SSLM_GPU_CONTEXT_CAP_EXCEEDED, 32);
 
