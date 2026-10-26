@@ -6,9 +6,8 @@ All notable changes to SuperSLM (Layer 1) are recorded here.
 
 Schema skip-ahead on the GPU (schema fast-decode plan rev 1.4.4, slices G1-F, G1-M and G1-J). Three GPU verbs, the
 ready getter, one struct and two appended GPU statuses are added; no save format (`SLM5`, `SLM6`, `SPX1`) changes, and
-the GPU masked finish changes no GPU token. To be certified on the NVIDIA RTX 2080 SUPER and the AMD Radeon RX 7900 XT
-only; no GPU run has certified it yet.
-The release waits for the box's exactness rules on both cards.
+the GPU masked finish changes no GPU token. To be certified on the NVIDIA RTX 2080 SUPER, the NVIDIA RTX 5060 and
+the AMD Radeon RX 7900 XT only. The release waits for the box's exactness rules on all three cards.
 
 - **Forced-text query.** `sslm_gpu_model_map` builds the forced-next table with the CPU map's builder, and
   `sslm_gpu_seq_forced_tokens` returns the CPU's ids for the same walk state. A model without a table returns the
@@ -26,6 +25,13 @@ The release waits for the box's exactness rules on both cards.
   `SSLM_GPU_ALLOCATION_FAILED` for an allocation failure (device or host) and `SSLM_DEVICE_LOST` for any other
   fault. The walked embed refuses a mid-token sequence. **The GPU verb refuses `SSLM_JUMP_EXACT` in 1.17.0 with
   `SSLM_SEQUENCE_REJECTED`.**
+- **Canonical mode changes answers, not only tokens. Use exact mode where answers matter.** Canonical writes the
+  forced text with the tokenizer's own split instead of the model's, and the model then continues from tokens it
+  would not have chosen. On a user's schema-heavy workload of 44 lines on the CPU (1.16.0), exact mode was 0.46 s a line
+  with all 44 answers identical to off (0.63 s), and canonical was 0.44 s but changed 8 of the 44 answers and lowered
+  accuracy. On array schemas (not convertible before 1.19.0) canonical closes an array after its first item. On the
+  GPU, 1.17.0 has canonical only: exact runs as off there until multi-row GPU dispatch (1.18.0). Nothing jumps unless
+  the host calls a jump-forward verb, and on the CPU verb NULL options select canonical, so pass `SSLM_JUMP_EXACT`.
 - **CPU C ABI:** the two status names are appended to `SSLM_STATUS_ENUM_LIST`, so the CPU and GPU enums keep one
   ordinal space. No CPU call returns either.
 - **Two claims, kept apart.** Stream equality per mode is claimed on the GPUs where the box's exactness rules ran. The
