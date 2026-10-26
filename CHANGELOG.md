@@ -2,7 +2,7 @@
 
 All notable changes to SuperSLM (Layer 1) are recorded here.
 
-## [1.17.0] - @RELEASE_DATE@
+## [1.17.0] - 2026-10-26
 
 Schema skip-ahead on the GPU, and the RTX 50-series fix. `docs/releases/1.17.0.md` is the release note. Three GPU
 verbs, the ready getter, one struct and two appended GPU statuses are added; no save format (`SLM5`, `SLM6`, `SPX1`)
