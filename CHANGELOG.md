@@ -32,6 +32,7 @@ the AMD Radeon RX 7900 XT only. The release waits for the box's exactness rules 
   accuracy. On array schemas (not convertible before 1.19.0) canonical closes an array after its first item. On the
   GPU, 1.17.0 has canonical only: exact runs as off there until multi-row GPU dispatch (1.18.0). Nothing jumps unless
   the host calls a jump-forward verb, and on the CPU verb NULL options select canonical, so pass `SSLM_JUMP_EXACT`.
+  **Canonical mode is deprecated: 1.18.0 removes it on the CPU and the GPU.**
 - **CPU C ABI:** the two status names are appended to `SSLM_STATUS_ENUM_LIST`, so the CPU and GPU enums keep one
   ordinal space. No CPU call returns either.
 - **Two claims, kept apart.** Stream equality per mode is claimed on the GPUs where the box's exactness rules ran. The
