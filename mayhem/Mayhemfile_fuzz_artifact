@@ -1,0 +1,9 @@
+project: savantenvs/superslm
+target: fuzz_artifact
+testsuite:
+  - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+  - file://mayhem/fuzz_artifact/testsuite
+cmds:
+  - cmd: /mayhem/fuzz_artifact
+    libfuzzer: true
+    timeout: 60
